@@ -1,0 +1,19 @@
+/.git
+/target
+pkg
+/node_modules
+/dist
+*.local
+
+Dockerfile
+.dockerignore
+.env
+README.md
+docker-compose.yml
+docker-compose.dev.yml
+graphify-out
+# Secrets + local DB must never enter an image layer (COPY . . in the build).
+seed_users.json
+*.db
+*.db-journal
+*.db-wal

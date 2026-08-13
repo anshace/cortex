@@ -1,0 +1,23 @@
+/target
+pkg
+
+node_modules
+.DS_Store
+dist
+*.local
+
+.vscode
+
+# Backend-only secrets — never commit keys, the DB, or any local seed leftover
+seed_users.json
+.env
+*.db
+*.db-journal
+*.db-wal
+graphify-out/
+
+# Local-only notes/scratch kept out of the public repo (docs, documentation, etc.)
+archive/
+
+# Local tool state (SQLite DB + sessions) — never commit
+.freebuff/

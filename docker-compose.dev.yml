@@ -1,0 +1,49 @@
+# Fast dev loop tuned for flaky/corporate networks.
+#   docker compose -f docker-compose.dev.yml up --build
+#   → open http://localhost:5173
+#
+# Backend: the compiled prod image (Rust is built at image-build time via
+#   BuildKit, which has reliable networking — no crates.io access at runtime).
+#   Rebuilt only when you change Rust: re-run with --build.
+# Frontend: Vite hot-reload — edit a .tsx and the browser updates instantly,
+#   no rebuild. This is the hot path while building UI.
+#
+# One-time prerequisite (builds the wasm package onto the host so the frontend
+# container's `npm install` works — see README):
+#   npm run wasm:dev   (or the docker command in the README)
+#
+# Stop the production compose first (both use port 3030): docker compose down
+name: cortex-dev
+
+services:
+  backend:
+    build:
+      context: .
+    environment:
+      RUST_LOG: info
+      SQLITE_URI: sqlite:///data/authpad.db
+      # First-run owner (admin/admin by default). Change it on first login.
+      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin}"
+    volumes:
+      - cortex-data:/data
+    ports:
+      - "3030:3030"
+
+  frontend:
+    image: node:lts-alpine
+    working_dir: /app
+    environment:
+      VITE_PROXY_TARGET: http://backend:3030
+    command: sh -c "npm install && npm run dev"
+    volumes:
+      - .:/app
+      - cortex-node-modules:/app/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  cortex-data:
+  cortex-node-modules:
