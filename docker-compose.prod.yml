@@ -1,0 +1,43 @@
+# Production: Cortex behind Caddy (automatic HTTPS).
+# Usage on the server:
+#   DOMAIN=<your-ip>.sslip.io docker compose -f docker-compose.prod.yml up -d --build
+services:
+  app:
+    # Pull the CI-built image (recommended on the small box — no compiling on EC2):
+    #   docker compose -f docker-compose.prod.yml pull app && ... up -d
+    # `build: .` is kept as a fallback so you can still build locally with
+    # `... up -d --build`. The `image:` name is also the tag a local build produces.
+    image: ghcr.io/anshace/cortex:latest
+    build: .
+    restart: unless-stopped
+    environment:
+      - SQLITE_URI=sqlite:///data/authpad.db
+      - COOKIE_SECURE=1
+      - RUST_LOG=info
+      # First-run owner login (admin/admin by default). Override to set your own on
+      # a fresh database; ignored once any user exists. Change it on first login.
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+    volumes:
+      - cortex-data:/data
+    # No published ports: only Caddy can reach it, over the compose network.
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:?set DOMAIN, e.g. 203.0.113.9.sslip.io}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
+
+volumes:
+  cortex-data:
+  caddy-data:
+  caddy-config:

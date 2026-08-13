@@ -1,0 +1,35 @@
+[package]
+name = "rustpad-server"
+version = "0.1.0"
+authors = ["Eric Zhang <ekzhang1@gmail.com>"]
+edition = "2021"
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1.0.40"
+base64 = "0.22"
+bcrypt = "0.15"
+bytecount = "0.6"
+bytes = "1"
+hkdf = "0.12"
+p256 = { version = "0.13", features = ["ecdh"] }
+sha2 = "0.10"
+dashmap = "4.0.2"
+dotenv = "0.15.0"
+futures = "0.3.15"
+log = "0.4.14"
+operational-transform = { version = "0.6.0", features = ["serde"] }
+parking_lot = "0.11.1"
+pretty_env_logger = "0.4.0"
+rand = "0.8.3"
+serde = { version = "1.0.126", features = ["derive"] }
+serde_json = "1.0.64"
+sqlx = { version = "0.6.3", features = ["runtime-tokio-rustls", "sqlite"] }
+tokio = { version = "1.6.1", features = ["full", "test-util"] }
+tokio-stream = "0.1.6"
+totp-rs = { version = "5.5", default-features = false, features = ["otpauth"] }
+warp = "0.3.1"
+zip = "2"
+
+[dev-dependencies]
+tempfile = "3.2.0"

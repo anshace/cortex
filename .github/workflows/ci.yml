@@ -1,0 +1,56 @@
+name: build-image
+
+# Build the Cortex image on GitHub's runners (fast, plenty of RAM) and push it to
+# this repo's private GitHub Container Registry package. The tiny EC2 box then only
+# *pulls* the finished image instead of compiling Rust on 1 GB of RAM. See DEPLOY.md.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {} # allow manual runs from the Actions tab
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # lets the built-in GITHUB_TOKEN push to ghcr.io/<owner>/<repo>
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # automatic; no repo secret needed
+
+      - name: Image tags + labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }} # ghcr.io/anshace/cortex
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: Build and push (amd64 — EC2 is x86_64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache across runs: the Rust dep compiles are now their own
+          # image layers (cargo-chef in the backend stage, a stub-source
+          # pre-compile in the wasm stage), so the GHA cache persists them and
+          # only changed sources recompile — no more 8-minute full rebuilds.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

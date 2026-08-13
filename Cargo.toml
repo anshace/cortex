@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["rustpad-server", "rustpad-wasm"]
+
+# LTO off: on an I/O-bound web server it buys ~nothing at runtime but adds
+# minutes of slow single-threaded linking to every build. codegen-units high
+# keeps compilation parallel.
+[profile.release]
+lto = false
+codegen-units = 16

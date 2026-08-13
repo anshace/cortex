@@ -1,0 +1,43 @@
+version: 2
+updates:
+  # Rust backend + wasm crates (Cargo workspace at the repo root). Group only
+  # minor/patch bumps into one PR; a breaking major (e.g. sqlx 0.x) then lands
+  # as its own PR to review/migrate instead of poisoning the whole group's CI.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    # Major bumps are breaking (esp. crypto/framework crates: sqlx, warp,
+    # reqwest, aes-gcm, bcrypt, rand). Do them deliberately in a dedicated
+    # upgrade branch, not as weekly auto-PRs. Security fixes still flow through.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # Frontend npm dependencies (same minor/patch grouping).
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      npm-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions used in workflows — grouped into a single PR.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

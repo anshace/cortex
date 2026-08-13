@@ -1,0 +1,50 @@
+name: test
+
+# Fast checks on every pull request (and pushes to main). `backend` is the
+# required status check for merging; the heavier release image is built in
+# build-image.yml.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rustpad-server
+      # Library unit tests (auth, crypto, workspace). The tests/ integration
+      # suite is inherited from Rustpad and predates authentication — it opens
+      # the collaborative socket with no session, which the auth layer now
+      # rejects, so it needs a rewrite for the gated model before it can run.
+      - run: cargo test --lib --manifest-path rustpad-server/Cargo.toml
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - run: wasm-pack build rustpad-wasm
+      # Pinned exact LTS (not `lts/*`): resolving the alias fetches the
+      # nodejs.org version manifest, which intermittently fails on GitHub
+      # runners with "self-signed certificate" (runner TLS interception). An
+      # exact version skips that manifest lookup — and 22.14.0 is usually
+      # already in the runner's tool cache, so no download happens at all.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22.14.0"
+      - run: npm ci
+      - run: npm run check

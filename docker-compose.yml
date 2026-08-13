@@ -1,0 +1,24 @@
+# Dev runner for Cortex — no Rust/Node/C++ toolchain needed on the host.
+#   docker compose up --build
+# Then open http://localhost:3030 and log in as the default owner (admin/admin
+# on first run; change it right away in Settings → Security).
+services:
+  cortex:
+    build:
+      context: .
+    ports:
+      # Bind to localhost only — never exposed to the LAN or public internet.
+      - "127.0.0.1:3030:3030"
+    environment:
+      RUST_LOG: info
+      EXPIRY_DAYS: "1"
+      # First-run owner login. Defaults to admin/admin; override here to set your
+      # own on a fresh database (ignored once any user exists).
+      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin}"
+    volumes:
+      # Persist the SQLite database (users, sessions, workspaces, files).
+      - cortex-data:/data
+
+volumes:
+  cortex-data:
