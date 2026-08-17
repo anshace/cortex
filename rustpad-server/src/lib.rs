@@ -230,10 +230,27 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         .boxed()
 }
 
-/// Whether a user may access the document `doc_id` (same org, or root owner).
+/// Whether a user may access the document `doc_id` (root bypasses; otherwise
+/// the same layered org / group / personal check as the REST workspace routes).
 async fn doc_allowed(db: &Database, user: &database::User, doc_id: &str) -> bool {
-    match db.doc_org(doc_id).await.ok().flatten() {
-        Some(org) => user.role == "root" || Some(org) == user.org_id,
+    if user.role == "root" {
+        return true;
+    }
+    match db.doc_ws_info(doc_id).await.ok().flatten() {
+        Some((group_id, org, scope, created_by)) => {
+            if Some(org) != user.org_id {
+                return false;
+            }
+            match scope.as_str() {
+                "org" => true,
+                "personal" => created_by == user.id,
+                "group" => db
+                    .is_group_member(group_id, user.id)
+                    .await
+                    .unwrap_or(false),
+                _ => false,
+            }
+        }
         None => false,
     }
 }

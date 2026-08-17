@@ -48,6 +48,16 @@ const theme = extendTheme({
         default: "rgba(91,75,214,0.09)",
         _dark: "rgba(139,123,255,0.14)",
       },
+      // Chat bubbles — incoming is WhatsApp's grey-teal in dark / white in
+      // light; outgoing stays the brand accent (Telegram vibe). Meta = the
+      // small timestamp/check colour inside each bubble. chat.bg is the
+      // wallpaper base (WhatsApp's beige / dark-teal).
+      "chat.bg": { default: "#efeae2", _dark: "#0b141a" },
+      "chat.incoming": { default: "#ffffff", _dark: "#202c33" },
+      "chat.incomingBorder": { default: "#e5e5e1", _dark: "#2f3b41" },
+      "chat.incomingText": { default: "#111b21", _dark: "#e9edef" },
+      "chat.incomingMeta": { default: "#667781", _dark: "#8696a0" },
+      "chat.read": { default: "#34b7f1", _dark: "#53bdeb" }, // read-receipt blue
     },
   },
   shadows: {

@@ -19,7 +19,7 @@ use warp::{http::StatusCode, hyper::Body, reply::Reply, Filter, Rejection};
 
 use crate::auth::{with_auth, Forbidden};
 use crate::crypto;
-use crate::database::{ChatMessage, Database, PersistedDocument, ReactionView, User, Workspace};
+use crate::database::{ChatMessage, Database, Group, PersistedDocument, ReactionView, User, Workspace};
 
 /// Filter extracting the client's ECDH public key header (present when the
 /// client encrypts the payload).
@@ -126,12 +126,70 @@ fn acting_org(user: &User, q: &OrgQuery) -> Option<i64> {
     }
 }
 
+/// The visibility rule shared by workspaces and their groups.
+/// root bypasses everything; a regular member sees org-scope groups,
+/// their own personal groups, and group-scope groups they belong to.
+fn scope_ok(scope: &str, created_by: i64, me: i64, is_member: bool) -> bool {
+    match scope {
+        "org" => true,
+        "personal" => created_by == me,
+        "group" => is_member,
+        _ => false,
+    }
+}
+
 /// Resolve a workspace the user may access, else reject with Forbidden.
+/// Visibility comes from the workspace's group.
 async fn ensure_ws(db: &Database, user: &User, ws_id: i64) -> Result<Workspace, Rejection> {
     match db.get_workspace(ws_id).await.ok().flatten() {
-        Some(ws) if user.role == "root" || Some(ws.org_id) == user.org_id => Ok(ws),
+        Some(ws) if user.role == "root" => Ok(ws),
+        Some(ws) => {
+            let group = db.get_group(ws.group_id).await.ok().flatten();
+            match group {
+                Some(g) if user.org_id == Some(g.org_id) => {
+                    let member = g.scope == "group"
+                        && db.is_group_member(g.id, user.id).await.unwrap_or(false);
+                    if scope_ok(&g.scope, g.created_by, user.id, member) {
+                        Ok(ws)
+                    } else {
+                        Err(warp::reject::custom(Forbidden))
+                    }
+                }
+                _ => Err(warp::reject::custom(Forbidden)),
+            }
+        }
         _ => Err(warp::reject::custom(Forbidden)),
     }
+}
+
+/// Resolve a group the user may access (chat routes are keyed by group).
+async fn ensure_group(db: &Database, user: &User, group_id: i64) -> Result<Group, Rejection> {
+    match db.get_group(group_id).await.ok().flatten() {
+        Some(g) if user.role == "root" => Ok(g),
+        Some(g) if user.org_id == Some(g.org_id) => {
+            let member = g.scope == "group"
+                && db.is_group_member(g.id, user.id).await.unwrap_or(false);
+            if scope_ok(&g.scope, g.created_by, user.id, member) {
+                Ok(g)
+            } else {
+                Err(warp::reject::custom(Forbidden))
+            }
+        }
+        _ => Err(warp::reject::custom(Forbidden)),
+    }
+}
+
+/// The owner of a group may manage it: the group's creator or a root/org admin.
+async fn group_owner(db: &Database, user: &User, group_id: i64) -> bool {
+    user.role == "root"
+        || user.role == "admin"
+        || db
+            .get_group(group_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|g| g.created_by == user.id)
+            .unwrap_or(false)
 }
 
 #[derive(Deserialize, Default)]
@@ -149,6 +207,19 @@ struct WsUpload {
 #[derive(Deserialize)]
 struct CreateWorkspace {
     name: String,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// Create a workspace (file project) inside an existing group.
+#[derive(Deserialize)]
+struct CreateWsInGroup {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct MemberReq {
+    user_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -179,7 +250,7 @@ struct EditBody {
 
 #[derive(Deserialize)]
 struct ChatQuery {
-    workspace_id: i64,
+    group_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -192,11 +263,12 @@ struct DmQuery {
 #[derive(Deserialize, Default)]
 struct OverviewReq {
     #[serde(default)]
-    workspace_id: Option<i64>,
+    group_id: Option<i64>,
     #[serde(default)]
     org: Option<i64>,
+    /// Per-group read markers, keyed by group id.
     #[serde(default)]
-    ws_read: Option<i64>,
+    group_read: Option<HashMap<i64, i64>>,
     #[serde(default)]
     dm_read: HashMap<i64, i64>,
 }
@@ -229,13 +301,54 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(warp::query::<OrgQuery>())
         .and_then(get_org);
 
-    let create_ws = warp::path!("workspaces")
+    // Groups are the top-level container: create / view / rename / delete,
+    // manage members, and create workspaces (file projects) inside a group.
+    let create_group_r = warp::path!("groups")
         .and(warp::post())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
         .and(warp::query::<OrgQuery>())
         .and(warp::body::json())
-        .and_then(create_workspace);
+        .and_then(create_group);
+
+    let get_group_r = warp::path!("groups" / i64)
+        .and(warp::get())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(get_group);
+
+    let rename_group_r = warp::path!("groups" / i64)
+        .and(warp::put())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::body::json())
+        .and_then(rename_group);
+
+    let delete_group_r = warp::path!("groups" / i64)
+        .and(warp::delete())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(delete_group);
+
+    let add_member = warp::path!("groups" / i64 / "members")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::body::json())
+        .and_then(add_member);
+
+    let remove_member = warp::path!("groups" / i64 / "members" / i64)
+        .and(warp::delete())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(remove_member);
+
+    let create_ws_in_group = warp::path!("groups" / i64 / "workspaces")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::body::json())
+        .and_then(create_ws_in_group);
 
     let get_ws = warp::path!("workspaces" / i64)
         .and(warp::get())
@@ -459,7 +572,13 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
     // ~two-dozen routes the compiler overflows resolving it (E0275). `.boxed()`
     // erases each half's type so the final combination stays shallow.
     let workspace_routes = get_org
-        .or(create_ws)
+        .or(create_group_r)
+        .or(get_group_r)
+        .or(rename_group_r)
+        .or(delete_group_r)
+        .or(add_member)
+        .or(remove_member)
+        .or(create_ws_in_group)
         .or(upload)
         .or(raw)
         .or(download)
@@ -500,23 +619,75 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
 async fn get_org(user: User, db: Database, q: OrgQuery) -> Result<impl Reply, Rejection> {
     let is_owner = user.role == "root";
     let org_id = acting_org(&user, &q);
-    let (org, workspaces, members) = match org_id {
-        Some(oid) => (
-            db.get_org(oid).await.ok().flatten(),
-            db.list_workspaces(oid).await.unwrap_or_default(),
-            db.list_org_members(oid).await.unwrap_or_default(),
-        ),
-        None => (None, Vec::new(), Vec::new()),
+    let (org, groups, workspaces, members) = match org_id {
+        Some(oid) => {
+            // Every person gets their own private "Personal" group — create it
+            // on first access so each user always has a personal space.
+            let has_personal = if is_owner {
+                db.list_groups(oid).await.unwrap_or_default()
+            } else {
+                db.list_groups_for_user(oid, user.id)
+                    .await
+                    .unwrap_or_default()
+            }
+            .iter()
+            .any(|g| g.scope == "personal" && g.created_by == user.id);
+            if !has_personal {
+                let _ = db
+                    .create_group(oid, "Personal", user.id, now_secs(), "personal")
+                    .await;
+            }
+            let groups = if is_owner {
+                db.list_groups(oid).await.unwrap_or_default()
+            } else {
+                db.list_groups_for_user(oid, user.id)
+                    .await
+                    .unwrap_or_default()
+            };
+            // All workspaces inside the visible groups (so the sidebar can show
+            // the group → workspace hierarchy in one round-trip).
+            let mut workspaces = Vec::new();
+            for g in &groups {
+                workspaces.extend(db.list_workspaces(g.id).await.unwrap_or_default());
+            }
+            (
+                db.get_org(oid).await.ok().flatten(),
+                groups,
+                workspaces,
+                db.list_org_members(oid).await.unwrap_or_default(),
+            )
+        }
+        None => (None, Vec::new(), Vec::new(), Vec::new()),
     };
+    // Groups with their real member counts (group scope) so the sidebar can
+    // show "N members" without an extra request per group.
+    let mut groups_json = Vec::new();
+    for g in groups {
+        let mc = if g.scope == "group" {
+            db.group_member_ids(g.id).await.unwrap_or_default().len() as i64
+        } else {
+            0
+        };
+        groups_json.push(json!({
+            "id": g.id,
+            "org_id": g.org_id,
+            "name": g.name,
+            "scope": g.scope,
+            "created_by": g.created_by,
+            "member_count": mc,
+        }));
+    }
+    let groups = groups_json;
     Ok(warp::reply::json(&json!({
         "org": org,
+        "groups": groups,
         "workspaces": workspaces,
         "members": members,
         "isOwner": is_owner,
     })))
 }
 
-async fn create_workspace(
+async fn create_group(
     user: User,
     db: Database,
     q: OrgQuery,
@@ -530,7 +701,68 @@ async fn create_workspace(
     if name.is_empty() {
         return Ok(err(StatusCode::BAD_REQUEST, "name cannot be empty"));
     }
-    match db.create_workspace(org_id, name, user.id, now_secs()).await {
+    let scope = body.scope.unwrap_or_else(|| "group".to_string());
+    if !["group", "personal"].contains(&scope.as_str()) {
+        return Ok(err(StatusCode::BAD_REQUEST, "invalid scope"));
+    }
+    match db.create_group(org_id, name, user.id, now_secs(), &scope).await {
+        Ok(g) => Ok(warp::reply::json(&json!({ "group": g })).into_response()),
+        Err(_) => Ok(err(StatusCode::BAD_REQUEST, "could not create group")),
+    }
+}
+
+async fn get_group(group_id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+    let g = ensure_group(&db, &user, group_id).await?;
+    let workspaces = db.list_workspaces(g.id).await.unwrap_or_default();
+    let member_ids = if g.scope == "group" {
+        db.group_member_ids(g.id).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Ok(warp::reply::json(
+        &json!({ "group": g, "workspaces": workspaces, "member_ids": member_ids }),
+    ))
+}
+
+async fn rename_group(
+    group_id: i64,
+    user: User,
+    db: Database,
+    body: RenameReq,
+) -> Result<impl Reply, Rejection> {
+    let g = ensure_group(&db, &user, group_id).await?;
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Ok(err(StatusCode::BAD_REQUEST, "name cannot be empty"));
+    }
+    if !group_owner(&db, &user, g.id).await {
+        return Ok(err(StatusCode::FORBIDDEN, "only the group owner can rename"));
+    }
+    let _ = db.rename_group(g.id, name).await;
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+async fn delete_group(group_id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+    let g = ensure_group(&db, &user, group_id).await?;
+    if !group_owner(&db, &user, g.id).await {
+        return Ok(err(StatusCode::FORBIDDEN, "only the group owner can delete"));
+    }
+    let _ = db.delete_group(g.id).await;
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+async fn create_ws_in_group(
+    group_id: i64,
+    user: User,
+    db: Database,
+    body: CreateWsInGroup,
+) -> Result<impl Reply, Rejection> {
+    let g = ensure_group(&db, &user, group_id).await?;
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Ok(err(StatusCode::BAD_REQUEST, "name cannot be empty"));
+    }
+    match db.create_workspace(g.id, name, user.id, now_secs()).await {
         Ok(ws) => Ok(warp::reply::json(&json!({ "workspace": ws })).into_response()),
         Err(_) => Ok(err(StatusCode::BAD_REQUEST, "could not create workspace")),
     }
@@ -542,6 +774,42 @@ async fn get_workspace(ws_id: i64, user: User, db: Database) -> Result<impl Repl
     Ok(warp::reply::json(
         &json!({ "workspace": ws, "files": files }),
     ))
+}
+
+async fn add_member(
+    group_id: i64,
+    user: User,
+    db: Database,
+    body: MemberReq,
+) -> Result<impl Reply, Rejection> {
+    let g = ensure_group(&db, &user, group_id).await?;
+    if g.scope != "group" {
+        return Ok(err(StatusCode::BAD_REQUEST, "only group-scope groups have members"));
+    }
+    if !group_owner(&db, &user, g.id).await {
+        return Ok(err(StatusCode::FORBIDDEN, "only the group owner can manage members"));
+    }
+    let _ = db.add_group_member(g.id, body.user_id, "member").await;
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+async fn remove_member(
+    group_id: i64,
+    user_id: i64,
+    user: User,
+    db: Database,
+) -> Result<impl Reply, Rejection> {
+    let g = ensure_group(&db, &user, group_id).await?;
+    if g.scope != "group" {
+        return Ok(err(StatusCode::BAD_REQUEST, "only group-scope groups have members"));
+    }
+    if !group_owner(&db, &user, g.id).await {
+        return Ok(err(StatusCode::FORBIDDEN, "only the group owner can manage members"));
+    }
+    if user_id != g.created_by {
+        let _ = db.remove_group_member(g.id, user_id).await;
+    }
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
 async fn rename_workspace(
@@ -932,12 +1200,20 @@ async fn chat_overview(
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
 
-    let ws = if let Some(id) = req.workspace_id {
-        if ensure_ws(&db, &user, id).await.is_ok() {
-            match db.workspace_last_msg(id).await.ok().flatten() {
+    let gs = if let Some(id) = req.group_id {
+        if ensure_group(&db, &user, id).await.is_ok() {
+            match db.group_last_msg(id).await.ok().flatten() {
                 Some((last_id, sender, body, at)) => {
                     let unread = db
-                        .ws_unread_count(id, user.id, req.ws_read.unwrap_or(0))
+                        .group_unread_count(
+                            id,
+                            user.id,
+                            req.group_read
+                                .as_ref()
+                                .and_then(|m| m.get(&id))
+                                .copied()
+                                .unwrap_or(0),
+                        )
                         .await
                         .unwrap_or(0);
                     Some(
@@ -958,6 +1234,41 @@ async fn chat_overview(
     } else {
         user.org_id
     };
+
+    // Per-group summaries for EVERY group the user may see, so the chat
+    // sidebar can list personal / group / org conversations with their own
+    // preview and unread count.
+    let mut gss = Vec::new();
+    if let Some(org) = org {
+        let groups = if user.role == "root" {
+            db.list_groups(org).await.unwrap_or_default()
+        } else {
+            db.list_groups_for_user(org, user.id)
+                .await
+                .unwrap_or_default()
+        };
+        for g in groups {
+            let after = req
+                .group_read
+                .as_ref()
+                .and_then(|m| m.get(&g.id))
+                .copied()
+                .unwrap_or(0);
+            let unread = db
+                .group_unread_count(g.id, user.id, after)
+                .await
+                .unwrap_or(0);
+            match db.group_last_msg(g.id).await.ok().flatten() {
+                Some((last_id, sender, body, at)) => {
+                    gss.push(json!({ "group_id": g.id, "name": g.name, "scope": g.scope, "last_id": last_id, "last_sender": sender, "body": preview(&body), "at": at, "unread": unread }));
+                }
+                None => {
+                    gss.push(json!({ "group_id": g.id, "name": g.name, "scope": g.scope, "last_id": 0, "last_sender": serde_json::Value::Null, "body": serde_json::Value::Null, "at": serde_json::Value::Null, "unread": 0 }));
+                }
+            }
+        }
+    }
+
     let mut dms = Vec::new();
     if let Some(org) = org {
         for (peer, last_id, sender, body, at) in
@@ -971,7 +1282,7 @@ async fn chat_overview(
             dms.push(json!({ "peer_id": peer, "last_id": last_id, "last_sender": sender, "body": preview(&body), "at": at, "unread": unread }));
         }
     }
-    Ok(crypto::seal_reply(&epk, &json!({ "ws": ws, "dms": dms })))
+    Ok(crypto::seal_reply(&epk, &json!({ "gs": gs, "gss": gss, "dms": dms })))
 }
 
 async fn get_chat(
@@ -980,17 +1291,17 @@ async fn get_chat(
     q: ChatQuery,
     epk: Option<String>,
 ) -> Result<impl Reply, Rejection> {
-    ensure_ws(&db, &user, q.workspace_id).await?;
+    ensure_group(&db, &user, q.group_id).await?;
     let messages = db
-        .list_messages(q.workspace_id, 300)
+        .list_messages(q.group_id, 300)
         .await
         .unwrap_or_default();
     let reactions = db
-        .reactions_for_workspace(q.workspace_id, user.id)
+        .reactions_for_group(q.group_id, user.id)
         .await
         .unwrap_or_default();
     let messages = attach_reactions(messages, reactions);
-    let typing = who_typing(&format!("ws:{}", q.workspace_id), user.id, now_secs());
+    let typing = who_typing(&format!("g:{}", q.group_id), user.id, now_secs());
     Ok(crypto::seal_reply(
         &epk,
         &json!({ "messages": messages, "typing": typing }),
@@ -1004,7 +1315,7 @@ async fn post_chat(
     epk: Option<String>,
     raw: bytes::Bytes,
 ) -> Result<impl Reply, Rejection> {
-    ensure_ws(&db, &user, q.workspace_id).await?;
+    ensure_group(&db, &user, q.group_id).await?;
     let body: ChatPost =
         match crypto::open_request(&epk, &raw).and_then(|b| serde_json::from_slice(&b).ok()) {
             Some(v) => v,
@@ -1018,7 +1329,7 @@ async fn post_chat(
         return Ok(err(StatusCode::BAD_REQUEST, "message too long"));
     }
     if db
-        .create_message(q.workspace_id, user.id, text, now_secs())
+        .create_message(q.group_id, user.id, text, now_secs())
         .await
         .is_err()
     {
@@ -1030,13 +1341,13 @@ async fn post_chat(
     Ok(crypto::seal_reply(&epk, &json!({ "ok": true })))
 }
 
-/// Clear a workspace's group chat. Admin or root only.
+/// Clear a group's chat. Admin, root, or the group owner.
 async fn clear_chat(user: User, db: Database, q: ChatQuery) -> Result<impl Reply, Rejection> {
-    ensure_ws(&db, &user, q.workspace_id).await?;
-    if user.role != "admin" && user.role != "root" {
+    let g = ensure_group(&db, &user, q.group_id).await?;
+    if user.role != "admin" && user.role != "root" && !group_owner(&db, &user, g.id).await {
         return Err(warp::reject::custom(Forbidden));
     }
-    let _ = db.clear_messages(q.workspace_id).await;
+    let _ = db.clear_messages(g.id).await;
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
@@ -1189,10 +1500,10 @@ async fn delete_dm_msg(id: i64, user: User, db: Database) -> Result<impl Reply, 
     }
 }
 
-/// "I'm typing" ping for a workspace's group chat (ephemeral, no body).
+/// "I'm typing" ping for a group chat (ephemeral, no body).
 async fn typing_chat(user: User, db: Database, q: ChatQuery) -> Result<impl Reply, Rejection> {
-    ensure_ws(&db, &user, q.workspace_id).await?;
-    mark_typing(format!("ws:{}", q.workspace_id), user.id, now_secs());
+    ensure_group(&db, &user, q.group_id).await?;
+    mark_typing(format!("g:{}", q.group_id), user.id, now_secs());
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
@@ -1278,6 +1589,8 @@ async fn admin_storage(user: User, db: Database) -> Result<impl Reply, Rejection
     const TABLES: &[&str] = &[
         "users",
         "org",
+        "groups",
+        "group_member",
         "workspace",
         "file",
         "document",

@@ -3,6 +3,7 @@ import {
   Badge,
   Box,
   Flex,
+  HStack,
   Icon,
   IconButton,
   Menu,
@@ -10,24 +11,38 @@ import {
   MenuDivider,
   MenuItem,
   MenuList,
+  Popover,
+  PopoverBody,
+  PopoverContent,
+  PopoverTrigger,
   Text,
   Tooltip,
 } from "@chakra-ui/react";
 import { ElementType } from "react";
 import { FiMoon, FiSun } from "react-icons/fi";
 import {
+  VscAccount,
+  VscAdd,
   VscArrowLeft,
+  VscCheck,
   VscComment,
+  VscEllipsis,
   VscFiles,
   VscGear,
+  VscLock,
   VscSignOut,
 } from "react-icons/vsc";
 
-import { Me } from "./api";
+import { Group, Me } from "./api";
 
 export type Section = "explorer" | "chat";
 
 type Item = { key: Section; icon: ElementType; label: string; count?: number };
+
+/** Personal-scope groups always read "Personal" — the owner's private space. */
+export function groupLabel(g: { scope: string; name: string }): string {
+  return g.scope === "personal" ? "Personal" : g.name;
+}
 
 type Props = {
   section: Section;
@@ -39,6 +54,15 @@ type Props = {
   toggleColorMode: () => void;
   onLogout: () => void;
   onExit?: () => void;
+  /** All visible groups, for the switcher popover. */
+  groups: Group[];
+  activeGroupId: number | null;
+  onSelectGroup: (id: number) => void;
+  onNewGroup: () => void;
+  onRenameGroup: (g: Group) => void;
+  onNewWorkspace: (groupId: number) => void;
+  onManageMembers: (g: Group) => void;
+  onDeleteGroup: (g: Group) => void;
 };
 
 function ActivityBar({
@@ -51,11 +75,113 @@ function ActivityBar({
   toggleColorMode,
   onLogout,
   onExit,
+  groups,
+  activeGroupId,
+  onSelectGroup,
+  onNewGroup,
+  onRenameGroup,
+  onNewWorkspace,
+  onManageMembers,
+  onDeleteGroup,
 }: Props) {
   const items: Item[] = [
     { key: "explorer", icon: VscFiles, label: "Explorer" },
     { key: "chat", icon: VscComment, label: "Chat", count: chatCount },
   ];
+
+  const activeGroup = groups.find((g) => g.id === activeGroupId);
+
+  const row = (g: Group) => {
+    const active = g.id === activeGroupId;
+    const label = groupLabel(g);
+    const isPersonal = g.scope === "personal";
+    return (
+      <Flex
+        key={g.id}
+        align="center"
+        gap={2.5}
+        px={2}
+        py={1.5}
+        borderRadius="md"
+        cursor="pointer"
+        bg={active ? "accent.tint" : "transparent"}
+        _hover={{ bg: active ? "accent.tint" : "surface.hover" }}
+        onClick={() => onSelectGroup(g.id)}
+      >
+        <Avatar size="xs" name={label} bg="brand.400" color="white" />
+        <Text flex={1} fontSize="sm" fontWeight={active ? 600 : 400} isTruncated>
+          {label}
+        </Text>
+        {isPersonal && <Icon as={VscLock} boxSize="11px" color="ink.subtle" flexShrink={0} />}
+        {!isPersonal && g.member_count != null && (
+          <Text fontSize="11px" color="ink.subtle" flexShrink={0}>
+            {g.member_count}
+          </Text>
+        )}
+        {active && <Icon as={VscCheck} color="brand.400" boxSize="13px" flexShrink={0} />}
+        <Menu placement="right-start" closeOnSelect={false}>
+          <MenuButton
+            as={IconButton}
+            aria-label={`${label} actions`}
+            icon={<VscEllipsis />}
+            size="xs"
+            variant="ghost"
+            color="ink.subtle"
+            _hover={{ color: "ink.base", bg: "surface.hover" }}
+            onClick={(e: React.MouseEvent) => e.stopPropagation()}
+          />
+          <MenuList bg="surface.raised" borderColor="surface.border" boxShadow="pop" py={1} minW="180px">
+            {!isPersonal && (
+              <MenuItem
+                bg="transparent"
+                _hover={{ bg: "surface.hover" }}
+                fontSize="sm"
+                icon={<Icon as={VscAccount} fontSize="15px" />}
+                onClick={() => onRenameGroup(g)}
+              >
+                Rename
+              </MenuItem>
+            )}
+            <MenuItem
+              bg="transparent"
+              _hover={{ bg: "surface.hover" }}
+              fontSize="sm"
+              icon={<Icon as={VscAdd} fontSize="15px" />}
+              onClick={() => onNewWorkspace(g.id)}
+            >
+              New workspace
+            </MenuItem>
+            {!isPersonal && (
+              <MenuItem
+                bg="transparent"
+                _hover={{ bg: "surface.hover" }}
+                fontSize="sm"
+                icon={<Icon as={VscAccount} fontSize="15px" />}
+                onClick={() => onManageMembers(g)}
+              >
+                Manage members…
+              </MenuItem>
+            )}
+            {!isPersonal && (
+              <>
+                <MenuDivider borderColor="surface.border" />
+                <MenuItem
+                  bg="transparent"
+                  _hover={{ bg: "rgba(229,62,62,0.12)" }}
+                  color="red.400"
+                  fontSize="sm"
+                  icon={<Icon as={VscSignOut} fontSize="15px" />}
+                  onClick={() => onDeleteGroup(g)}
+                >
+                  Delete group
+                </MenuItem>
+              </>
+            )}
+          </MenuList>
+        </Menu>
+      </Flex>
+    );
+  };
 
   return (
     <Flex
@@ -82,6 +208,61 @@ function ActivityBar({
         </Tooltip>
       )}
 
+      {/* Group switcher: one avatar that opens a popover with every group and
+          a per-group actions menu (rename / new workspace / members / delete). */}
+      <Popover placement="right-start">
+        <PopoverTrigger>
+          <IconButton
+            aria-label="Switch group"
+            icon={
+              <Avatar
+                size="sm"
+                name={activeGroup ? groupLabel(activeGroup) : me.name || me.email}
+                bg={activeGroup ? "brand.500" : "surface.hover"}
+                color={activeGroup ? "white" : "ink.muted"}
+                fontWeight={700}
+                fontSize="13px"
+              />
+            }
+            variant="ghost"
+            size="md"
+            borderRadius="lg"
+            _hover={{ bg: "surface.hover" }}
+          />
+        </PopoverTrigger>
+        <PopoverContent
+          bg="surface.raised"
+          borderColor="surface.border"
+          boxShadow="pop"
+          w="250px"
+          maxH="70vh"
+        >
+          <PopoverBody p={1} overflowY="auto">
+            {/** Personal first, then group-scope groups. */}
+            {[...groups]
+              .sort((a, b) => (a.scope === "personal" ? -1 : b.scope === "personal" ? 1 : 0))
+              .map(row)}
+
+            <Box h="1px" bg="surface.border" mx={2} />
+            <Flex
+              align="center"
+              gap={2}
+              px={2}
+              py={1.5}
+              borderRadius="md"
+              cursor="pointer"
+              color="brand.400"
+              _hover={{ bg: "surface.hover" }}
+              onClick={onNewGroup}
+            >
+              <Icon as={VscAdd} boxSize="14px" flexShrink={0} />
+              <Text fontSize="sm">New group</Text>
+            </Flex>
+          </PopoverBody>
+        </PopoverContent>
+      </Popover>
+
+      {/* Section icons */}
       {items.map((it) => {
         const active = section === it.key;
         return (
@@ -103,7 +284,6 @@ function ActivityBar({
                 size="md"
                 color={active ? "ink.base" : "ink.subtle"}
                 _hover={{ color: "ink.base", bg: "surface.hover" }}
-                // Blur after click so the (focus-reopening) tooltip doesn't linger.
                 onClick={(e) => {
                   onSelect(it.key);
                   e.currentTarget.blur();
@@ -136,15 +316,16 @@ function ActivityBar({
 
       <Box flex={1} />
 
-      {/* Account & settings — one consolidated menu instead of loose icons. */}
+      {/* Account & settings */}
       <Menu placement="right-end">
         <Tooltip label="Account & settings" placement="right" openDelay={300}>
           <MenuButton
             as={IconButton}
             aria-label="Account and settings"
-            icon={<Avatar size="xs" name={me.name || me.email} bg="brand.600" color="white" />}
+            icon={<VscGear />}
             variant="ghost"
             size="md"
+            color="ink.subtle"
             _hover={{ bg: "surface.hover" }}
             _active={{ bg: "surface.hover" }}
           />
