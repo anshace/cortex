@@ -23,15 +23,21 @@ CREATE TABLE group_member(
 -- Backfill: every existing workspace becomes its own group (ids align 1:1
 -- because both sequences are empty and we insert in workspace id order), and
 -- workspace membership carries over to the group.
+-- Workspaces whose org has since been deleted are unreachable dead rows: skip
+-- them in the backfill (and in the group_id backfill below) so the FK on
+-- org(id)/groups(id) can't fail and take the app down at startup.
 INSERT INTO groups (org_id, name, scope, created_by, created_at)
-    SELECT org_id, name, scope, created_by, created_at FROM workspace ORDER BY id;
+    SELECT org_id, name, scope, created_by, created_at
+    FROM workspace
+    WHERE org_id IN (SELECT id FROM org)
+    ORDER BY id;
 INSERT INTO group_member (group_id, user_id, role)
     SELECT workspace_id, user_id, role FROM workspace_member;
 
 -- Workspaces now belong to a group; each existing workspace is attached to its
--- own backfilled group.
+-- own backfilled group (orphaned workspaces stay ungrouped and invisible).
 ALTER TABLE workspace ADD COLUMN group_id INTEGER REFERENCES groups(id);
-UPDATE workspace SET group_id = id;
+UPDATE workspace SET group_id = id WHERE org_id IN (SELECT id FROM org);
 
 -- Group chat lives on the group, not the workspace.
 ALTER TABLE message ADD COLUMN group_id INTEGER;
