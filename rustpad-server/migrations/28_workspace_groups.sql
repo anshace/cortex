@@ -20,24 +20,28 @@ CREATE TABLE IF NOT EXISTS group_member(
     PRIMARY KEY (group_id, user_id)
 );
 
--- Backfill: every existing workspace becomes its own group (ids align 1:1
--- because both sequences are empty and we insert in workspace id order), and
--- workspace membership carries over to the group.
+-- Backfill: every existing workspace becomes its own group, and workspace
+-- membership carries over to the group. The 1:1 workspace->group mapping is
+-- captured explicitly (ws_id) because workspace ids may have gaps from
+-- historic deletes — assuming id parity (group_id = id) would point at
+-- non-existent groups and fail the FK on groups(id) at startup.
 -- Workspaces whose org has since been deleted are unreachable dead rows: skip
--- them in the backfill (and in the group_id backfill below) so the FK on
--- org(id)/groups(id) can't fail and take the app down at startup.
-INSERT OR IGNORE INTO groups (org_id, name, scope, created_by, created_at)
-    SELECT org_id, name, scope, created_by, created_at
+-- them (in both backfills) so the FK on org(id) can't fail either.
+ALTER TABLE groups ADD COLUMN ws_id INTEGER;
+INSERT OR IGNORE INTO groups (org_id, name, scope, created_by, created_at, ws_id)
+    SELECT org_id, name, scope, created_by, created_at, id
     FROM workspace
     WHERE org_id IN (SELECT id FROM org)
     ORDER BY id;
 INSERT OR IGNORE INTO group_member (group_id, user_id, role)
     SELECT workspace_id, user_id, role FROM workspace_member;
 
--- Workspaces now belong to a group; each existing workspace is attached to its
--- own backfilled group (orphaned workspaces stay ungrouped and invisible).
+-- Workspaces now belong to their own backfilled group (orphaned workspaces
+-- stay ungrouped and invisible).
 ALTER TABLE workspace ADD COLUMN group_id INTEGER REFERENCES groups(id);
-UPDATE workspace SET group_id = id WHERE org_id IN (SELECT id FROM org);
+UPDATE workspace SET group_id = (SELECT g.id FROM groups g WHERE g.ws_id = workspace.id)
+    WHERE org_id IN (SELECT id FROM org);
+ALTER TABLE groups DROP COLUMN ws_id;
 
 -- Group chat lives on the group, not the workspace.
 ALTER TABLE message ADD COLUMN group_id INTEGER;
