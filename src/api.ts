@@ -4,7 +4,26 @@ import { encFetch } from "./crypto";
 
 export type Me = { email: string; name: string; role: string; mfa: boolean };
 export type Org = { id: number; name: string; slug: string };
-export type Workspace = { id: number; org_id: number; name: string; slug: string };
+// A group is the top-level container: a people + conversation hub with a
+// visibility layer. It holds one or more workspaces (file projects) beneath it.
+export type Group = {
+  id: number;
+  org_id: number;
+  name: string;
+  // Visibility layer: just the creator / the group's members.
+  scope: "group" | "personal";
+  created_by: number;
+  // Real member count (group scope only) — populated by the org endpoint.
+  member_count?: number;
+};
+export type Workspace = {
+  id: number;
+  // The group this file project lives in.
+  group_id: number;
+  name: string;
+  slug: string;
+  created_by: number;
+};
 export type FileRow = {
   id: number;
   workspace_id: number;
@@ -28,11 +47,20 @@ export type Presence = { id: number; last_seen: number; online: boolean };
 type ChatThread = { messages: ChatMessage[]; typing?: number[] };
 export type OrgData = {
   org: Org | null;
+  groups: Group[];
   workspaces: Workspace[];
   members: Member[];
   isOwner: boolean;
 };
-export type WorkspaceDetail = { workspace: Workspace; files: FileRow[] };
+export type GroupDetail = {
+  group: Group;
+  workspaces: Workspace[];
+  member_ids: number[];
+};
+export type WorkspaceDetail = {
+  workspace: Workspace;
+  files: FileRow[];
+};
 
 export type AdminUser = {
   id: number;
@@ -110,8 +138,34 @@ export async function adminReset2fa(id: number): Promise<void> {
 export async function getOrg(orgId?: number): Promise<OrgData> {
   return json(await fetch(`/api/org${orgQ(orgId)}`, { credentials: "include" }));
 }
-export async function createWorkspace(name: string, orgId?: number): Promise<{ workspace: Workspace }> {
-  return json(await fetch(`/api/workspaces${orgQ(orgId)}`, opts("POST", { name })));
+// Create a group (the top-level hub) with a visibility scope.
+export async function createGroup(
+  name: string,
+  orgId?: number,
+  scope?: "org" | "group" | "personal",
+): Promise<{ group: Group }> {
+  return json(
+    await fetch(`/api/groups${orgQ(orgId)}`, opts("POST", { name, scope })),
+  );
+}
+export async function getGroup(id: number): Promise<GroupDetail> {
+  return json(await fetch(`/api/groups/${id}`, { credentials: "include" }));
+}
+export async function renameGroup(id: number, name: string): Promise<void> {
+  await json(await fetch(`/api/groups/${id}`, opts("PUT", { name })));
+}
+export async function deleteGroup(id: number): Promise<void> {
+  await json(await fetch(`/api/groups/${id}`, opts("DELETE")));
+}
+export async function addGroupMember(groupId: number, userId: number): Promise<void> {
+  await json(await fetch(`/api/groups/${groupId}/members`, opts("POST", { user_id: userId })));
+}
+export async function removeGroupMember(groupId: number, userId: number): Promise<void> {
+  await json(await fetch(`/api/groups/${groupId}/members/${userId}`, opts("DELETE")));
+}
+// Create a workspace (file project) inside a group.
+export async function createWsInGroup(groupId: number, name: string): Promise<{ workspace: Workspace }> {
+  return json(await fetch(`/api/groups/${groupId}/workspaces`, opts("POST", { name })));
 }
 export async function getWorkspace(id: number): Promise<WorkspaceDetail> {
   return json(await fetch(`/api/workspaces/${id}`, { credentials: "include" }));
@@ -127,9 +181,18 @@ export async function deleteWorkspace(id: number): Promise<void> {
 export async function createFile(workspaceId: number, path: string): Promise<{ file: FileRow }> {
   return json(await fetch("/api/files", opts("POST", { workspace_id: workspaceId, path })));
 }
-export async function uploadFile(workspaceId: number, file: File): Promise<{ file: FileRow }> {
+// A file queued for upload, with the folder-relative path it should be stored
+// at (may contain slashes — the server creates the full path from the filename).
+export type UploadItem = { file: File; path: string };
+export async function uploadFile(
+  workspaceId: number,
+  file: File,
+  path?: string,
+): Promise<{ file: FileRow }> {
   const fd = new FormData();
-  fd.append("file", file);
+  // The 3-arg append overrides the multipart filename, so a folder-relative
+  // path uploads straight into its folder in one request (no move needed).
+  fd.append("file", file, path || file.name);
   return json(
     await fetch(`/api/files/upload?workspace_id=${workspaceId}`, {
       method: "POST",
@@ -137,6 +200,13 @@ export async function uploadFile(workspaceId: number, file: File): Promise<{ fil
       body: fd,
     }),
   );
+}
+// Fetch a file's bytes without triggering the browser download (used by
+// Duplicate / Copy-paste to re-upload it under a new name).
+export async function fetchFileBlob(file: FileRow): Promise<Blob> {
+  const res = await fetch(`/api/files/${file.id}/download`, { credentials: "include" });
+  if (!res.ok) throw new Error("download failed");
+  return res.blob();
 }
 export function rawUrl(file: FileRow): string {
   return `/api/files/${file.id}/raw`;
@@ -176,15 +246,15 @@ export async function moveFile(id: number, path: string): Promise<void> {
   await json(await fetch(`/api/files/${id}`, opts("PUT", { path })));
 }
 
-// ----- workspace group chat (payloads encrypted end-to-end with the server) -----
-export async function getWorkspaceChat(workspaceId: number): Promise<ChatThread> {
-  return encFetch(`/api/chat?workspace_id=${workspaceId}`);
+// ----- group chat (payloads encrypted end-to-end with the server) -----
+export async function getGroupChat(groupId: number): Promise<ChatThread> {
+  return encFetch(`/api/chat?group_id=${groupId}`);
 }
-export async function postWorkspaceChat(workspaceId: number, body: string): Promise<void> {
-  await encFetch(`/api/chat?workspace_id=${workspaceId}`, { method: "POST", body: { body } });
+export async function postGroupChat(groupId: number, body: string): Promise<void> {
+  await encFetch(`/api/chat?group_id=${groupId}`, { method: "POST", body: { body } });
 }
-export async function clearWorkspaceChat(workspaceId: number): Promise<void> {
-  await json(await fetch(`/api/chat?workspace_id=${workspaceId}`, opts("DELETE")));
+export async function clearGroupChat(groupId: number): Promise<void> {
+  await json(await fetch(`/api/chat?group_id=${groupId}`, opts("DELETE")));
 }
 // Edit / delete your own message (author-scoped on the server).
 export async function editWorkspaceChat(id: number, body: string): Promise<void> {
@@ -222,8 +292,8 @@ export async function getPresence(orgId?: number): Promise<{ presence: Presence[
 export async function pingPresence(): Promise<void> {
   try { await fetch("/api/presence", opts("POST")); } catch { /* ignore */ }
 }
-export async function pingTypingWs(workspaceId: number): Promise<void> {
-  try { await fetch(`/api/chat/typing?workspace_id=${workspaceId}`, opts("POST")); } catch { /* ignore */ }
+export async function pingTypingGroup(groupId: number): Promise<void> {
+  try { await fetch(`/api/chat/typing?group_id=${groupId}`, opts("POST")); } catch { /* ignore */ }
 }
 export async function pingTypingDm(withId: number, orgId?: number): Promise<void> {
   try { await fetch(`/api/dm/typing?with=${withId}${orgId != null ? `&org=${orgId}` : ""}`, opts("POST")); } catch { /* ignore */ }
@@ -242,30 +312,37 @@ export async function getStorage(): Promise<StorageStats> {
 export type ThreadSummary = {
   last_id: number;
   last_sender: number;
-  body: string; // short preview
+  body: string | null; // short preview; null when the thread is empty
   at: number;
   unread: number;
 };
+// Per-group summary (personal / group / org chat) for the sidebar list.
+export type GroupThreadSummary = {
+  group_id: number;
+  name: string;
+  scope: "org" | "group" | "personal";
+} & ThreadSummary;
 export type ChatOverview = {
-  ws: ThreadSummary | null;
+  gs: ThreadSummary | null;
+  gss: GroupThreadSummary[];
   dms: ({ peer_id: number } & ThreadSummary)[];
 };
 // Sends the client's per-thread read markers so the server can count unread.
 // Payload carries message previews, so it's ECIES-sealed like the rest of chat.
 export async function getChatOverview(
-  workspaceId: number | null,
+  groupId: number | null,
   orgId: number | undefined,
   read: Record<string, number>,
 ): Promise<ChatOverview> {
   const dm_read: Record<number, number> = {};
-  let ws_read: number | undefined;
+  const group_read: Record<number, number> = {};
   for (const [k, v] of Object.entries(read)) {
     if (k.startsWith("dm:")) dm_read[Number(k.slice(3))] = v;
-    else if (workspaceId != null && k === `ws:${workspaceId}`) ws_read = v;
+    else if (k.startsWith("g:")) group_read[Number(k.slice(2))] = v;
   }
   return encFetch(`/api/chat/overview`, {
     method: "POST",
-    body: { workspace_id: workspaceId ?? undefined, org: orgId, ws_read, dm_read },
+    body: { group_id: groupId ?? undefined, org: orgId, group_read, dm_read },
   });
 }
 

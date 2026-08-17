@@ -1,23 +1,52 @@
 import {
+  AlertDialog,
+  AlertDialogBody,
+  AlertDialogContent,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogOverlay,
   Box,
+  Button,
   Center,
   Flex,
+  FormControl,
+  FormLabel,
   HStack,
   Icon,
   IconButton,
+  Input,
+  Menu,
+  MenuButton,
+  MenuDivider,
+  MenuItem,
+  MenuList,
+  Switch,
   Text,
   Tooltip,
   useColorMode,
   useToast,
+  VStack,
 } from "@chakra-ui/react";
 import { MouseEvent as ReactMouseEvent, useCallback, useEffect, useRef, useState } from "react";
 import { FiMoon, FiSun } from "react-icons/fi";
 import useLocalStorageState from "use-local-storage-state";
 import {
+  VscAccount,
+  VscAdd,
   VscArrowLeft,
+  VscCheck,
+  VscChevronDown,
+  VscChevronRight,
   VscCloudDownload,
   VscCloudUpload,
+  VscClose,
   VscCollapseAll,
+  VscEdit,
+  VscEllipsis,
+  VscFiles,
+  VscFolderOpened,
+  VscGlobe,
+  VscLock,
   VscNewFile,
   VscNewFolder,
   VscOrganization,
@@ -25,22 +54,23 @@ import {
   VscSearch,
   VscSettingsGear,
   VscSignOut,
+  VscTrash,
 } from "react-icons/vsc";
 
-import ActivityBar, { Section } from "./ActivityBar";
+import ActivityBar, { groupLabel, Section } from "./ActivityBar";
 import * as api from "./api";
-import { FileRow, Me, OrgData, Workspace, WorkspaceDetail } from "./api";
+import { FileRow, Group, Me, OrgData, Workspace, WorkspaceDetail } from "./api";
 import ChatChannels, { ChatTarget } from "./ChatChannels";
 import CommandPalette, { PaletteItem } from "./CommandPalette";
+import ContextMenu, { MenuState } from "./ContextMenu";
 import { fileIcon } from "./fileIcon";
-import ChatView from "./ChatView";
+import ChatView, { ChatPrefs, DEFAULT_PREFS, WALLPAPERS, WallpaperId } from "./ChatView";
 import { ConfirmModal, PromptModal } from "./Dialogs";
 import EditorPane from "./EditorPane";
 import FileTree, { allFolderPaths, FileTreeHandle } from "./FileTree";
 import Loader from "./Loader";
 import Settings from "./Settings";
 import { PanelHeader, PanelIconButton } from "./ui";
-import WorkspaceSwitcher from "./WorkspaceSwitcher";
 
 type Props = {
   me: Me;
@@ -59,6 +89,18 @@ type ConfirmCfg = { title: string; body: string; cta?: string; onConfirm: () => 
 type GroupState = { fileIds: number[]; activeId: number | null };
 const EMPTY_GROUPS: GroupState[] = [{ fileIds: [], activeId: null }];
 
+// A path that doesn't collide with `existing`: "a.txt" → "a (1).txt" → "a (2).txt".
+function freePath(existing: Set<string>, path: string): string {
+  if (!existing.has(path)) return path;
+  const slash = path.lastIndexOf("/");
+  const dot = path.lastIndexOf(".");
+  const ext = dot > slash && dot >= 0 ? path.slice(dot) : "";
+  const stem = ext ? path.slice(0, dot) : path;
+  let n = 1;
+  while (existing.has(`${stem} (${n})${ext}`)) n++;
+  return `${stem} (${n})${ext}`;
+}
+
 function pruneGroups(gs: GroupState[], exist: Set<number>): GroupState[] {
   const mapped = gs.map((g) => {
     const ids = g.fileIds.filter((id) => exist.has(id));
@@ -74,12 +116,14 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   const { colorMode, toggleColorMode } = useColorMode();
   const [org, setOrg] = useState<OrgData | null>(null);
   const [activeWsId, setActiveWsId] = useState<number | null>(null);
+  const [activeGroupId, setActiveGroupId] = useState<number | null>(null);
   const [ws, setWs] = useState<WorkspaceDetail | null>(null);
   const [groups, setGroups] = useState<GroupState[]>(EMPTY_GROUPS);
   const [focused, setFocused] = useState(0);
   const [sectionStored, setSection] = useLocalStorageState<Section>("cortex-section", { defaultValue: "explorer" });
-  const section: Section = sectionStored === "chat" || sectionStored === "explorer" ? sectionStored : "explorer";
-  const [chatTarget, setChatTarget] = useState<ChatTarget>({ kind: "ws" });
+  const section: Section =
+    sectionStored === "chat" || sectionStored === "explorer" ? sectionStored : "explorer";
+  const [chatTarget, setChatTarget] = useState<ChatTarget>({ kind: "group" });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [palette, setPalette] = useState<null | "files" | "commands">(null);
@@ -87,11 +131,32 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [prompt, setPrompt] = useState<PromptCfg | null>(null);
   const [confirm, setConfirm] = useState<ConfirmCfg | null>(null);
+  const [wsMenu, setWsMenu] = useState<MenuState>(null);
+  // Whether the "Workspaces" section in the Explorer panel is collapsed.
+  const [wsSectionOpen, setWsSectionOpen] = useState(true);
+  // New-group dialog (name + visibility layer) and group-members dialog.
+  const [groupDraft, setGroupDraft] = useState<{
+    name: string;
+    scope: "group" | "personal";
+  } | null>(null);
+  const [membersOf, setMembersOf] = useState<Group | null>(null);
+  const [memberIds, setMemberIds] = useState<number[]>([]);
+  const [memberQuery, setMemberQuery] = useState("");
   // Unread tracking: poll the latest message id per thread and compare against
   // per-thread "last read" markers (persisted). A thread the user is actively
   // viewing is marked read automatically.
   const [overview, setOverview] = useState<api.ChatOverview | null>(null);
   const [read, setRead] = useLocalStorageState<Record<string, number>>("cortex-chat-read", { defaultValue: {} });
+  // Chat appearance prefs (wallpaper / font size / enter-to-send) — owned here
+  // so the sidebar wallpaper picker and the chat pane share one source of truth.
+  const [rawChatPrefs, setRawChatPrefs] = useLocalStorageState<ChatPrefs>("cortex-chat-prefs", {
+    defaultValue: DEFAULT_PREFS,
+  });
+  const chatPrefs: ChatPrefs = {
+    ...DEFAULT_PREFS,
+    ...rawChatPrefs,
+    wallpaper: WALLPAPERS[rawChatPrefs.wallpaper] ? rawChatPrefs.wallpaper : DEFAULT_PREFS.wallpaper,
+  };
   const readRef = useRef(read);
   readRef.current = read;
   const seeded = useRef(false);
@@ -99,6 +164,8 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
 
   const treeRef = useRef<FileTreeHandle>(null);
   const uploadInput = useRef<HTMLInputElement>(null);
+  const uploadFolderInput = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef(null);
 
   // Refs so the notification effect (which only reacts to `overview`) can read
   // the current org/me/view without re-subscribing on every keystroke.
@@ -147,14 +214,14 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     let stop = false;
     const poll = async () => {
       try {
-        const o = await api.getChatOverview(activeWsId, orgId, readRef.current);
+        const o = await api.getChatOverview(activeGroupId, orgId, readRef.current);
         if (stop) return;
         setOverview(o);
         if (!seeded.current) {
           seeded.current = true;
           setRead((prev) => {
             const next = { ...prev };
-            if (o.ws && activeWsId != null && next[`ws:${activeWsId}`] == null) next[`ws:${activeWsId}`] = o.ws.last_id;
+            if (o.gs && activeGroupId != null && next[`g:${activeGroupId}`] == null) next[`g:${activeGroupId}`] = o.gs.last_id;
             o.dms.forEach((d) => {
               if (next[`dm:${d.peer_id}`] == null) next[`dm:${d.peer_id}`] = d.last_id;
             });
@@ -171,7 +238,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       stop = true;
       window.clearInterval(id);
     };
-  }, [activeWsId, orgId, setRead]);
+  }, [activeGroupId, orgId, setRead]);
 
   // The open thread is "read" up to its latest message.
   useEffect(() => {
@@ -185,14 +252,14 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
           changed = true;
         }
       };
-      if (chatTarget.kind === "ws" && activeWsId != null && overview.ws) mark(`ws:${activeWsId}`, overview.ws.last_id);
+      if (chatTarget.kind === "group" && activeGroupId != null && overview.gs) mark(`g:${activeGroupId}`, overview.gs.last_id);
       if (chatTarget.kind === "dm") {
         const e = overview.dms.find((d) => d.peer_id === chatTarget.userId);
         if (e) mark(`dm:${chatTarget.userId}`, e.last_id);
       }
       return changed ? next : prev;
     });
-  }, [section, settingsOpen, chatTarget, overview, activeWsId, setRead]);
+  }, [section, settingsOpen, chatTarget, overview, activeGroupId, setRead]);
 
   // Who's online, for presence dots in the chat sidebar.
   useEffect(() => {
@@ -247,7 +314,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         !document.hidden && sectionRef.current === "chat" && !settingsRef.current && activeKeyRef.current === key;
       if (viewing) return; // already looking at it
       if (!mention && !document.hidden) return; // non-mentions only when backgrounded
-      const who = isWs ? `${nameOf(s.last_sender)} · workspace` : nameOf(s.last_sender);
+      const who = isWs ? `${nameOf(s.last_sender)} · group` : nameOf(s.last_sender);
       const body = s.body?.startsWith("![") ? "📷 Photo" : s.body || "New message";
       const n = new Notification(mention ? `🔔 ${who} mentioned you` : who, { body, tag: key });
       n.onclick = () => {
@@ -263,12 +330,12 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       setChatTarget(t);
       setSection("chat");
     };
-    if (activeWsId != null) consider(`ws:${activeWsId}`, overview.ws, true, () => openChat({ kind: "ws" }));
+    if (activeGroupId != null) consider(`g:${activeGroupId}`, overview.gs, true, () => openChat({ kind: "group" }));
     overview.dms.forEach((d) =>
       consider(`dm:${d.peer_id}`, d, false, () => openChat({ kind: "dm", userId: d.peer_id })),
     );
     notifySeeded.current = true;
-  }, [overview, activeWsId]);
+  }, [overview, activeGroupId]);
 
   const uploadDir = useRef<string>("");
   const editorLike = section === "explorer";
@@ -317,8 +384,18 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     return data;
   }, [orgId]);
 
+  // The active group follows the active workspace (a workspace lives inside
+  // one group), unless the user explicitly picked an empty group.
+  const activeGroup = org?.groups.find((g) => g.id === activeGroupId);
+
   useEffect(() => {
-    loadOrg().catch(() => setOrg({ org: null, workspaces: [], members: [], isOwner: false }));
+    if (activeWsId == null) return;
+    const w = org?.workspaces.find((x) => x.id === activeWsId);
+    if (w) setActiveGroupId(w.group_id);
+  }, [activeWsId, org]);
+
+  useEffect(() => {
+    loadOrg().catch(() => setOrg({ org: null, groups: [], workspaces: [], members: [], isOwner: false }));
   }, [loadOrg]);
 
   // Keep the URL (/slug) in sync with the active workspace (member view only).
@@ -363,6 +440,23 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
 
   useEffect(loadWs, [loadWs]);
 
+  // Live Explorer: poll the file list while the Explorer is visible so files
+  // uploaded/deleted by teammates appear (and disappear) without a manual
+  // refresh. loadWs also prunes tabs for deleted files.
+  useEffect(() => {
+    if (section !== "explorer" || settingsOpen) return;
+    const id = window.setInterval(loadWs, 5000);
+    return () => window.clearInterval(id);
+  }, [section, settingsOpen, loadWs]);
+
+  // Pick a group from the chat list: switch the conversation and STAY in chat
+  // (the messenger flow), unlike the Explorer switcher which jumps to Explorer.
+  function selectGroupChat(id: number) {
+    setActiveGroupId(id);
+    setChatTarget({ kind: "group" });
+    setSettingsOpen(false);
+  }
+
   function selectWorkspace(id: number) {
     setActiveWsId(id);
     setGroups(EMPTY_GROUPS);
@@ -371,6 +465,25 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     if (orgId == null) {
       const w = wsRef.current.find((x) => x.id === id);
       if (w) window.history.pushState({}, "", "/" + w.slug);
+    }
+  }
+
+  // Pick a group from the sidebar (Groups panel): make it the active group and
+  // open its home workspace (the one named like the group, else the first) —
+  // groups hold the workspaces.
+  function selectGroup(id: number) {
+    const g = org?.groups.find((x) => x.id === id);
+    setActiveGroupId(id);
+    setSidebarCollapsed(false);
+    if (g) {
+      const wss = (org?.workspaces ?? []).filter((w) => w.group_id === g.id);
+      const home = wss.find((w) => w.name === g.name) ?? wss[0];
+      if (home) selectWorkspace(home.id);
+      else {
+        setActiveWsId(null);
+        setGroups(EMPTY_GROUPS);
+        setFocused(0);
+      }
     }
   }
 
@@ -483,7 +596,31 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     }
   }
 
-  function newWorkspace() {
+  function newGroup() {
+    setGroupDraft({ name: "", scope: "group" });
+  }
+
+  async function createGroupNow() {
+    if (!groupDraft) return;
+    const name = groupDraft.name.trim();
+    if (!name) return;
+    setGroupDraft(null);
+    await run(
+      async () => {
+        const { group } = await api.createGroup(name, orgId, groupDraft.scope);
+        await loadOrg();
+        selectGroup(group.id);
+      },
+      undefined,
+      "Group created",
+    );
+  }
+
+  // Create a workspace (file project) inside the given group (or the active
+  // one when called from the Explorer switcher without a group id).
+  function newWorkspaceInGroup(groupId?: number) {
+    const gid = groupId ?? activeGroupId;
+    if (gid == null) return;
     setPrompt({
       title: "New workspace",
       label: "Name",
@@ -491,12 +628,98 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       onSubmit: (name) =>
         run(
           async () => {
-            const { workspace } = await api.createWorkspace(name, orgId);
+            const { workspace } = await api.createWsInGroup(gid, name.trim());
             await loadOrg();
             selectWorkspace(workspace.id);
           },
           undefined,
           "Workspace created",
+        ),
+    });
+  }
+
+  // Keep the group's member list loaded so the chat header can show the real
+  // member count and the members dialog opens instantly.
+  useEffect(() => {
+    if (activeGroupId == null || activeGroup?.scope !== "group") {
+      setMemberIds([]);
+      return;
+    }
+    let stop = false;
+    api
+      .getGroup(activeGroupId)
+      .then((d) => {
+        if (!stop) setMemberIds(d.member_ids);
+      })
+      .catch(() => {});
+    return () => {
+      stop = true;
+    };
+  }, [activeGroupId, activeGroup?.scope]);
+
+  // Open the group-members dialog (membership is already loaded).
+  function openMembers(g: Group) {
+    setMemberQuery("");
+    setMembersOf(g);
+  }
+
+  // Add every org member who isn't already in the group (one request each).
+  async function addAllMembers() {
+    if (!membersOf || !org) return;
+    const todo = org.members.filter(
+      (m) => m.id !== membersOf.created_by && !memberIds.includes(m.id),
+    );
+    await run(
+      async () => {
+        for (const m of todo) await api.addGroupMember(membersOf.id, m.id);
+        setMemberIds((prev) =>
+          Array.from(new Set([...prev, ...todo.map((m) => m.id)])),
+        );
+      },
+      undefined,
+      `${todo.length} ${todo.length === 1 ? "member" : "members"} added`,
+    );
+  }
+
+  async function toggleMember(userId: number, add: boolean) {
+    if (!membersOf) return;
+    await run(
+      async () => {
+        if (add) await api.addGroupMember(membersOf.id, userId);
+        else await api.removeGroupMember(membersOf.id, userId);
+        setMemberIds((prev) =>
+          add
+            ? Array.from(new Set([...prev, userId]))
+            : prev.filter((id) => id !== userId),
+        );
+      },
+      undefined,
+      add ? "Member added" : "Member removed",
+    );
+  }
+
+  function renameGroup(g: Group) {
+    setPrompt({
+      title: "Rename group",
+      label: "Name",
+      initial: g.name,
+      cta: "Rename",
+      onSubmit: (name) => run(() => api.renameGroup(g.id, name), loadOrg),
+    });
+  }
+
+  function deleteGroup(g: Group) {
+    setConfirm({
+      title: "Delete group",
+      body: `Delete "${groupLabel(g)}" and everything in it (workspaces, files, chat)? This can't be undone.`,
+      onConfirm: () =>
+        run(
+          () => api.deleteGroup(g.id),
+          () => {
+            setActiveGroupId(null);
+            setActiveWsId(null);
+            loadOrg();
+          },
         ),
     });
   }
@@ -545,21 +768,100 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     uploadInput.current?.click();
   }
 
-  async function uploadFiles(dir: string, list: FileList | File[] | null) {
+  // A folder picker (webkitdirectory) — the picked files carry folder-relative
+  // paths that we preserve on upload.
+  function requestUploadFolder(dir: string) {
+    uploadDir.current = dir;
+    uploadFolderInput.current?.click();
+  }
+
+  // Upload a batch concurrently (bounded), storing each item at its folder-
+  // relative path in one request. Name collisions get a " (n)" suffix instead
+  // of failing, so re-dropping a folder works like a real file manager.
+  async function uploadFiles(dir: string, list: api.UploadItem[] | null) {
     if (!list || activeWsId == null) return;
-    const files = Array.from(list);
-    if (files.length === 0) return;
-    for (const f of files) {
-      try {
-        const { file } = await api.uploadFile(activeWsId, f);
-        const finalPath = dir ? `${dir}/${f.name}` : file.path;
-        if (dir) await api.moveFile(file.id, finalPath);
-      } catch (e) {
-        fail(e);
+    const queue = Array.from(list).filter((it) => it.path.trim());
+    if (queue.length === 0) return;
+    const existing = new Set(ws?.files?.map((f) => f.path) ?? []);
+    const ok: string[] = [];
+    const failed: string[] = [];
+    const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
+      while (queue.length) {
+        const { file, path } = queue.shift()!;
+        const rel = path.replace(/\\/g, "/").replace(/^\/+/, "");
+        if (!rel) continue;
+        const finalPath = dir ? `${dir}/${rel}` : rel;
+        const free = freePath(existing, finalPath);
+        try {
+          await api.uploadFile(activeWsId, file, free);
+          existing.add(free);
+          ok.push(free);
+        } catch (e) {
+          failed.push(`${free}: ${e instanceof Error ? e.message : "upload failed"}`);
+        }
       }
-    }
+    });
+    await Promise.all(workers);
     loadWs();
-    toast({ title: files.length === 1 ? "Uploaded" : `Uploaded ${files.length} files`, status: "success", duration: 1800 });
+    if (failed.length === 0) {
+      toast({
+        title: ok.length === 1 ? "Uploaded" : `Uploaded ${ok.length} files`,
+        status: "success",
+        duration: 2000,
+      });
+    } else {
+      toast({
+        title: `${ok.length} uploaded, ${failed.length} failed`,
+        description: failed.slice(0, 3).join("\n"),
+        status: "warning",
+        duration: 6000,
+      });
+    }
+  }
+
+  // Copy-paste / Duplicate: pull each file's bytes down and re-upload it under
+  // the target path (auto-suffixed on collision).
+  async function copyItems(dir: string, items: { file: api.FileRow; rel: string }[]) {
+    if (activeWsId == null) return;
+    const queue = [...items];
+    const existing = new Set(ws?.files?.map((f) => f.path) ?? []);
+    const ok: string[] = [];
+    const failed: string[] = [];
+    const workers = Array.from({ length: Math.min(3, queue.length) }, async () => {
+      while (queue.length) {
+        const { file, rel } = queue.shift()!;
+        const clean = rel.replace(/\\/g, "/").replace(/^\/+/, "");
+        if (!clean) continue;
+        const finalPath = dir ? `${dir}/${clean}` : clean;
+        const free = freePath(existing, finalPath);
+        try {
+          const blob = await api.fetchFileBlob(file);
+          const name = free.split("/").pop() || free;
+          const f = new File([blob], name, { type: blob.type || undefined });
+          await api.uploadFile(activeWsId, f, free);
+          existing.add(free);
+          ok.push(free);
+        } catch (e) {
+          failed.push(`${free}: ${e instanceof Error ? e.message : "copy failed"}`);
+        }
+      }
+    });
+    await Promise.all(workers);
+    loadWs();
+    if (failed.length === 0) {
+      toast({
+        title: ok.length === 1 ? "Duplicated" : `Copied ${ok.length} files`,
+        status: "success",
+        duration: 2000,
+      });
+    } else {
+      toast({
+        title: `${ok.length} copied, ${failed.length} failed`,
+        description: failed.slice(0, 3).join("\n"),
+        status: "warning",
+        duration: 6000,
+      });
+    }
   }
 
   function deleteFiles(targets: FileRow[], label: string) {
@@ -627,29 +929,50 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     const m = org.members.find((x) => x.id === id);
     return m ? m.name || m.email : "";
   };
+  // Owners/admins and a group's creator may manage its membership.
+  const canManageGroup = (g?: Group) =>
+    !!g && g.scope === "group" && (me.role === "root" || me.role === "admin" || g.created_by === myId);
   const activeKey =
     section === "chat" && !settingsOpen
-      ? chatTarget.kind === "ws"
-        ? `ws:${activeWsId}`
+      ? chatTarget.kind === "group"
+        ? `g:${activeGroupId}`
         : `dm:${chatTarget.userId}`
       : null;
   activeKeyRef.current = activeKey;
-  const summaryPreview = (s: api.ThreadSummary, isWs: boolean) => {
-    const body = s.body?.startsWith("![") ? "📷 Photo" : s.body || "";
+  const summaryPreview = (s: api.ThreadSummary, isGroup: boolean) => {
+    // Empty threads show a quiet placeholder; nothing to preview.
+    if (!s.body && !s.last_id) return isGroup ? "No messages yet" : "";
+    // Plain-text preview: images become a photo marker, links keep their
+    // label, inline formatting is stripped — no raw markdown in the sidebar.
+    const body = (s.body || "")
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, "📷 Photo")
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+      .replace(/[`*_~>#|]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
     const fromMe = s.last_sender === myId;
-    const prefix = fromMe ? "You: " : isWs ? `${memberName(s.last_sender)}: ` : "";
-    return prefix + body;
+    const prefix = fromMe ? "You: " : isGroup ? `${memberName(s.last_sender)}: ` : "";
+    return prefix + (body || "New message");
   };
 
-  const wsUnread = activeKey === `ws:${activeWsId}` ? 0 : overview?.ws?.unread ?? 0;
-  const wsPreview = overview?.ws ? summaryPreview(overview.ws, true) : undefined;
+  const groupUnread = activeKey === `g:${activeGroupId}` ? 0 : overview?.gs?.unread ?? 0;
+  // Per-group summaries for the messenger-style sidebar: every accessible
+  // personal / group / org chat with its own preview, time and unread count.
+  const groupThreads: Record<number, api.GroupThreadSummary> = {};
+  overview?.gss.forEach((s) => {
+    groupThreads[s.group_id] = {
+      ...s,
+      body: summaryPreview(s, true),
+      unread: activeKey === `g:${s.group_id}` ? 0 : s.unread,
+    };
+  });
   const dmUnread: Record<number, number> = {};
   const dmPreview: Record<number, string> = {};
   overview?.dms.forEach((d) => {
     dmUnread[d.peer_id] = activeKey === `dm:${d.peer_id}` ? 0 : d.unread;
     dmPreview[d.peer_id] = summaryPreview(d, false);
   });
-  const chatUnreadCount = wsUnread + Object.values(dmUnread).reduce((a, b) => a + b, 0);
+  const chatUnreadCount = groupUnread + Object.values(dmUnread).reduce((a, b) => a + b, 0);
 
   const allFiles = ws?.files ?? [];
   const filesById = new Map(allFiles.map((f) => [f.id, f]));
@@ -695,7 +1018,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     { id: "newfile", label: "New File", icon: <Icon as={VscNewFile} />, run: () => goExplorerThen(() => treeRef.current?.startCreate("file")) },
     { id: "newfolder", label: "New Folder", icon: <Icon as={VscNewFolder} />, run: () => goExplorerThen(() => treeRef.current?.startCreate("folder")) },
     { id: "upload", label: "Upload Files…", icon: <Icon as={VscCloudUpload} />, run: () => requestUpload("") },
-    { id: "newws", label: "New Workspace", icon: <Icon as={VscOrganization} />, run: newWorkspace },
+    { id: "newgroup", label: "New Group", icon: <Icon as={VscOrganization} />, run: newGroup },
     { id: "split", label: "Split Editor Right", run: () => splitGroup(focusedIdx) },
     { id: "explorer", label: "Show Explorer", keywords: "files tree", run: () => showSection("explorer") },
     { id: "chat", label: "Show Chat", keywords: "messages dm", run: () => showSection("chat") },
@@ -727,6 +1050,14 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         toggleColorMode={toggleColorMode}
         onLogout={onLogout}
         onExit={onExit}
+        groups={org.groups}
+        activeGroupId={activeGroupId}
+        onSelectGroup={selectGroup}
+        onNewGroup={newGroup}
+        onRenameGroup={renameGroup}
+        onNewWorkspace={newWorkspaceInGroup}
+        onManageMembers={openMembers}
+        onDeleteGroup={deleteGroup}
       />
 
       {/* Side panel — Explorer, or Chat */}
@@ -743,46 +1074,120 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       >
         {section === "chat" ? (
           <Flex direction="column" flex={1} minH={0}>
-            {org.workspaces.length > 0 && (
-              <Box px={3} pt={3} pb={2}>
-                <WorkspaceSwitcher
-                  workspaces={org.workspaces}
-                  activeWsId={activeWsId}
-                  activeWs={activeWs}
-                  onSelect={selectWorkspace}
-                  onNew={newWorkspace}
-                  onRename={renameWorkspace}
-                  onDelete={deleteWorkspace}
-                />
-              </Box>
-            )}
+            {/* The chat sidebar is the conversation list itself (personal /
+                groups / org / DMs) — no workspace switcher up here anymore. */}
             <ChatChannels
               me={me}
-              workspaceId={activeWsId}
+              groups={org.groups}
+              activeGroupId={activeGroupId}
+              groupThreads={groupThreads}
               members={org.members}
               target={chatTarget}
               onSelect={setChatTarget}
-              wsUnread={wsUnread}
+              onSelectGroup={selectGroupChat}
               dmUnread={dmUnread}
-              wsPreview={wsPreview}
               dmPreview={dmPreview}
+              dmAt={overview?.dms ? Object.fromEntries(overview.dms.map((d) => [d.peer_id, d.at])) : undefined}
               presence={presence}
+              prefs={chatPrefs}
+              onPrefsChange={setRawChatPrefs}
             />
           </Flex>
         ) : (
           <Box flex={1} overflowY="auto" pb={2}>
-            {/* Workspace switcher — org name intentionally hidden. */}
-            <Box px={3} pt={3} pb={2}>
-              <WorkspaceSwitcher
-                workspaces={org.workspaces}
-                activeWsId={activeWsId}
-                activeWs={activeWs}
-                onSelect={selectWorkspace}
-                onNew={newWorkspace}
-                onRename={renameWorkspace}
-                onDelete={deleteWorkspace}
-              />
-            </Box>
+            {/* Workspaces — a collapsible section at the top of the Explorer panel
+                listing every workspace in the active group. The header has a
+                chevron to collapse/expand and a + button to create a workspace. */}
+            {activeGroup && (
+              <Box px={2} pt={2} pb={1}>
+                <Flex
+                  align="center"
+                  gap={1}
+                  px={1}
+                  py={0.5}
+                  borderRadius="md"
+                  cursor="pointer"
+                  _hover={{ bg: "surface.hover" }}
+                  onClick={() => setWsSectionOpen((o) => !o)}
+                >
+                  <Icon
+                    as={wsSectionOpen ? VscChevronDown : VscChevronRight}
+                    boxSize="12px"
+                    color="ink.subtle"
+                    flexShrink={0}
+                  />
+                  <Text
+                    flex={1}
+                    fontSize="10px"
+                    fontWeight={700}
+                    textTransform="uppercase"
+                    letterSpacing="0.05em"
+                    color="ink.subtle"
+                  >
+                    Workspaces
+                  </Text>
+                  <Tooltip label="New workspace" openDelay={400}>
+                    <PanelIconButton
+                      aria-label="New workspace"
+                      icon={<VscAdd />}
+                      size="xs"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        newWorkspaceInGroup(activeGroup.id);
+                      }}
+                    />
+                  </Tooltip>
+                </Flex>
+                {wsSectionOpen &&
+                  org.workspaces
+                    .filter((w) => w.group_id === activeGroup.id)
+                    .map((w) => {
+                      const active = w.id === activeWsId;
+                      return (
+                        <Flex
+                          key={w.id}
+                          align="center"
+                          gap={2}
+                          px={2}
+                          py={1.5}
+                          borderRadius="md"
+                          cursor="pointer"
+                          bg={active ? "accent.tint" : "transparent"}
+                          _hover={{ bg: active ? "accent.tint" : "surface.hover" }}
+                          w="full"
+                          onClick={() => selectWorkspace(w.id)}
+                          onContextMenu={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setWsMenu({
+                              x: e.clientX,
+                              y: e.clientY,
+                              actions: [
+                                {
+                                  label: "Rename",
+                                  icon: VscEdit,
+                                  onClick: () => renameWorkspace(w),
+                                },
+                                {
+                                  label: "Delete",
+                                  icon: VscTrash,
+                                  danger: true,
+                                  onClick: () => deleteWorkspace(w),
+                                },
+                              ],
+                            });
+                          }}
+                        >
+                          <Icon as={VscFiles} boxSize="13px" color={active ? "brand.400" : "ink.subtle"} flexShrink={0} />
+                          <Text fontSize="13px" isTruncated flex={1} color={active ? "ink.base" : "ink.muted"}>
+                            {w.name}
+                          </Text>
+                          {active && <Icon as={VscCheck} color="brand.400" boxSize="13px" flexShrink={0} />}
+                        </Flex>
+                      );
+                    })}
+              </Box>
+            )}
 
             {activeWs && (
               <>
@@ -805,11 +1210,38 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                         />
                       </Tooltip>
                       <Tooltip label="Upload" openDelay={400}>
-                        <PanelIconButton
-                          aria-label="Upload files"
-                          icon={<VscCloudUpload />}
-                          onClick={() => requestUpload("")}
-                        />
+                        <Menu placement="bottom-end">
+                          <MenuButton
+                            as={PanelIconButton}
+                            aria-label="Upload"
+                            icon={<VscCloudUpload />}
+                          />
+                          <MenuList
+                            minW="175px"
+                            bg="surface.raised"
+                            borderColor="surface.border"
+                            boxShadow="pop"
+                            fontSize="13px"
+                            py="4px"
+                          >
+                            <MenuItem
+                              icon={<Icon as={VscCloudUpload} fontSize="16px" color="ink.muted" />}
+                              fontSize="13px"
+                              borderRadius="sm"
+                              onClick={() => requestUpload("")}
+                            >
+                              Upload files…
+                            </MenuItem>
+                            <MenuItem
+                              icon={<Icon as={VscFolderOpened} fontSize="16px" color="ink.muted" />}
+                              fontSize="13px"
+                              borderRadius="sm"
+                              onClick={() => requestUploadFolder("")}
+                            >
+                              Upload folders…
+                            </MenuItem>
+                          </MenuList>
+                        </Menu>
                       </Tooltip>
                       <Tooltip label="Download workspace (.zip)" openDelay={400}>
                         <PanelIconButton
@@ -858,7 +1290,9 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                     onMove={movePath}
                     onCreate={createPath}
                     onUpload={requestUpload}
+                    onUploadFolder={requestUploadFolder}
                     onUploadFiles={uploadFiles}
+                    onCopyItems={copyItems}
                   />
                   {allFiles.length === 0 && (
                     <Text fontSize="xs" color="ink.subtle" px={2} py={2}>
@@ -889,10 +1323,17 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         <ChatView
           me={me}
           orgId={orgId}
-          workspaceId={activeWsId}
+          groupId={activeGroupId}
           members={org.members}
           isAdmin={me.role === "admin" || me.role === "root"}
           target={chatTarget}
+          groupName={activeGroup ? groupLabel(activeGroup) : undefined}
+          groupMemberCount={
+            activeGroup?.scope === "group" ? memberIds.length : undefined
+          }
+          canClearGroup={me.role === "admin" || me.role === "root" || activeGroup?.created_by === myId}
+          prefs={chatPrefs}
+          onPrefsChange={setRawChatPrefs}
         />
       ) : (
         <EditorPane
@@ -922,7 +1363,27 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         multiple
         hidden
         onChange={(e) => {
-          uploadFiles(uploadDir.current, e.target.files);
+          uploadFiles(
+            uploadDir.current,
+            Array.from(e.target.files ?? []).map((f) => ({ file: f, path: f.name })),
+          );
+          e.target.value = "";
+        }}
+      />
+      <input
+        ref={uploadFolderInput}
+        type="file"
+        multiple
+        hidden
+        {...({ webkitdirectory: "" } as Record<string, string>)}
+        onChange={(e) => {
+          uploadFiles(
+            uploadDir.current,
+            Array.from(e.target.files ?? []).map((f) => ({
+              file: f,
+              path: f.webkitRelativePath || f.name,
+            })),
+          );
           e.target.value = "";
         }}
       />
@@ -944,12 +1405,246 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         onConfirm={() => confirm?.onConfirm()}
         onClose={() => setConfirm(null)}
       />
+      <ContextMenu state={wsMenu} onClose={() => setWsMenu(null)} />
       <CommandPalette
         isOpen={palette !== null}
         onClose={() => setPalette(null)}
         placeholder={palette === "commands" ? "Type a command…" : "Search files by name…"}
         items={palette === "commands" ? commandItems : fileItems}
       />
+
+      {/* New group: name + visibility layer (personal / group / org). */}
+      <AlertDialog
+        isOpen={!!groupDraft}
+        leastDestructiveRef={dialogRef}
+        onClose={() => setGroupDraft(null)}
+        isCentered
+      >
+        <AlertDialogOverlay bg="blackAlpha.600">
+          <AlertDialogContent bg="surface.panel" border="1px solid" borderColor="surface.border" mx={4}>
+            <AlertDialogHeader fontSize="md">New group</AlertDialogHeader>
+            <AlertDialogBody>
+              <FormControl mb={3}>
+                <FormLabel fontSize="xs" color="ink.muted">
+                  Name
+                </FormLabel>
+                <Input
+                  autoFocus
+                  placeholder="e.g. Design team"
+                  value={groupDraft?.name ?? ""}
+                  onChange={(e) => setGroupDraft((d) => (d ? { ...d, name: e.target.value } : d))}
+                  onKeyDown={(e) => e.key === "Enter" && createGroupNow()}
+                />
+              </FormControl>
+              <FormLabel fontSize="xs" color="ink.muted" mb={1.5}>
+                Who can see it?
+              </FormLabel>
+              <VStack spacing={1.5} align="stretch">
+                {[
+                  {
+                    key: "personal",
+                    icon: VscLock,
+                    title: "Personal",
+                    desc: "Only you. Private notes, drafts and files.",
+                  },
+                  {
+                    key: "group",
+                    icon: VscOrganization,
+                    title: "Group",
+                    desc: "Members you invite. Files and chat for the group.",
+                  },
+                ].map((opt) => (
+                  <Flex
+                    key={opt.key}
+                    as="button"
+                    type="button"
+                    align="center"
+                    gap={2.5}
+                    p={2.5}
+                    borderRadius="md"
+                    border="1px solid"
+                    borderColor={
+                      groupDraft?.scope === opt.key ? "brand.400" : "surface.border"
+                    }
+                    bg={
+                      groupDraft?.scope === opt.key
+                        ? "rgba(139,123,255,0.12)"
+                        : "surface.raised"
+                    }
+                    _hover={{ borderColor: "brand.300" }}
+                    onClick={() => setGroupDraft((d) => (d ? { ...d, scope: opt.key as "group" | "personal" } : d))}
+                  >
+                    <Icon as={opt.icon} boxSize="18px" color={groupDraft?.scope === opt.key ? "brand.400" : "ink.muted"} />
+                    <Box textAlign="left" minW={0}>
+                      <Text fontSize="sm" fontWeight={600} color="ink.base">
+                        {opt.title}
+                      </Text>
+                      <Text fontSize="xs" color="ink.subtle">
+                        {opt.desc}
+                      </Text>
+                    </Box>
+                  </Flex>
+                ))}
+              </VStack>
+            </AlertDialogBody>
+            <AlertDialogFooter>
+              <Button variant="ghost" size="sm" mr={2} onClick={() => setGroupDraft(null)}>
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                colorScheme="brand"
+                isDisabled={!groupDraft?.name.trim()}
+                onClick={createGroupNow}
+              >
+                Create
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialogOverlay>
+      </AlertDialog>
+
+      {/* Group members: who can see and use this group. */}
+      <AlertDialog
+        isOpen={!!membersOf}
+        leastDestructiveRef={dialogRef}
+        onClose={() => setMembersOf(null)}
+        isCentered
+      >
+        <AlertDialogOverlay bg="blackAlpha.600">
+          <AlertDialogContent bg="surface.panel" border="1px solid" borderColor="surface.border" mx={4}>
+            <AlertDialogHeader fontSize="md">
+              <HStack spacing={2}>
+                <Text>Members</Text>
+                <Flex
+                  minW="22px"
+                  h="22px"
+                  px="6px"
+                  borderRadius="full"
+                  bg="brand.500"
+                  color="white"
+                  fontSize="11px"
+                  fontWeight={700}
+                  align="center"
+                  justify="center"
+                >
+                  {memberIds.length}
+                </Flex>
+              </HStack>
+            </AlertDialogHeader>
+            <AlertDialogBody maxH="360px" overflowY="auto">
+              <Text fontSize="xs" color="ink.subtle" mb={2}>
+                Only these people can see “{membersOf?.name}” and its workspaces.
+              </Text>
+              <Flex align="center" gap={2} bg="surface.hover" borderRadius="lg" px={2.5} py={1.5} mb={2}>
+                <Icon as={VscSearch} color="ink.subtle" flexShrink={0} />
+                <Input
+                  variant="unstyled"
+                  size="sm"
+                  fontSize="sm"
+                  placeholder="Search people…"
+                  value={memberQuery}
+                  onChange={(e) => setMemberQuery(e.target.value)}
+                />
+                {memberQuery && (
+                  <Icon
+                    as={VscClose}
+                    color="ink.subtle"
+                    flexShrink={0}
+                    cursor="pointer"
+                    boxSize="14px"
+                    onClick={() => setMemberQuery("")}
+                  />
+                )}
+              </Flex>
+              {org.members
+                .filter((m) =>
+                  !memberQuery.trim() ||
+                  (m.name + " " + m.email).toLowerCase().includes(memberQuery.trim().toLowerCase()),
+                )
+                .map((m) => {
+                  const isOwner = m.id === membersOf?.created_by;
+                  const on = memberIds.includes(m.id) || isOwner;
+                  return (
+                    <Flex
+                      key={m.id}
+                      align="center"
+                      justify="space-between"
+                      py={2}
+                      px={1.5}
+                      borderRadius="md"
+                      _hover={{ bg: "surface.hover" }}
+                    >
+                      <HStack spacing={2.5} minW={0}>
+                        <Center
+                          boxSize="32px"
+                          borderRadius="full"
+                          bg={on ? "brand.500" : "surface.hover"}
+                          color={on ? "white" : "ink.muted"}
+                          fontSize="xs"
+                          fontWeight={700}
+                          flexShrink={0}
+                        >
+                          {(m.name || m.email).charAt(0).toUpperCase()}
+                        </Center>
+                        <Box minW={0}>
+                          <Text fontSize="sm" color="ink.base" isTruncated>
+                            {m.name || m.email}
+                            {isOwner && (
+                              <Text as="span" fontSize="xs" color="ink.subtle" ml={1.5}>
+                                owner
+                              </Text>
+                            )}
+                            {!isOwner && m.role === "admin" && (
+                              <Text as="span" fontSize="xs" color="ink.subtle" ml={1.5}>
+                                admin
+                              </Text>
+                            )}
+                          </Text>
+                          <Text fontSize="xs" color="ink.subtle" isTruncated>
+                            {m.email}
+                          </Text>
+                        </Box>
+                      </HStack>
+                      {isOwner ? (
+                        <Text fontSize="xs" color="ink.subtle" flexShrink={0}>
+                          Owner
+                        </Text>
+                      ) : (
+                        <Switch
+                          colorScheme="brand"
+                          size="sm"
+                          isChecked={on}
+                          onChange={(e) => toggleMember(m.id, e.target.checked)}
+                        />
+                      )}
+                    </Flex>
+                  );
+                })}
+              {org.members.length > 0 &&
+                memberIds.length < org.members.length &&
+                !memberQuery.trim() && (
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    color="brand.400"
+                    mt={1}
+                    leftIcon={<Icon as={VscAdd} />}
+                    _hover={{ bg: "surface.hover" }}
+                    onClick={addAllMembers}
+                  >
+                    Add everyone ({org.members.length - memberIds.length} left)
+                  </Button>
+                )}
+            </AlertDialogBody>
+            <AlertDialogFooter>
+              <Button size="sm" colorScheme="brand" onClick={() => setMembersOf(null)}>
+                Done
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialogOverlay>
+      </AlertDialog>
     </Flex>
   );
 }

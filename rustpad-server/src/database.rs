@@ -84,17 +84,37 @@ pub struct AdminOrg {
     pub workspaces: i64,
 }
 
-/// A workspace within an org.
+/// A group: the people + conversation hub inside an org, scoped to one of
+/// three layers — `org` (whole org), `group` (visible to group_member rows)
+/// or `personal` (visible only to `created_by`). A group holds one or more
+/// workspaces (file/code projects) beneath it, and its own chat.
 #[derive(sqlx::FromRow, Serialize, PartialEq, Eq, Clone, Debug)]
-pub struct Workspace {
+pub struct Group {
     /// Primary key.
     pub id: i64,
     /// Owning org.
     pub org_id: i64,
     /// Display name.
     pub name: String,
-    /// URL slug, unique within the org (e.g. "backend").
+    /// Visibility layer: "org" | "group" | "personal".
+    pub scope: String,
+    /// Creator; owner for personal/group scopes.
+    pub created_by: i64,
+}
+
+/// A workspace (file project) inside a group.
+#[derive(sqlx::FromRow, Serialize, PartialEq, Eq, Clone, Debug)]
+pub struct Workspace {
+    /// Primary key.
+    pub id: i64,
+    /// Owning group.
+    pub group_id: i64,
+    /// Display name.
+    pub name: String,
+    /// URL slug, unique within the group (e.g. "backend").
     pub slug: String,
+    /// Creator.
+    pub created_by: i64,
 }
 
 /// Turn a name into a URL slug.
@@ -511,7 +531,7 @@ impl Database {
         sqlx::query_as(
             r#"SELECT o.id, o.name, o.slug,
                       (SELECT count(*) FROM users u WHERE u.org_id = o.id) AS members,
-                      (SELECT count(*) FROM workspace w WHERE w.org_id = o.id) AS workspaces
+                      (SELECT count(*) FROM workspace w JOIN groups g ON g.id = w.group_id WHERE g.org_id = o.id) AS workspaces
                FROM org o ORDER BY o.name"#,
         )
         .fetch_all(&self.pool)
@@ -538,31 +558,46 @@ impl Database {
         Ok(())
     }
 
-    /// Delete an org and everything in it (workspaces, files, chat), and
-    /// unassign its users.
+    /// Delete an org and everything in it (groups, workspaces, files, chat),
+    /// and unassign its users.
     pub async fn delete_org(&self, id: i64) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"DELETE FROM file_blob WHERE file_id IN
-               (SELECT f.id FROM file f JOIN workspace w ON w.id = f.workspace_id WHERE w.org_id = $1)"#,
+               (SELECT f.id FROM file f
+                  JOIN workspace w ON w.id = f.workspace_id
+                  JOIN groups g ON g.id = w.group_id WHERE g.org_id = $1)"#,
         )
         .bind(id)
         .execute(&mut tx)
         .await?;
         sqlx::query(
             r#"DELETE FROM document WHERE id IN
-               (SELECT f.doc_id FROM file f JOIN workspace w ON w.id = f.workspace_id WHERE w.org_id = $1)"#,
+               (SELECT f.doc_id FROM file f
+                  JOIN workspace w ON w.id = f.workspace_id
+                  JOIN groups g ON g.id = w.group_id WHERE g.org_id = $1)"#,
         )
         .bind(id)
         .execute(&mut tx)
         .await?;
         sqlx::query(
-            r#"DELETE FROM file WHERE workspace_id IN (SELECT id FROM workspace WHERE org_id = $1)"#,
+            r#"DELETE FROM file WHERE workspace_id IN
+               (SELECT w.id FROM workspace w JOIN groups g ON g.id = w.group_id WHERE g.org_id = $1)"#,
         )
         .bind(id)
         .execute(&mut tx)
         .await?;
-        sqlx::query(r#"DELETE FROM workspace WHERE org_id = $1"#)
+        sqlx::query(
+            r#"DELETE FROM workspace WHERE group_id IN (SELECT id FROM groups WHERE org_id = $1)"#,
+        )
+        .bind(id)
+        .execute(&mut tx)
+        .await?;
+        sqlx::query(r#"DELETE FROM group_member WHERE group_id IN (SELECT id FROM groups WHERE org_id = $1)"#)
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query(r#"DELETE FROM groups WHERE org_id = $1"#)
             .bind(id)
             .execute(&mut tx)
             .await?;
@@ -594,12 +629,207 @@ impl Database {
         .map_err(|e| e.into())
     }
 
-    // ----- Workspaces (org-scoped) -----
+    // ----- Groups (the people + conversation hub) -----
 
-    /// Create a workspace in an org, with a slug unique within that org.
-    pub async fn create_workspace(
+    /// Create a group in an org with a visibility scope
+    /// ("org" | "group" | "personal"). For "group" the creator is added as
+    /// a member (owner) so they can see it immediately.
+    pub async fn create_group(
         &self,
         org_id: i64,
+        name: &str,
+        created_by: i64,
+        now: i64,
+        scope: &str,
+    ) -> Result<Group> {
+        let row: (i64,) = sqlx::query_as(
+            r#"INSERT INTO groups (org_id, name, scope, created_by, created_at)
+               VALUES ($1, $2, $3, $4, $5) RETURNING id"#,
+        )
+        .bind(org_id)
+        .bind(name)
+        .bind(scope)
+        .bind(created_by)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        if scope == "group" {
+            let _ = self.add_group_member(row.0, created_by, "owner").await;
+        }
+        Ok(Group {
+            id: row.0,
+            org_id,
+            name: name.to_string(),
+            scope: scope.to_string(),
+            created_by,
+        })
+    }
+
+    /// List the groups in an org (used by the root owner, who bypasses scoping).
+    pub async fn list_groups(&self, org_id: i64) -> Result<Vec<Group>> {
+        sqlx::query_as(
+            r#"SELECT id, org_id, name, scope, created_by FROM groups WHERE org_id = $1 ORDER BY name"#,
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.into())
+    }
+
+    /// List the groups in an org that a regular member may see: every org-wide
+    /// group, their own personal groups, and every group they belong to.
+    pub async fn list_groups_for_user(
+        &self,
+        org_id: i64,
+        user_id: i64,
+    ) -> Result<Vec<Group>> {
+        sqlx::query_as(
+            r#"SELECT g.id, g.org_id, g.name, g.scope, g.created_by
+               FROM groups g
+               WHERE g.org_id = $1
+                 AND (g.scope = 'org'
+                      OR (g.scope = 'personal' AND g.created_by = $2)
+                      OR (g.scope = 'group' AND EXISTS (
+                          SELECT 1 FROM group_member m
+                          WHERE m.group_id = g.id AND m.user_id = $2)))
+               ORDER BY g.name"#,
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| e.into())
+    }
+
+    /// Fetch a group by id.
+    pub async fn get_group(&self, id: i64) -> Result<Option<Group>> {
+        sqlx::query_as(
+            r#"SELECT id, org_id, name, scope, created_by FROM groups WHERE id = $1"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.into())
+    }
+
+    /// Add a member to a group (no-op when already a member).
+    pub async fn add_group_member(&self, group_id: i64, user_id: i64, role: &str) -> Result<()> {
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO group_member (group_id, user_id, role)
+               VALUES ($1, $2, $3)"#,
+        )
+        .bind(group_id)
+        .bind(user_id)
+        .bind(role)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove a member from a group.
+    pub async fn remove_group_member(&self, group_id: i64, user_id: i64) -> Result<()> {
+        sqlx::query(
+            r#"DELETE FROM group_member WHERE group_id = $1 AND user_id = $2"#,
+        )
+        .bind(group_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// True when the user is a member of the group (group scope).
+    pub async fn is_group_member(&self, group_id: i64, user_id: i64) -> Result<bool> {
+        let row: (i64,) = sqlx::query_as(
+            r#"SELECT count(*) FROM group_member WHERE group_id = $1 AND user_id = $2"#,
+        )
+        .bind(group_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0 > 0)
+    }
+
+    /// Member user-ids of a group (empty for other scopes).
+    pub async fn group_member_ids(&self, group_id: i64) -> Result<Vec<i64>> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            r#"SELECT user_id FROM group_member WHERE group_id = $1 ORDER BY user_id"#,
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    /// Rename a group.
+    pub async fn rename_group(&self, id: i64, name: &str) -> Result<()> {
+        sqlx::query(r#"UPDATE groups SET name = $1 WHERE id = $2"#)
+            .bind(name)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete a group: its chat, memberships, workspaces and all their
+    /// files/blobs/documents.
+    pub async fn delete_group(&self, id: i64) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(r#"DELETE FROM group_member WHERE group_id = $1"#)
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query(r#"DELETE FROM message WHERE group_id = $1"#)
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query(
+            r#"DELETE FROM file_blob WHERE file_id IN (
+                SELECT f.id FROM file f JOIN workspace w ON w.id = f.workspace_id WHERE w.group_id = $1)"#,
+        )
+        .bind(id)
+        .execute(&mut tx)
+        .await?;
+        sqlx::query(
+            r#"DELETE FROM document WHERE id IN (
+                SELECT f.doc_id FROM file f JOIN workspace w ON w.id = f.workspace_id WHERE w.group_id = $1)"#,
+        )
+        .bind(id)
+        .execute(&mut tx)
+        .await?;
+        sqlx::query(
+            r#"DELETE FROM file WHERE workspace_id IN (SELECT id FROM workspace WHERE group_id = $1)"#,
+        )
+        .bind(id)
+        .execute(&mut tx)
+        .await?;
+        sqlx::query(r#"DELETE FROM workspace WHERE group_id = $1"#)
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query(r#"DELETE FROM groups WHERE id = $1"#)
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The org that owns a group, if it exists.
+    pub async fn group_org(&self, group_id: i64) -> Result<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as(r#"SELECT org_id FROM groups WHERE id = $1"#)
+            .bind(group_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    // ----- Workspaces (file projects inside a group) -----
+
+    /// Create a workspace inside a group, with a slug unique within that group.
+    pub async fn create_workspace(
+        &self,
+        group_id: i64,
         name: &str,
         created_by: i64,
         now: i64,
@@ -607,15 +837,15 @@ impl Database {
         let base = slugify(name);
         let mut slug = base.clone();
         let mut n = 2;
-        while self.slug_taken(org_id, &slug).await? {
+        while self.slug_taken(group_id, &slug).await? {
             slug = format!("{base}-{n}");
             n += 1;
         }
         let row: (i64,) = sqlx::query_as(
-            r#"INSERT INTO workspace (org_id, name, slug, created_by, created_at)
+            r#"INSERT INTO workspace (group_id, name, slug, created_by, created_at)
                VALUES ($1, $2, $3, $4, $5) RETURNING id"#,
         )
-        .bind(org_id)
+        .bind(group_id)
         .bind(name)
         .bind(&slug)
         .bind(created_by)
@@ -624,28 +854,29 @@ impl Database {
         .await?;
         Ok(Workspace {
             id: row.0,
-            org_id,
+            group_id,
             name: name.to_string(),
             slug,
+            created_by,
         })
     }
 
-    async fn slug_taken(&self, org_id: i64, slug: &str) -> Result<bool> {
+    async fn slug_taken(&self, group_id: i64, slug: &str) -> Result<bool> {
         let row: (i64,) =
-            sqlx::query_as(r#"SELECT count(*) FROM workspace WHERE org_id = $1 AND slug = $2"#)
-                .bind(org_id)
+            sqlx::query_as(r#"SELECT count(*) FROM workspace WHERE group_id = $1 AND slug = $2"#)
+                .bind(group_id)
                 .bind(slug)
                 .fetch_one(&self.pool)
                 .await?;
         Ok(row.0 > 0)
     }
 
-    /// List the workspaces in an org.
-    pub async fn list_workspaces(&self, org_id: i64) -> Result<Vec<Workspace>> {
+    /// List the workspaces inside a group.
+    pub async fn list_workspaces(&self, group_id: i64) -> Result<Vec<Workspace>> {
         sqlx::query_as(
-            r#"SELECT id, org_id, name, slug FROM workspace WHERE org_id = $1 ORDER BY name"#,
+            r#"SELECT id, group_id, name, slug, created_by FROM workspace WHERE group_id = $1 ORDER BY name"#,
         )
-        .bind(org_id)
+        .bind(group_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| e.into())
@@ -653,11 +884,13 @@ impl Database {
 
     /// Fetch a workspace by id.
     pub async fn get_workspace(&self, id: i64) -> Result<Option<Workspace>> {
-        sqlx::query_as(r#"SELECT id, org_id, name, slug FROM workspace WHERE id = $1"#)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| e.into())
+        sqlx::query_as(
+            r#"SELECT id, group_id, name, slug, created_by FROM workspace WHERE id = $1"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| e.into())
     }
 
     /// Rename a workspace.
@@ -697,19 +930,31 @@ impl Database {
         Ok(())
     }
 
-    /// The org that owns a workspace, if it exists.
+    /// The org that owns the group containing a workspace, if it exists.
     pub async fn workspace_org(&self, workspace_id: i64) -> Result<Option<i64>> {
-        let row: Option<(i64,)> = sqlx::query_as(r#"SELECT org_id FROM workspace WHERE id = $1"#)
+        let row: Option<(i64,)> = sqlx::query_as(
+            r#"SELECT g.org_id FROM workspace w JOIN groups g ON g.id = w.group_id
+               WHERE w.id = $1"#,
+        )
+        .bind(workspace_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// The group that owns a workspace, if it exists.
+    pub async fn workspace_group(&self, workspace_id: i64) -> Result<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as(r#"SELECT group_id FROM workspace WHERE id = $1"#)
             .bind(workspace_id)
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|r| r.0))
-    }
-
-    /// The org that owns the workspace containing a file, if it exists.
+    }    /// The org that owns the group containing the workspace of a file, if any.
     pub async fn file_org(&self, file_id: i64) -> Result<Option<i64>> {
         let row: Option<(i64,)> = sqlx::query_as(
-            r#"SELECT w.org_id FROM file f JOIN workspace w ON w.id = f.workspace_id
+            r#"SELECT g.org_id FROM file f
+               JOIN workspace w ON w.id = f.workspace_id
+               JOIN groups g ON g.id = w.group_id
                WHERE f.id = $1"#,
         )
         .bind(file_id)
@@ -718,16 +963,40 @@ impl Database {
         Ok(row.map(|r| r.0))
     }
 
-    /// The org that owns the workspace containing the file for a document.
+    /// The org that owns the group containing the workspace of a document.
     pub async fn doc_org(&self, doc_id: &str) -> Result<Option<i64>> {
         let row: Option<(i64,)> = sqlx::query_as(
-            r#"SELECT w.org_id FROM file f JOIN workspace w ON w.id = f.workspace_id
+            r#"SELECT g.org_id FROM file f
+               JOIN workspace w ON w.id = f.workspace_id
+               JOIN groups g ON g.id = w.group_id
                WHERE f.doc_id = $1"#,
         )
         .bind(doc_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.0))
+    }
+
+    /// The group, org, visibility scope and creator of the group that owns
+    /// the workspace of a document — used for the layered access check on the
+    /// collaborative socket. Returns (group_id, org_id, scope, created_by).
+    #[allow(clippy::type_complexity)]
+    pub async fn doc_ws_info(
+        &self,
+        doc_id: &str,
+
+    ) -> Result<Option<(i64, i64, String, i64)>> {
+        let row: Option<(i64, i64, String, i64)> = sqlx::query_as(
+            r#"SELECT g.id, g.org_id, g.scope, g.created_by
+               FROM file f
+               JOIN workspace w ON w.id = f.workspace_id
+               JOIN groups g ON g.id = w.group_id
+               WHERE f.doc_id = $1"#,
+        )
+        .bind(doc_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     // ----- Files -----
@@ -876,21 +1145,21 @@ impl Database {
         Ok(a + b)
     }
 
-    // ----- Workspace group chat -----
+    // ----- Group chat -----
 
-    /// Post a message to a workspace's group chat (org_id derived from workspace).
+    /// Post a message to a group's chat (org_id derived from the group).
     pub async fn create_message(
         &self,
-        workspace_id: i64,
+        group_id: i64,
         user_id: i64,
         body: &str,
         now: i64,
     ) -> Result<()> {
         sqlx::query(
-            r#"INSERT INTO message (workspace_id, org_id, user_id, body, created_at)
-               VALUES ($1, (SELECT org_id FROM workspace WHERE id = $1), $2, $3, $4)"#,
+            r#"INSERT INTO message (group_id, org_id, user_id, body, created_at)
+               VALUES ($1, (SELECT org_id FROM groups WHERE id = $1), $2, $3, $4)"#,
         )
-        .bind(workspace_id)
+        .bind(group_id)
         .bind(user_id)
         .bind(body)
         .bind(now)
@@ -899,14 +1168,14 @@ impl Database {
         Ok(())
     }
 
-    /// The most recent messages in a workspace, oldest-first.
-    pub async fn list_messages(&self, workspace_id: i64, limit: i64) -> Result<Vec<ChatMessage>> {
+    /// The most recent messages in a group, oldest-first.
+    pub async fn list_messages(&self, group_id: i64, limit: i64) -> Result<Vec<ChatMessage>> {
         let mut rows: Vec<ChatMessage> = sqlx::query_as(
             r#"SELECT m.id, m.body, u.name AS author, u.email AS email, m.created_at, m.edited_at
                FROM message m JOIN users u ON u.id = m.user_id
-               WHERE m.workspace_id = $1 ORDER BY m.id DESC LIMIT $2"#,
+               WHERE m.group_id = $1 ORDER BY m.id DESC LIMIT $2"#,
         )
-        .bind(workspace_id)
+        .bind(group_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -914,26 +1183,26 @@ impl Database {
         Ok(rows)
     }
 
-    /// The latest message in a workspace: (id, author id, body, created_at).
-    pub async fn workspace_last_msg(
+    /// The latest message in a group: (id, author id, body, created_at).
+    pub async fn group_last_msg(
         &self,
-        workspace_id: i64,
+        group_id: i64,
     ) -> Result<Option<(i64, i64, String, i64)>> {
         Ok(sqlx::query_as(
             r#"SELECT id, user_id, body, created_at FROM message
-               WHERE workspace_id = $1 ORDER BY id DESC LIMIT 1"#,
+               WHERE group_id = $1 ORDER BY id DESC LIMIT 1"#,
         )
-        .bind(workspace_id)
+        .bind(group_id)
         .fetch_optional(&self.pool)
         .await?)
     }
 
-    /// Count of workspace messages after `after` not sent by `me` (unread).
-    pub async fn ws_unread_count(&self, workspace_id: i64, me: i64, after: i64) -> Result<i64> {
+    /// Count of group messages after `after` not sent by `me` (unread).
+    pub async fn group_unread_count(&self, group_id: i64, me: i64, after: i64) -> Result<i64> {
         let (n,): (i64,) = sqlx::query_as(
-            r#"SELECT COUNT(*) FROM message WHERE workspace_id = $1 AND id > $2 AND user_id <> $3"#,
+            r#"SELECT COUNT(*) FROM message WHERE group_id = $1 AND id > $2 AND user_id <> $3"#,
         )
-        .bind(workspace_id)
+        .bind(group_id)
         .bind(after)
         .bind(me)
         .fetch_one(&self.pool)
@@ -1014,10 +1283,10 @@ impl Database {
         Ok(r.rows_affected() > 0)
     }
 
-    /// Clear a workspace's group chat (admin/root only — enforced at the route).
-    pub async fn clear_messages(&self, workspace_id: i64) -> Result<()> {
-        sqlx::query(r#"DELETE FROM message WHERE workspace_id = $1"#)
-            .bind(workspace_id)
+    /// Clear a group's chat (admin/root only — enforced at the route).
+    pub async fn clear_messages(&self, group_id: i64) -> Result<()> {
+        sqlx::query(r#"DELETE FROM message WHERE group_id = $1"#)
+            .bind(group_id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -1178,18 +1447,18 @@ impl Database {
         Ok(())
     }
 
-    /// Reactions for every message in a workspace's group chat, keyed by msg id.
-    pub async fn reactions_for_workspace(
+    /// Reactions for every message in a group's chat, keyed by msg id.
+    pub async fn reactions_for_group(
         &self,
-        workspace_id: i64,
+        group_id: i64,
         me: i64,
     ) -> Result<HashMap<i64, Vec<ReactionView>>> {
         let rows: Vec<(i64, String, i64)> = sqlx::query_as(
             r#"SELECT r.msg_id, r.emoji, r.user_id
                FROM reaction r JOIN message m ON m.id = r.msg_id
-               WHERE r.kind = 'ws' AND m.workspace_id = $1"#,
+               WHERE r.kind = 'ws' AND m.group_id = $1"#,
         )
-        .bind(workspace_id)
+        .bind(group_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(group_reactions(rows, me))
