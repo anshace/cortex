@@ -1825,7 +1825,7 @@ function ChatView({
         )}
         {/* Attachment chips — the visible "files attached" strip above the
             input. Each chip has a thumb (images) or an icon and an × to drop. */}
-        {pends.length > 0 && (
+        {pends.length > 0 && !recording && (
           <Flex gap={1.5} mb={2} flexWrap="wrap">
             {pends.map((p, i) => (
               <HStack
@@ -1879,79 +1879,119 @@ function ChatView({
             ))}
           </Flex>
         )}
-        <Flex
-          align="flex-end"
-          bg="surface.raised"
-          border="1px solid"
-          borderColor="surface.border"
-          _focusWithin={{ borderColor: "brand.500" }}
-          borderRadius="20px"
-          pl={2}
-          pr="6px"
-          py="4px"
-          transition="border-color 0.15s"
-          opacity={canSend ? 1 : 0.6}
-        >
-          <input
-            ref={attachInput}
-            type="file"
-            multiple
-            hidden
-            onChange={(e) => {
-              attachFiles(e.target.files);
-              e.target.value = "";
-            }}
-          />
-          <EmojiInput
-            onPick={(e) => {
-              setDraft((d) => d + e);
-              requestAnimationFrame(() => {
-                inputRef.current?.focus();
-                autoGrow();
-              });
-            }}
-          />
-          <Textarea
-            ref={inputRef}
-            value={draft}
-            onChange={onDraftChange}
-            onKeyDown={onKeyDown}
-            onPaste={onPaste}
-            isDisabled={!canSend}
-            variant="unstyled"
-            placeholder={
-              editing != null
-                ? "Edit your message…"
-                : target.kind === "group"
-                  ? `Message the group…${prefs.enterToSend ? "" : "  (Ctrl+Enter to send)"}`
-                  : `Message ${title}…${prefs.enterToSend ? "" : "  (Ctrl+Enter to send)"}`
-            }
-            resize="none"
-            rows={1}
-            minH="26px"
-            maxH="160px"
-            py={2}
-            flex={1}
-            fontSize="sm"
-          />
-          {recording ? (
-            <Flex align="center" gap={1.5} px={1} mb="3px">
-              <Box
-                boxSize="8px"
-                borderRadius="full"
-                bg="red.400"
-                flexShrink={0}
-                sx={{ animation: `${pulseKey} 1s infinite` }}
-              />
-              <Text
-                fontSize="xs"
-                color="ink.muted"
-                sx={{ fontVariantNumeric: "tabular-nums" }}
-              >
-                {`${Math.floor(recSeconds / 60)}:${String(recSeconds % 60).padStart(2, "0")}`}
-              </Text>
+        {recording ? (
+          /* Full-width recording bar — replaces the entire composer while
+              recording so the user gets a clear, spacious countdown + stop. */
+          <Flex
+            align="center"
+            gap={3}
+            w="100%"
+            bg="surface.raised"
+            border="1px solid"
+            borderColor="red.400"
+            borderRadius="20px"
+            pl={4}
+            pr={2}
+            py={3}
+          >
+            <Box
+              boxSize="10px"
+              borderRadius="full"
+              bg="red.400"
+              flexShrink={0}
+              sx={{ animation: `${pulseKey} 1s infinite` }}
+            />
+            <Text
+              fontSize="xl"
+              fontWeight="bold"
+              color="red.400"
+              sx={{ fontVariantNumeric: "tabular-nums" }}
+              flexShrink={0}
+            >
+              {`${Math.floor(recSeconds / 60)}:${String(recSeconds % 60).padStart(2, "0")}`}
+            </Text>
+            <Flex align="center" gap="2px" flex={1} justify="center">
+              {Array.from({ length: 32 }).map((_, i) => (
+                <Box
+                  key={i}
+                  w="3px"
+                  borderRadius="full"
+                  bg="red.300"
+                  h={`${6 + Math.sin(i * 0.6 + recSeconds * 3) * 6}px`}
+                  transition="height 0.15s ease"
+                />
+              ))}
             </Flex>
-          ) : (
+            <Text fontSize="xs" color="ink.subtle" flexShrink={0}>
+              Recording
+            </Text>
+            <IconButton
+              aria-label="Stop recording"
+              icon={<Icon as={LuSquare} />}
+              size="sm"
+              borderRadius="full"
+              bg="red.400"
+              color="white"
+              _hover={{ bg: "red.500" }}
+              onClick={toggleRecording}
+            />
+          </Flex>
+        ) : (
+          <Flex
+            align="flex-end"
+            bg="surface.raised"
+            border="1px solid"
+            borderColor="surface.border"
+            _focusWithin={{ borderColor: "brand.500" }}
+            borderRadius="20px"
+            pl={2}
+            pr="6px"
+            py="4px"
+            transition="border-color 0.15s"
+            opacity={canSend ? 1 : 0.6}
+          >
+            <input
+              ref={attachInput}
+              type="file"
+              multiple
+              hidden
+              onChange={(e) => {
+                attachFiles(e.target.files);
+                e.target.value = "";
+              }}
+            />
+            <EmojiInput
+              onPick={(e) => {
+                setDraft((d) => d + e);
+                requestAnimationFrame(() => {
+                  inputRef.current?.focus();
+                  autoGrow();
+                });
+              }}
+            />
+            <Textarea
+              ref={inputRef}
+              value={draft}
+              onChange={onDraftChange}
+              onKeyDown={onKeyDown}
+              onPaste={onPaste}
+              isDisabled={!canSend}
+              variant="unstyled"
+              placeholder={
+                editing != null
+                  ? "Edit your message…"
+                  : target.kind === "group"
+                    ? `Message the group…${prefs.enterToSend ? "" : "  (Ctrl+Enter to send)"}`
+                    : `Message ${title}…${prefs.enterToSend ? "" : "  (Ctrl+Enter to send)"}`
+              }
+              resize="none"
+              rows={1}
+              minH="26px"
+              maxH="160px"
+              py={2}
+              flex={1}
+              fontSize="sm"
+            />
             <IconButton
               aria-label="Attach file or image"
               icon={<Icon as={LuPaperclip} />}
@@ -1962,32 +2002,32 @@ function ChatView({
               isDisabled={!canSend || editing != null}
               onClick={() => attachInput.current?.click()}
             />
-          )}
-          <IconButton
-            aria-label={recording ? "Stop recording" : "Record voice note"}
-            icon={<Icon as={recording ? LuSquare : LuMic} />}
-            size="sm"
-            variant="ghost"
-            color={recording ? "red.400" : "ink.muted"}
-            _hover={{ color: recording ? "red.400" : "ink.base", bg: "surface.hover" }}
-            isDisabled={!canSend}
-            onClick={toggleRecording}
-          />
-          <IconButton
-            aria-label={editing != null ? "Save edit" : "Send message"}
-            icon={<Icon as={editing != null ? VscCheck : LuSend} />}
-            type="submit"
-            size="sm"
-            borderRadius="full"
-            colorScheme="brand"
-            alignSelf="flex-end"
-            mb="3px"
-            isLoading={sending}
-            // Attachments alone (no typed text) are a valid message — only
-            // disable when there's neither text nor staged attachments.
-            isDisabled={(!draft.trim() && pends.length === 0) || !canSend}
-          />
-        </Flex>
+            <IconButton
+              aria-label="Record voice note"
+              icon={<Icon as={LuMic} />}
+              size="sm"
+              variant="ghost"
+              color="ink.muted"
+              _hover={{ color: "ink.base", bg: "surface.hover" }}
+              isDisabled={!canSend}
+              onClick={toggleRecording}
+            />
+            <IconButton
+              aria-label={editing != null ? "Save edit" : "Send message"}
+              icon={<Icon as={editing != null ? VscCheck : LuSend} />}
+              type="submit"
+              size="sm"
+              borderRadius="full"
+              colorScheme="brand"
+              alignSelf="flex-end"
+              mb="3px"
+              isLoading={sending}
+              // Attachments alone (no typed text) are a valid message — only
+              // disable when there's neither text nor staged attachments.
+              isDisabled={(!draft.trim() && pends.length === 0) || !canSend}
+            />
+          </Flex>
+        )}
       </Box>
 
       <ConfirmModal

@@ -33,7 +33,9 @@ import {
   VscSignOut,
 } from "react-icons/vsc";
 
-import { Group, Me } from "./api";
+import { ChatOverview, Group, Me, Member } from "./api";
+import { ChatTarget } from "./ChatChannels";
+import NotificationCenter from "./NotificationCenter";
 
 export type Section = "explorer" | "chat";
 
@@ -63,6 +65,13 @@ type Props = {
   onNewWorkspace: (groupId: number) => void;
   onManageMembers: (g: Group) => void;
   onDeleteGroup: (g: Group) => void;
+  /** Notification center props */
+  overview: ChatOverview | null;
+  members: Member[];
+  chatTarget: ChatTarget;
+  settingsOpen: boolean;
+  onChatNavigate: (t: ChatTarget) => void;
+  notifInApp: boolean;
 };
 
 function ActivityBar({
@@ -83,6 +92,12 @@ function ActivityBar({
   onNewWorkspace,
   onManageMembers,
   onDeleteGroup,
+  overview,
+  members,
+  chatTarget,
+  settingsOpen,
+  onChatNavigate,
+  notifInApp,
 }: Props) {
   const items: Item[] = [
     { key: "explorer", icon: VscFiles, label: "Explorer" },
@@ -315,6 +330,20 @@ function ActivityBar({
       })}
 
       <Box flex={1} />
+
+      {/* Notification center — bell icon with unread badge + popover. */}
+      {notifInApp && (
+        <NotificationCenter
+          overview={overview}
+          members={members}
+          me={me}
+          activeGroupId={activeGroupId}
+          chatTarget={chatTarget}
+          section={section}
+          settingsOpen={settingsOpen}
+          onNavigate={onChatNavigate}
+        />
+      )}
 
       {/* Account & settings */}
       <Menu placement="right-end">

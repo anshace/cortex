@@ -24,13 +24,14 @@ import {
 import QRCode from "qrcode";
 import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
 import { FiCommand, FiSliders } from "react-icons/fi";
-import { VscAccount, VscColorMode, VscDatabase, VscHistory, VscShield } from "react-icons/vsc";
+import { VscAccount, VscBell, VscColorMode, VscDatabase, VscHistory, VscShield } from "react-icons/vsc";
+import useLocalStorageState from "use-local-storage-state";
 import * as api from "./api";
 import { Me } from "./api";
 import { EditorPrefs, useEditorPrefs } from "./editorPrefs";
 import { EDITOR_THEMES, SWATCHES, useEditorThemeId } from "./editorThemes";
 
-type Section = "profile" | "appearance" | "editor" | "keyboard" | "security" | "activity" | "storage";
+type Section = "profile" | "appearance" | "editor" | "keyboard" | "security" | "notifications" | "activity" | "storage";
 
 type Props = {
   me: Me | null;
@@ -44,6 +45,7 @@ const NAV: { id: Section; label: string; icon: typeof VscAccount; adminOnly?: bo
   { id: "editor", label: "Editor", icon: FiSliders },
   { id: "keyboard", label: "Keyboard", icon: FiCommand },
   { id: "security", label: "Security", icon: VscShield },
+  { id: "notifications", label: "Notifications", icon: VscBell },
   { id: "activity", label: "Activity", icon: VscHistory, adminOnly: true },
   { id: "storage", label: "Storage", icon: VscDatabase, adminOnly: true },
 ];
@@ -103,6 +105,7 @@ function Settings({ me, onClose, onUpdated }: Props) {
             {section === "editor" && <EditorPanel />}
             {section === "keyboard" && <KeyboardPanel />}
             {section === "security" && <SecurityPanel me={me} onUpdated={onUpdated} />}
+            {section === "notifications" && <NotificationsPanel />}
             {section === "activity" && isAdmin && <ActivityPanel />}
             {section === "storage" && isAdmin && <StoragePanel />}
           </Box>
@@ -621,6 +624,82 @@ function TwoFactor({ me, onUpdated }: { me: Me | null; onUpdated: () => void }) 
         </Button>
       )}
     </Box>
+  );
+}
+
+// ----- Notifications -----
+export type NotifPrefs = {
+  desktop: boolean;
+  sound: boolean;
+  inApp: boolean;
+};
+export const DEFAULT_NOTIF_PREFS: NotifPrefs = { desktop: true, sound: true, inApp: true };
+
+function NotificationsPanel() {
+  const [prefs, setPrefs] = useLocalStorageState<NotifPrefs>("cortex-notif-prefs", {
+    defaultValue: DEFAULT_NOTIF_PREFS,
+  });
+
+  function toggle(key: keyof NotifPrefs) {
+    setPrefs((p) => ({ ...p, [key]: !p[key] }));
+  }
+
+  return (
+    <>
+      <PanelHead
+        title="Notifications"
+        sub="Control how you're notified about new messages, mentions, and activity."
+      />
+      <Card>
+        <VStack align="stretch" spacing={4}>
+          <Flex align="center" justify="space-between">
+            <Box>
+              <Text fontSize="sm" fontWeight={600}>
+                Desktop notifications
+              </Text>
+              <Text fontSize="xs" color="ink.subtle">
+                Show browser notifications when messages arrive while the tab is in the background.
+              </Text>
+            </Box>
+            <Switch
+              isChecked={prefs.desktop}
+              onChange={() => toggle("desktop")}
+              colorScheme="brand"
+            />
+          </Flex>
+          <Flex align="center" justify="space-between">
+            <Box>
+              <Text fontSize="sm" fontWeight={600}>
+                Notification sound
+              </Text>
+              <Text fontSize="xs" color="ink.subtle">
+                Play a subtle chime when a new message arrives while the app is in the foreground.
+              </Text>
+            </Box>
+            <Switch
+              isChecked={prefs.sound}
+              onChange={() => toggle("sound")}
+              colorScheme="brand"
+            />
+          </Flex>
+          <Flex align="center" justify="space-between">
+            <Box>
+              <Text fontSize="sm" fontWeight={600}>
+                In-app notifications
+              </Text>
+              <Text fontSize="xs" color="ink.subtle">
+                Show notification badges and the notification center bell icon in the sidebar.
+                           </Text>
+            </Box>
+            <Switch
+              isChecked={prefs.inApp}
+              onChange={() => toggle("inApp")}
+              colorScheme="brand"
+            />
+          </Flex>
+        </VStack>
+      </Card>
+    </>
   );
 }
 
