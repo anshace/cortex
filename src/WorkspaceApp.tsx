@@ -58,6 +58,8 @@ import {
 } from "react-icons/vsc";
 
 import ActivityBar, { groupLabel, Section } from "./ActivityBar";
+import { DEFAULT_NOTIF_PREFS, NotifPrefs } from "./Settings";
+import { playNotifSound } from "./notifSound";
 import * as api from "./api";
 import { FileRow, Group, Me, OrgData, Workspace, WorkspaceDetail } from "./api";
 import ChatChannels, { ChatTarget } from "./ChatChannels";
@@ -157,6 +159,10 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     ...rawChatPrefs,
     wallpaper: WALLPAPERS[rawChatPrefs.wallpaper] ? rawChatPrefs.wallpaper : DEFAULT_PREFS.wallpaper,
   };
+  // Notification preferences (desktop / sound / in-app toggle).
+  const [notifPrefs] = useLocalStorageState<NotifPrefs>("cortex-notif-prefs", {
+    defaultValue: DEFAULT_NOTIF_PREFS,
+  });
   const readRef = useRef(read);
   readRef.current = read;
   const seeded = useRef(false);
@@ -303,17 +309,22 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       (!!meNow.name && b.includes(`@${meNow.name}`)) || b.includes(`@${myLocal}`);
     const canNotify =
       notifySeeded.current && "Notification" in window && Notification.permission === "granted";
+    const notifPrefsRef = notifPrefs;
 
     const consider = (key: string, s: api.ThreadSummary | undefined | null, isWs: boolean, open: () => void) => {
       if (!s || s.last_sender === myId) return;
       if (s.last_id <= (notifiedRef.current[key] ?? 0)) return;
       notifiedRef.current[key] = s.last_id;
-      if (!canNotify) return;
       const mention = s.body ? mentionsMe(s.body) : false;
       const viewing =
         !document.hidden && sectionRef.current === "chat" && !settingsRef.current && activeKeyRef.current === key;
       if (viewing) return; // already looking at it
+      // Sound: play a chime for any non-self message when the app is in the foreground.
+      if (!document.hidden && notifPrefsRef.sound) playNotifSound();
+      // Desktop notification: only when backgrounded (or when @mentioned, even foreground).
+      if (!canNotify) return;
       if (!mention && !document.hidden) return; // non-mentions only when backgrounded
+      if (!notifPrefsRef.desktop) return; // user disabled desktop notifications
       const who = isWs ? `${nameOf(s.last_sender)} · group` : nameOf(s.last_sender);
       const body = s.body?.startsWith("![") ? "📷 Photo" : s.body || "New message";
       const n = new Notification(mention ? `🔔 ${who} mentioned you` : who, { body, tag: key });
@@ -1058,6 +1069,17 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         onNewWorkspace={newWorkspaceInGroup}
         onManageMembers={openMembers}
         onDeleteGroup={deleteGroup}
+        overview={overview}
+        members={org.members}
+        chatTarget={chatTarget}
+        settingsOpen={settingsOpen}
+        onChatNavigate={(t) => {
+          setSettingsOpen(false);
+          setSidebarCollapsed(false);
+          setChatTarget(t);
+          setSection("chat");
+        }}
+        notifInApp={notifPrefs.inApp}
       />
 
       {/* Side panel — Explorer, or Chat */}

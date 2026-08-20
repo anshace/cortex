@@ -130,7 +130,7 @@ pub fn server(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         .with(warp::reply::with::header("referrer-policy", "no-referrer"))
         .with(warp::reply::with::header(
             "permissions-policy",
-            "geolocation=(), microphone=(), camera=(), payment=(), usb=()",
+            "geolocation=(), camera=(), payment=(), usb=()",
         ))
         .with(warp::reply::with::header(
             "strict-transport-security",
