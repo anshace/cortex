@@ -3,6 +3,7 @@ import {
   Center,
   Flex,
   Icon,
+  Input,
   Spinner,
   Tab,
   TabList,
@@ -20,9 +21,8 @@ import {
   useToast,
 } from "@chakra-ui/react";
 import mammoth from "mammoth";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { VscDesktopDownload, VscFileBinary } from "react-icons/vsc";
-import * as XLSX from "xlsx";
 
 import * as api from "./api";
 import { FileRow, rawUrl } from "./api";
@@ -48,39 +48,190 @@ function isWord(mime: string | null, name: string): boolean {
   return /\.docx?$/i.test(name);
 }
 
+// One sheet's grid. The full data lives in memory (parsing is fast), but only
+// a window of rows is *rendered* at first — an IntersectionObserver on the
+// bottom sentinel grows the window as you scroll, so a million-row sheet never
+// mounts a million <tr> elements. Strictly read-only by design.
+type SheetRow = (string | number | boolean | null)[];
+
+const INITIAL_ROWS = 100;
+const LOAD_MORE_ROWS = 250;
+
+function SheetTable({ data }: { data: SheetRow[] }) {
+  const [limit, setLimit] = useState(INITIAL_ROWS);
+  const [query, setQuery] = useState("");
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+
+  // Client-side text filter across every cell — cheap because it runs over the
+  // already-parsed array, not the DOM.
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return null;
+    return data.filter((row) =>
+      row.some((c) => c != null && String(c).toLowerCase().includes(q)),
+    );
+  }, [data, query]);
+
+  const rows = filtered ?? data;
+  const shown = Math.min(limit, rows.length);
+
+  // A new search starts from the top again.
+  useEffect(() => {
+    setLimit(INITIAL_ROWS);
+  }, [query]);
+
+  // Grow the rendered window when the sentinel scrolls into view.
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el) return;
+    const ob = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting))
+          setLimit((l) => Math.min(rows.length, l + LOAD_MORE_ROWS));
+      },
+      { rootMargin: "600px" }, // start loading before the user hits the edge
+    );
+    ob.observe(el);
+    return () => ob.disconnect();
+  }, [rows.length]);
+
+  if (rows.length === 0)
+    return (
+      <Center flexDirection="column" gap={2} py={16} color="ink.muted">
+        <Icon as={VscFileBinary} fontSize="2xl" color="ink.subtle" />
+        <Text fontSize="sm">
+          {filtered ? `No cells match “${query}”` : "This sheet is empty"}
+        </Text>
+      </Center>
+    );
+
+  return (
+    <Box>
+      <Flex
+        align="center"
+        gap={3}
+        px={3}
+        py={2}
+        position="sticky"
+        top={0}
+        bg="surface.panel"
+        zIndex={1}
+        borderBottom="1px solid"
+        borderColor="surface.border"
+      >
+        <Input
+          size="xs"
+          placeholder="Search this sheet…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          maxW="240px"
+          bg="surface.bg"
+        />
+        <Text fontSize="0.7rem" color="ink.subtle" flexShrink={0}>
+          {data.length.toLocaleString()} rows
+          {filtered
+            ? ` · ${rows.length.toLocaleString()} match${rows.length === 1 ? "" : "es"}`
+            : ""}
+          {shown < rows.length
+            ? ` · showing ${shown.toLocaleString()} — scroll for more`
+            : shown > INITIAL_ROWS
+              ? " · all loaded"
+              : ""}
+        </Text>
+      </Flex>
+      <TableContainer overflow="auto">
+        <Table size="sm" variant="striped" colorScheme="gray">
+          {rows[0].length > 0 && (
+            <Thead
+              position="sticky"
+              top="33px"
+              zIndex={1}
+              sx={{ "& th": { bg: "surface.panel" } }}
+            >
+              <Tr>
+                <Th fontSize="xs" color="ink.subtle" isNumeric w="1px">
+                  #
+                </Th>
+                {rows[0].map((cell, ci) => (
+                  <Th key={ci} fontSize="xs" whiteSpace="nowrap">
+                    {cell != null ? String(cell) : ""}
+                  </Th>
+                ))}
+              </Tr>
+            </Thead>
+          )}
+          <Tbody>
+            {rows.slice(1, shown).map((row, ri) => (
+              <Tr key={ri}>
+                <Td fontSize="xs" color="ink.subtle" isNumeric w="1px">
+                  {ri + 2}
+                </Td>
+                {row.map((cell, ci) => (
+                  <Td key={ci} fontSize="xs" whiteSpace="nowrap">
+                    {cell != null ? String(cell) : ""}
+                  </Td>
+                ))}
+              </Tr>
+            ))}
+          </Tbody>
+        </Table>
+        {shown < rows.length && (
+          <Center ref={sentinelRef} py={4}>
+            <Spinner size="sm" />
+          </Center>
+        )}
+      </TableContainer>
+    </Box>
+  );
+}
+
 function ExcelPreview({ file }: { file: FileRow }) {
-  const [sheets, setSheets] = useState<
-    { name: string; data: (string | number | boolean | null)[][] }[]
-  >([]);
+  const [sheets, setSheets] = useState<{ name: string; data: SheetRow[] }[]>(
+    [],
+  );
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Parsing happens in a Web Worker (excelWorker.ts) so a big workbook never
+  // blocks the main thread while it's decoded.
   useEffect(() => {
     let cancelled = false;
+    const worker = new Worker(new URL("./excelWorker", import.meta.url), {
+      type: "module",
+    });
+    worker.onmessage = (e: MessageEvent) => {
+      const r = e.data as
+        | { id: number; ok: true; sheets: { name: string; data: SheetRow[] }[] }
+        | { id: number; ok: false; error: string };
+      if (cancelled) return;
+      if (r.ok) setSheets(r.sheets);
+      else setError(r.error || "Failed to load spreadsheet");
+      setLoading(false);
+      worker.terminate();
+    };
+    worker.onerror = () => {
+      if (!cancelled) {
+        setError("Failed to load spreadsheet");
+        setLoading(false);
+      }
+    };
     (async () => {
       try {
         const res = await fetch(rawUrl(file));
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const buf = await res.arrayBuffer();
-        const wb = XLSX.read(buf, { type: "array" });
-        const result = wb.SheetNames.map((name) => {
-          const ws = wb.Sheets[name];
-          const raw = XLSX.utils.sheet_to_json<(string | number | boolean | null)[]>(
-            ws,
-            { header: 1, defval: null },
-          );
-          return { name, data: raw };
-        });
-        if (!cancelled) setSheets(result);
+        worker.postMessage({ id: 1, buf }, [buf]);
       } catch (e) {
         if (!cancelled)
-          setError(e instanceof Error ? e.message : "Failed to load spreadsheet");
-      } finally {
-        if (!cancelled) setLoading(false);
+          setError(
+            e instanceof Error ? e.message : "Failed to load spreadsheet",
+          );
+        setLoading(false);
       }
     })();
     return () => {
       cancelled = true;
+      worker.terminate();
     };
   }, [file.id]);
 
@@ -92,13 +243,25 @@ function ExcelPreview({ file }: { file: FileRow }) {
     );
   if (error)
     return (
-      <Center flex={1} minH={0} flexDirection="column" gap={2} color="ink.muted">
+      <Center
+        flex={1}
+        minH={0}
+        flexDirection="column"
+        gap={2}
+        color="ink.muted"
+      >
         <Text fontSize="sm">{error}</Text>
       </Center>
     );
 
   return (
-    <Tabs flex={1} minH={0} display="flex" flexDirection="column" overflow="hidden">
+    <Tabs
+      flex={1}
+      minH={0}
+      display="flex"
+      flexDirection="column"
+      overflow="hidden"
+    >
       <TabList flexShrink={0}>
         {sheets.map((s) => (
           <Tab key={s.name} fontSize="xs">
@@ -109,32 +272,7 @@ function ExcelPreview({ file }: { file: FileRow }) {
       <TabPanels flex={1} minH={0} overflow="auto">
         {sheets.map((s) => (
           <TabPanel key={s.name} p={0}>
-            <TableContainer overflow="auto" maxH="calc(100vh - 160px)">
-              <Table size="sm" variant="striped" colorScheme="gray">
-                {s.data.length > 0 && (
-                  <Thead>
-                    <Tr>
-                      {s.data[0].map((cell, ci) => (
-                        <Th key={ci} fontSize="xs" whiteSpace="nowrap">
-                          {cell != null ? String(cell) : ""}
-                        </Th>
-                      ))}
-                    </Tr>
-                  </Thead>
-                )}
-                <Tbody>
-                  {s.data.slice(1).map((row, ri) => (
-                    <Tr key={ri}>
-                      {row.map((cell, ci) => (
-                        <Td key={ci} fontSize="xs" whiteSpace="nowrap">
-                          {cell != null ? String(cell) : ""}
-                        </Td>
-                      ))}
-                    </Tr>
-                  ))}
-                </Tbody>
-              </Table>
-            </TableContainer>
+            <SheetTable data={s.data} />
           </TabPanel>
         ))}
       </TabPanels>
@@ -181,7 +319,13 @@ function WordPreview({ file }: { file: FileRow }) {
     );
   if (error)
     return (
-      <Center flex={1} minH={0} flexDirection="column" gap={2} color="ink.muted">
+      <Center
+        flex={1}
+        minH={0}
+        flexDirection="column"
+        gap={2}
+        color="ink.muted"
+      >
         <Text fontSize="sm">{error}</Text>
       </Center>
     );
@@ -220,7 +364,13 @@ function WordPreview({ file }: { file: FileRow }) {
 
 // Opens an uploaded binary document in its own view: images and PDFs preview
 // inline; Excel/Word get interactive previews; anything else shows file info.
-function BinaryView({ file, canManage }: { file: FileRow; canManage: boolean }) {
+function BinaryView({
+  file,
+  canManage,
+}: {
+  file: FileRow;
+  canManage: boolean;
+}) {
   const toast = useToast();
   const mime = file.mime ?? "";
   const name = file.path.split("/").pop() ?? "";
@@ -275,7 +425,13 @@ function BinaryView({ file, canManage }: { file: FileRow; canManage: boolean }) 
   );
 
   return (
-    <Flex flex={1} minW={0} direction="column" bg="surface.bg" overflow="hidden">
+    <Flex
+      flex={1}
+      minW={0}
+      direction="column"
+      bg="surface.bg"
+      overflow="hidden"
+    >
       <Flex
         align="center"
         justify="space-between"
