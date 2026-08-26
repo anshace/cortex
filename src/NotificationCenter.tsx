@@ -11,15 +11,21 @@ import {
   PopoverTrigger,
   Text,
   Tooltip,
-  useDisclosure,
   VStack,
+  useDisclosure,
 } from "@chakra-ui/react";
 import { useEffect, useRef, useState } from "react";
-import { VscBell, VscBellDot, VscComment, VscMailRead, VscTrash } from "react-icons/vsc";
+import {
+  VscBell,
+  VscBellDot,
+  VscComment,
+  VscMailRead,
+  VscTrash,
+} from "react-icons/vsc";
 
+import { ChatTarget } from "./ChatChannels";
 import * as api from "./api";
 import { Member } from "./api";
-import { ChatTarget } from "./ChatChannels";
 
 // A single in-app notification event derived from the overview poll.
 export type NotificationEvent = {
@@ -47,13 +53,15 @@ type Props = {
 // Extract a short preview from a message body.
 function preview(body: string | null): string {
   if (!body) return "New message";
-  return body
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, "📷 Photo")
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/[`*_~>#|]/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 120) || "New message";
+  return (
+    body
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, "📷 Photo")
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+      .replace(/[`*_~>#|]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120) || "New message"
+  );
 }
 
 // Relative time for notification timestamps.
@@ -97,6 +105,11 @@ export default function NotificationCenter({
     const myLocal = me.email.split("@")[0];
     const mentionsMe = (b: string) =>
       (!!me.name && b.includes(`@${me.name}`)) || b.includes(`@${myLocal}`);
+    // @everyone / @here / @channel count as a mention in group threads.
+    const broadcastMention = (b: string) =>
+      /@(everyone|here|channel)\b/i.test(b);
+    const isMention = (b: string | null | undefined, group: boolean) =>
+      !!b && (mentionsMe(b) || (group && broadcastMention(b)));
 
     const nameOf = (id: number) => {
       const m = members.find((x) => x.id === id);
@@ -118,7 +131,7 @@ export default function NotificationCenter({
           senderName: nameOf(overview.gs.last_sender),
           body: preview(overview.gs.body),
           at: overview.gs.at,
-          isMention: overview.gs.body ? mentionsMe(overview.gs.body) : false,
+          isMention: isMention(overview.gs.body, true),
           isGroup: true,
         });
       }
@@ -138,7 +151,7 @@ export default function NotificationCenter({
           senderName: nameOf(s.last_sender),
           body: preview(s.body),
           at: s.at,
-          isMention: s.body ? mentionsMe(s.body) : false,
+          isMention: isMention(s.body, true),
           isGroup: true,
         });
       }
@@ -158,7 +171,7 @@ export default function NotificationCenter({
           senderName: nameOf(d.last_sender),
           body: preview(d.body),
           at: d.at,
-          isMention: d.body ? mentionsMe(d.body) : false,
+          isMention: isMention(d.body, false),
           isGroup: false,
         });
       }
@@ -190,12 +203,19 @@ export default function NotificationCenter({
   }
 
   return (
-    <Popover isOpen={isOpen} onOpen={onOpen} onClose={onClose} placement="bottom-end">
+    <Popover
+      isOpen={isOpen}
+      onOpen={onOpen}
+      onClose={onClose}
+      placement="bottom-end"
+    >
       <Tooltip label="Notifications" openDelay={300}>
         <PopoverTrigger>
           <IconButton
             aria-label="Notifications"
-            icon={<Icon as={totalUnread > 0 ? VscBellDot : VscBell} boxSize={5} />}
+            icon={
+              <Icon as={totalUnread > 0 ? VscBellDot : VscBell} boxSize={5} />
+            }
             variant="ghost"
             size="md"
             color={totalUnread > 0 ? "brand.400" : "ink.subtle"}
@@ -287,12 +307,20 @@ export default function NotificationCenter({
                         {evt.senderName}
                       </Text>
                       {evt.isMention && (
-                        <Badge colorScheme="purple" fontSize="0.55rem" variant="subtle">
+                        <Badge
+                          colorScheme="purple"
+                          fontSize="0.55rem"
+                          variant="subtle"
+                        >
                           mention
                         </Badge>
                       )}
                       {evt.isGroup && (
-                        <Badge colorScheme="blue" fontSize="0.55rem" variant="subtle">
+                        <Badge
+                          colorScheme="blue"
+                          fontSize="0.55rem"
+                          variant="subtle"
+                        >
                           group
                         </Badge>
                       )}
@@ -304,7 +332,13 @@ export default function NotificationCenter({
                       {notifTime(evt.at)}
                     </Text>
                   </Box>
-                  <Icon as={VscComment} boxSize="12px" color="ink.subtle" mt={1} flexShrink={0} />
+                  <Icon
+                    as={VscComment}
+                    boxSize="12px"
+                    color="ink.subtle"
+                    mt={1}
+                    flexShrink={0}
+                  />
                 </Flex>
               ))}
             </VStack>
@@ -314,5 +348,3 @@ export default function NotificationCenter({
     </Popover>
   );
 }
-
-

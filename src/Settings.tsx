@@ -11,27 +11,45 @@ import {
   Image,
   Input,
   Kbd,
+  Radio,
+  RadioGroup,
   Select,
   SimpleGrid,
   Switch,
   Text,
   Textarea,
   Tooltip,
+  VStack,
   useColorMode,
   useToast,
-  VStack,
 } from "@chakra-ui/react";
 import QRCode from "qrcode";
 import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
 import { FiCommand, FiSliders } from "react-icons/fi";
-import { VscAccount, VscBell, VscColorMode, VscDatabase, VscHistory, VscShield } from "react-icons/vsc";
+import {
+  VscAccount,
+  VscBell,
+  VscColorMode,
+  VscDatabase,
+  VscHistory,
+  VscShield,
+} from "react-icons/vsc";
 import useLocalStorageState from "use-local-storage-state";
+
 import * as api from "./api";
 import { Me } from "./api";
 import { EditorPrefs, useEditorPrefs } from "./editorPrefs";
 import { EDITOR_THEMES, SWATCHES, useEditorThemeId } from "./editorThemes";
 
-type Section = "profile" | "appearance" | "editor" | "keyboard" | "security" | "notifications" | "activity" | "storage";
+type Section =
+  | "profile"
+  | "appearance"
+  | "editor"
+  | "keyboard"
+  | "security"
+  | "notifications"
+  | "activity"
+  | "storage";
 
 type Props = {
   me: Me | null;
@@ -39,7 +57,12 @@ type Props = {
   onUpdated: () => void;
 };
 
-const NAV: { id: Section; label: string; icon: typeof VscAccount; adminOnly?: boolean }[] = [
+const NAV: {
+  id: Section;
+  label: string;
+  icon: typeof VscAccount;
+  adminOnly?: boolean;
+}[] = [
   { id: "profile", label: "Profile", icon: VscAccount },
   { id: "appearance", label: "Appearance", icon: VscColorMode },
   { id: "editor", label: "Editor", icon: FiSliders },
@@ -61,7 +84,14 @@ function Settings({ me, onClose, onUpdated }: Props) {
   }, [onClose]);
 
   return (
-    <Flex flex={1} minW={0} direction="column" bg="surface.bg" color="ink.base" overflow="hidden">
+    <Flex
+      flex={1}
+      minW={0}
+      direction="column"
+      bg="surface.bg"
+      color="ink.base"
+      overflow="hidden"
+    >
       <Flex flex={1} minH={0}>
         <VStack
           as="nav"
@@ -100,11 +130,15 @@ function Settings({ me, onClose, onUpdated }: Props) {
 
         <Box flex={1} minH={0} overflowY="auto" px={{ base: 5, md: 10 }} py={8}>
           <Box maxW="640px">
-            {section === "profile" && <ProfilePanel me={me} onUpdated={onUpdated} />}
+            {section === "profile" && (
+              <ProfilePanel me={me} onUpdated={onUpdated} />
+            )}
             {section === "appearance" && <AppearancePanel />}
             {section === "editor" && <EditorPanel />}
             {section === "keyboard" && <KeyboardPanel />}
-            {section === "security" && <SecurityPanel me={me} onUpdated={onUpdated} />}
+            {section === "security" && (
+              <SecurityPanel me={me} onUpdated={onUpdated} />
+            )}
             {section === "notifications" && <NotificationsPanel />}
             {section === "activity" && isAdmin && <ActivityPanel />}
             {section === "storage" && isAdmin && <StoragePanel />}
@@ -130,18 +164,35 @@ function PanelHead({ title, sub }: { title: string; sub: string }) {
 
 function Card({ children }: { children: ReactNode }) {
   return (
-    <Box bg="surface.panel" border="1px solid" borderColor="surface.border" borderRadius="lg" p={5} mb={5}>
+    <Box
+      bg="surface.panel"
+      border="1px solid"
+      borderColor="surface.border"
+      borderRadius="lg"
+      p={5}
+      mb={5}
+    >
       {children}
     </Box>
   );
 }
 
 function fail(toast: ReturnType<typeof useToast>, e: unknown) {
-  toast({ title: e instanceof Error ? e.message : "Something went wrong", status: "error", duration: 3500 });
+  toast({
+    title: e instanceof Error ? e.message : "Something went wrong",
+    status: "error",
+    duration: 3500,
+  });
 }
 
 // ----- Profile -----
-function ProfilePanel({ me, onUpdated }: { me: Me | null; onUpdated: () => void }) {
+function ProfilePanel({
+  me,
+  onUpdated,
+}: {
+  me: Me | null;
+  onUpdated: () => void;
+}) {
   const toast = useToast();
   const [name, setName] = useState(me?.name ?? "");
   const [username, setUsername] = useState(me?.email ?? "");
@@ -178,12 +229,18 @@ function ProfilePanel({ me, onUpdated }: { me: Me | null; onUpdated: () => void 
 
   return (
     <>
-      <PanelHead title="Profile" sub="Your login username and how you appear to others." />
+      <PanelHead
+        title="Profile"
+        sub="Your login username and how you appear to others."
+      />
       <Card>
         <Box as="form" onSubmit={saveUsername} mb={5}>
           <FormControl>
             <FormLabel fontSize="xs" color="ink.muted">
-              Username <Text as="span" color="ink.subtle">(what you sign in with)</Text>
+              Username{" "}
+              <Text as="span" color="ink.subtle">
+                (what you sign in with)
+              </Text>
             </FormLabel>
             <HStack>
               <Input
@@ -193,7 +250,12 @@ function ProfilePanel({ me, onUpdated }: { me: Me | null; onUpdated: () => void 
                 onChange={(e) => setUsername(e.target.value.replace(/\s/g, ""))}
                 maxW="360px"
               />
-              <Button size="sm" type="submit" isLoading={savingU} isDisabled={!username.trim() || username.trim() === me?.email}>
+              <Button
+                size="sm"
+                type="submit"
+                isLoading={savingU}
+                isDisabled={!username.trim() || username.trim() === me?.email}
+              >
                 Change
               </Button>
             </HStack>
@@ -208,7 +270,13 @@ function ProfilePanel({ me, onUpdated }: { me: Me | null; onUpdated: () => void 
               Display name
             </FormLabel>
             <HStack>
-              <Input size="sm" value={name} placeholder="Your name" onChange={(e) => setName(e.target.value)} maxW="360px" />
+              <Input
+                size="sm"
+                value={name}
+                placeholder="Your name"
+                onChange={(e) => setName(e.target.value)}
+                maxW="360px"
+              />
               <Button size="sm" type="submit" isLoading={saving}>
                 Save
               </Button>
@@ -227,7 +295,10 @@ function AppearancePanel() {
 
   return (
     <>
-      <PanelHead title="Appearance" sub="Chrome brightness and the code editor colour theme." />
+      <PanelHead
+        title="Appearance"
+        sub="Chrome brightness and the code editor colour theme."
+      />
       <Card>
         <Text fontSize="sm" fontWeight={600} mb={3}>
           App theme
@@ -267,14 +338,23 @@ function AppearancePanel() {
                 textAlign="left"
                 border="1px solid"
                 borderColor={active ? "brand.500" : "surface.border"}
-                boxShadow={active ? "0 0 0 1px var(--chakra-colors-brand-500)" : "none"}
+                boxShadow={
+                  active ? "0 0 0 1px var(--chakra-colors-brand-500)" : "none"
+                }
                 borderRadius="lg"
                 overflow="hidden"
                 _hover={{ borderColor: "surface.borderStrong" }}
                 onClick={() => setThemeId(t.id)}
               >
                 {/* code-ish preview */}
-                <Box bg={sw.bg} px={3} py={2.5} fontFamily="mono" fontSize="11px" lineHeight={1.5}>
+                <Box
+                  bg={sw.bg}
+                  px={3}
+                  py={2.5}
+                  fontFamily="mono"
+                  fontSize="11px"
+                  lineHeight={1.5}
+                >
                   <Box>
                     <Box as="span" color={sw.a}>
                       const
@@ -291,7 +371,13 @@ function AppearancePanel() {
                     // encrypted
                   </Box>
                 </Box>
-                <Flex align="center" justify="space-between" px={3} py={2} bg="surface.panel">
+                <Flex
+                  align="center"
+                  justify="space-between"
+                  px={3}
+                  py={2}
+                  bg="surface.panel"
+                >
                   <Box>
                     <Text fontSize="sm" fontWeight={active ? 700 : 500}>
                       {t.label}
@@ -335,39 +421,90 @@ function ToggleRow({
           </Text>
         )}
       </Box>
-      <Switch isChecked={checked} onChange={onChange} colorScheme="brand" flexShrink={0} />
+      <Switch
+        isChecked={checked}
+        onChange={onChange}
+        colorScheme="brand"
+        flexShrink={0}
+      />
     </Flex>
   );
 }
 
 function EditorPanel() {
   const [prefs, setPrefs] = useEditorPrefs();
-  const toggle = (k: keyof EditorPrefs) => setPrefs({ ...prefs, [k]: !prefs[k] });
-  const setSize = (n: number) => setPrefs({ ...prefs, fontSize: Math.max(8, Math.min(48, n)) });
+  const toggle = (k: keyof EditorPrefs) =>
+    setPrefs({ ...prefs, [k]: !prefs[k] });
+  const setSize = (n: number) =>
+    setPrefs({ ...prefs, fontSize: Math.max(8, Math.min(48, n)) });
 
   return (
     <>
-      <PanelHead title="Editor" sub="Tune the code editor. Changes apply everywhere, instantly." />
+      <PanelHead
+        title="Editor"
+        sub="Tune the code editor. Changes apply everywhere, instantly."
+      />
       <Card>
         <VStack align="stretch" spacing={4}>
-          <ToggleRow label="Minimap" hint="The code overview strip on the right edge" checked={prefs.minimap} onChange={() => toggle("minimap")} />
-          <ToggleRow label="Word wrap" hint="Wrap long lines instead of scrolling" checked={prefs.wordWrap} onChange={() => toggle("wordWrap")} />
-          <ToggleRow label="Line numbers" checked={prefs.lineNumbers} onChange={() => toggle("lineNumbers")} />
-          <ToggleRow label="Bracket pair colours" hint="Tint matching brackets" checked={prefs.bracketPairs} onChange={() => toggle("bracketPairs")} />
-          <ToggleRow label="Sticky scroll" hint="Pin the enclosing scope to the top" checked={prefs.stickyScroll} onChange={() => toggle("stickyScroll")} />
-          <ToggleRow label="Document stats" hint="Show lines · words · chars in the status bar" checked={prefs.showStats} onChange={() => toggle("showStats")} />
+          <ToggleRow
+            label="Minimap"
+            hint="The code overview strip on the right edge"
+            checked={prefs.minimap}
+            onChange={() => toggle("minimap")}
+          />
+          <ToggleRow
+            label="Word wrap"
+            hint="Wrap long lines instead of scrolling"
+            checked={prefs.wordWrap}
+            onChange={() => toggle("wordWrap")}
+          />
+          <ToggleRow
+            label="Line numbers"
+            checked={prefs.lineNumbers}
+            onChange={() => toggle("lineNumbers")}
+          />
+          <ToggleRow
+            label="Bracket pair colours"
+            hint="Tint matching brackets"
+            checked={prefs.bracketPairs}
+            onChange={() => toggle("bracketPairs")}
+          />
+          <ToggleRow
+            label="Sticky scroll"
+            hint="Pin the enclosing scope to the top"
+            checked={prefs.stickyScroll}
+            onChange={() => toggle("stickyScroll")}
+          />
+          <ToggleRow
+            label="Document stats"
+            hint="Show lines · words · chars in the status bar"
+            checked={prefs.showStats}
+            onChange={() => toggle("showStats")}
+          />
           <Flex align="center" justify="space-between" pt={1}>
             <Text fontSize="sm" fontWeight={500}>
               Font size
             </Text>
             <HStack>
-              <Button size="xs" variant="outline" onClick={() => setSize(prefs.fontSize - 1)}>
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={() => setSize(prefs.fontSize - 1)}
+              >
                 −
               </Button>
-              <Text minW="48px" textAlign="center" sx={{ fontVariantNumeric: "tabular-nums" }}>
+              <Text
+                minW="48px"
+                textAlign="center"
+                sx={{ fontVariantNumeric: "tabular-nums" }}
+              >
                 {prefs.fontSize}px
               </Text>
-              <Button size="xs" variant="outline" onClick={() => setSize(prefs.fontSize + 1)}>
+              <Button
+                size="xs"
+                variant="outline"
+                onClick={() => setSize(prefs.fontSize + 1)}
+              >
                 +
               </Button>
             </HStack>
@@ -395,7 +532,10 @@ function KeyboardPanel() {
   ];
   return (
     <>
-      <PanelHead title="Keyboard shortcuts" sub="The shortcuts available in Cortex today." />
+      <PanelHead
+        title="Keyboard shortcuts"
+        sub="The shortcuts available in Cortex today."
+      />
       <Card>
         <VStack align="stretch" spacing={0}>
           {rows.map(([keys, desc], i) => (
@@ -417,18 +557,25 @@ function KeyboardPanel() {
         </VStack>
       </Card>
       <Text fontSize="xs" color="ink.subtle" mt={3}>
-        The browser owns Ctrl+T / Ctrl+N (new tab / window) and usually Ctrl+W, so this app leans on
-        capturable <Kbd>Ctrl/⌘ Shift</Kbd> combos instead — <Kbd>Shift P</Kbd> (commands) and{" "}
-        <Kbd>Shift V</Kbd> (preview). Open files from the Explorer or Quick-open (<Kbd>Ctrl/⌘ P</Kbd>) and
-        close them with the ✕ on a tab; Ctrl+W closes the active tab while the editor is focused (some
-        browsers may still intercept it).
+        The browser owns Ctrl+T / Ctrl+N (new tab / window) and usually Ctrl+W,
+        so this app leans on capturable <Kbd>Ctrl/⌘ Shift</Kbd> combos instead —{" "}
+        <Kbd>Shift P</Kbd> (commands) and <Kbd>Shift V</Kbd> (preview). Open
+        files from the Explorer or Quick-open (<Kbd>Ctrl/⌘ P</Kbd>) and close
+        them with the ✕ on a tab; Ctrl+W closes the active tab while the editor
+        is focused (some browsers may still intercept it).
       </Text>
     </>
   );
 }
 
 // ----- Security (password + two-factor) -----
-function SecurityPanel({ me, onUpdated }: { me: Me | null; onUpdated: () => void }) {
+function SecurityPanel({
+  me,
+  onUpdated,
+}: {
+  me: Me | null;
+  onUpdated: () => void;
+}) {
   const toast = useToast();
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
@@ -451,7 +598,10 @@ function SecurityPanel({ me, onUpdated }: { me: Me | null; onUpdated: () => void
 
   return (
     <>
-      <PanelHead title="Security" sub="Your password and two-factor authentication." />
+      <PanelHead
+        title="Security"
+        sub="Your password and two-factor authentication."
+      />
 
       <Card>
         <Box as="form" onSubmit={savePassword}>
@@ -463,7 +613,13 @@ function SecurityPanel({ me, onUpdated }: { me: Me | null; onUpdated: () => void
               <FormLabel fontSize="xs" color="ink.muted">
                 Current password
               </FormLabel>
-              <Input size="sm" type="password" autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} />
+              <Input
+                size="sm"
+                type="password"
+                autoComplete="current-password"
+                value={current}
+                onChange={(e) => setCurrent(e.target.value)}
+              />
             </FormControl>
             <FormControl isRequired>
               <FormLabel fontSize="xs" color="ink.muted">
@@ -478,7 +634,13 @@ function SecurityPanel({ me, onUpdated }: { me: Me | null; onUpdated: () => void
                 onChange={(e) => setNext(e.target.value)}
               />
             </FormControl>
-            <Button size="sm" type="submit" alignSelf="flex-start" isLoading={savingPw} isDisabled={!current || next.length < 8}>
+            <Button
+              size="sm"
+              type="submit"
+              alignSelf="flex-start"
+              isLoading={savingPw}
+              isDisabled={!current || next.length < 8}
+            >
               Update password
             </Button>
           </VStack>
@@ -492,9 +654,18 @@ function SecurityPanel({ me, onUpdated }: { me: Me | null; onUpdated: () => void
   );
 }
 
-function TwoFactor({ me, onUpdated }: { me: Me | null; onUpdated: () => void }) {
+function TwoFactor({
+  me,
+  onUpdated,
+}: {
+  me: Me | null;
+  onUpdated: () => void;
+}) {
   const toast = useToast();
-  const [setup, setSetup] = useState<{ secret: string; otpauth_url: string } | null>(null);
+  const [setup, setSetup] = useState<{
+    secret: string;
+    otpauth_url: string;
+  } | null>(null);
   const [qr, setQr] = useState("");
   const [code, setCode] = useState("");
   const [pw, setPw] = useState("");
@@ -543,7 +714,11 @@ function TwoFactor({ me, onUpdated }: { me: Me | null; onUpdated: () => void }) 
       setDisabling(false);
       setPw("");
       onUpdated();
-      toast({ title: "Two-factor turned off", status: "success", duration: 2500 });
+      toast({
+        title: "Two-factor turned off",
+        status: "success",
+        duration: 2500,
+      });
     } catch (e) {
       fail(toast, e);
     } finally {
@@ -559,7 +734,9 @@ function TwoFactor({ me, onUpdated }: { me: Me | null; onUpdated: () => void }) 
         <Text fontSize="sm" fontWeight={600}>
           Two-factor authentication
         </Text>
-        <Badge colorScheme={me?.mfa ? "green" : "gray"}>{me?.mfa ? "On" : "Off"}</Badge>
+        <Badge colorScheme={me?.mfa ? "green" : "gray"}>
+          {me?.mfa ? "On" : "Off"}
+        </Badge>
       </HStack>
       <Text fontSize="xs" color="ink.subtle" mb={3}>
         {isOwner
@@ -570,32 +747,73 @@ function TwoFactor({ me, onUpdated }: { me: Me | null; onUpdated: () => void }) 
       {me?.mfa ? (
         disabling ? (
           <VStack spacing={2} align="stretch" maxW="360px">
-            <Input size="sm" type="password" autoComplete="current-password" placeholder="Confirm your password" value={pw} onChange={(e) => setPw(e.target.value)} />
+            <Input
+              size="sm"
+              type="password"
+              autoComplete="current-password"
+              placeholder="Confirm your password"
+              value={pw}
+              onChange={(e) => setPw(e.target.value)}
+            />
             <HStack>
-              <Button size="sm" colorScheme="red" onClick={turnOff} isLoading={busy} isDisabled={!pw}>
+              <Button
+                size="sm"
+                colorScheme="red"
+                onClick={turnOff}
+                isLoading={busy}
+                isDisabled={!pw}
+              >
                 Turn off
               </Button>
-              <Button size="sm" variant="ghost" onClick={() => { setDisabling(false); setPw(""); }}>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  setDisabling(false);
+                  setPw("");
+                }}
+              >
                 Cancel
               </Button>
             </HStack>
           </VStack>
         ) : (
-          <Button size="sm" variant="outline" onClick={() => setDisabling(true)}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setDisabling(true)}
+          >
             Turn off two-factor
           </Button>
         )
       ) : setup ? (
         <VStack spacing={3} align="stretch" maxW="360px">
           <Text fontSize="xs" color="ink.muted">
-            Scan this with your authenticator app, then enter the 6-digit code to confirm.
+            Scan this with your authenticator app, then enter the 6-digit code
+            to confirm.
           </Text>
-          {qr && <Image src={qr} alt="Two-factor QR code" boxSize="180px" alignSelf="center" borderRadius="md" bg="white" p={2} />}
+          {qr && (
+            <Image
+              src={qr}
+              alt="Two-factor QR code"
+              boxSize="180px"
+              alignSelf="center"
+              borderRadius="md"
+              bg="white"
+              p={2}
+            />
+          )}
           <Box>
             <Text fontSize="xs" color="ink.subtle" mb={1}>
               Can't scan? Enter this key manually:
             </Text>
-            <Code fontSize="xs" wordBreak="break-all" w="full" p={2} display="block">
+            <Code
+              fontSize="xs"
+              wordBreak="break-all"
+              w="full"
+              p={2}
+              display="block"
+            >
               {setup.secret}
             </Code>
           </Box>
@@ -608,13 +826,27 @@ function TwoFactor({ me, onUpdated }: { me: Me | null; onUpdated: () => void }) 
               value={code}
               textAlign="center"
               letterSpacing="0.3em"
-              onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+              onChange={(e) =>
+                setCode(e.target.value.replace(/\D/g, "").slice(0, 6))
+              }
             />
-            <Button size="sm" onClick={confirmEnable} isLoading={busy} isDisabled={code.length < 6} flexShrink={0}>
+            <Button
+              size="sm"
+              onClick={confirmEnable}
+              isLoading={busy}
+              isDisabled={code.length < 6}
+              flexShrink={0}
+            >
               Verify & turn on
             </Button>
           </HStack>
-          <Button size="xs" variant="link" color="ink.muted" alignSelf="flex-start" onClick={() => setSetup(null)}>
+          <Button
+            size="xs"
+            variant="link"
+            color="ink.muted"
+            alignSelf="flex-start"
+            onClick={() => setSetup(null)}
+          >
             Cancel
           </Button>
         </VStack>
@@ -628,20 +860,55 @@ function TwoFactor({ me, onUpdated }: { me: Me | null; onUpdated: () => void }) 
 }
 
 // ----- Notifications -----
+// mode controls WHICH messages notify you at all:
+//   "all"     — every new message in any thread
+//   "mentions" — only when someone @mentions you (or @everyone/@here)
+//   "silent"  — nothing, ever; the other toggles are ignored
+export type NotifMode = "all" | "mentions" | "silent";
 export type NotifPrefs = {
+  mode: NotifMode;
   desktop: boolean;
   sound: boolean;
   inApp: boolean;
 };
-export const DEFAULT_NOTIF_PREFS: NotifPrefs = { desktop: true, sound: true, inApp: true };
+export const DEFAULT_NOTIF_PREFS: NotifPrefs = {
+  mode: "all",
+  desktop: true,
+  sound: true,
+  inApp: true,
+};
+
+const NOTIF_MODES: { value: NotifMode; label: string; desc: string }[] = [
+  {
+    value: "all",
+    label: "All messages",
+    desc: "Notify me about every new message in every chat.",
+  },
+  {
+    value: "mentions",
+    label: "Mentions only",
+    desc: "Only ping when someone @mentions my name (or @everyone / @here).",
+  },
+  {
+    value: "silent",
+    label: "Completely silent",
+    desc: "Never notify — no popups, no sound, no desktop pings.",
+  },
+];
 
 function NotificationsPanel() {
-  const [prefs, setPrefs] = useLocalStorageState<NotifPrefs>("cortex-notif-prefs", {
-    defaultValue: DEFAULT_NOTIF_PREFS,
-  });
+  const [raw, setPrefs] = useLocalStorageState<NotifPrefs>(
+    "cortex-notif-prefs",
+    {
+      defaultValue: DEFAULT_NOTIF_PREFS,
+    },
+  );
+  // Merge so prefs stored before `mode` existed fall back to the default.
+  const prefs: NotifPrefs = { ...DEFAULT_NOTIF_PREFS, ...raw };
+  const silent = prefs.mode === "silent";
 
   function toggle(key: keyof NotifPrefs) {
-    setPrefs((p) => ({ ...p, [key]: !p[key] }));
+    setPrefs((p) => ({ ...DEFAULT_NOTIF_PREFS, ...p, [key]: !p[key] }));
   }
 
   return (
@@ -652,48 +919,91 @@ function NotificationsPanel() {
       />
       <Card>
         <VStack align="stretch" spacing={4}>
+          <Box>
+            <Text fontSize="sm" fontWeight={600} mb={1}>
+              Notify me about
+            </Text>
+            <RadioGroup
+              value={prefs.mode}
+              onChange={(v) =>
+                setPrefs((p) => ({
+                  ...DEFAULT_NOTIF_PREFS,
+                  ...p,
+                  mode: v as NotifMode,
+                }))
+              }
+            >
+              <VStack align="stretch" spacing={2}>
+                {NOTIF_MODES.map((m) => (
+                  <Box key={m.value}>
+                    <Radio value={m.value} colorScheme="brand" size="sm">
+                      <Text fontSize="sm">{m.label}</Text>
+                    </Radio>
+                    <Text fontSize="xs" color="ink.subtle" pl={6}>
+                      {m.desc}
+                    </Text>
+                  </Box>
+                ))}
+              </VStack>
+            </RadioGroup>
+          </Box>
           <Flex align="center" justify="space-between">
-            <Box>
+            <Box
+              opacity={silent ? 0.45 : 1}
+              pointerEvents={silent ? "none" : undefined}
+            >
               <Text fontSize="sm" fontWeight={600}>
-                Desktop notifications
+                In-app notifications
               </Text>
               <Text fontSize="xs" color="ink.subtle">
-                Show browser notifications when messages arrive while the tab is in the background.
+                Show a clickable toast inside the app and badges on the bell
+                icon.
               </Text>
             </Box>
             <Switch
-              isChecked={prefs.desktop}
-              onChange={() => toggle("desktop")}
+              isChecked={prefs.inApp && !silent}
+              isDisabled={silent}
+              onChange={() => toggle("inApp")}
               colorScheme="brand"
             />
           </Flex>
           <Flex align="center" justify="space-between">
-            <Box>
+            <Box
+              opacity={silent ? 0.45 : 1}
+              pointerEvents={silent ? "none" : undefined}
+            >
               <Text fontSize="sm" fontWeight={600}>
                 Notification sound
               </Text>
               <Text fontSize="xs" color="ink.subtle">
-                Play a subtle chime when a new message arrives while the app is in the foreground.
+                Play a subtle chime when a matching message arrives while the
+                app is in the foreground.
               </Text>
             </Box>
             <Switch
-              isChecked={prefs.sound}
+              isChecked={prefs.sound && !silent}
+              isDisabled={silent}
               onChange={() => toggle("sound")}
               colorScheme="brand"
             />
           </Flex>
           <Flex align="center" justify="space-between">
-            <Box>
+            <Box
+              opacity={silent ? 0.45 : 1}
+              pointerEvents={silent ? "none" : undefined}
+            >
               <Text fontSize="sm" fontWeight={600}>
-                In-app notifications
+                Desktop notifications
               </Text>
               <Text fontSize="xs" color="ink.subtle">
-                Show notification badges and the notification center bell icon in the sidebar.
-                           </Text>
+                Show browser notifications when messages arrive while the tab is
+                in the background.
+              </Text>
             </Box>
             <Switch
-              isChecked={prefs.inApp}
-              onChange={() => toggle("inApp")}
+              isChecked={prefs.desktop && !silent}
+              isDisabled={silent}
+              onChange={() => toggle("desktop")}
               colorScheme="brand"
             />
           </Flex>
@@ -731,7 +1041,10 @@ function ActivityPanel() {
 
   return (
     <>
-      <PanelHead title="Activity" sub="Recent security-relevant actions. Logins, file create / download / delete, and admin changes." />
+      <PanelHead
+        title="Activity"
+        sub="Recent security-relevant actions. Logins, file create / download / delete, and admin changes."
+      />
       <Card>
         {loading ? (
           <Text fontSize="sm" color="ink.muted">
@@ -744,7 +1057,10 @@ function ActivityPanel() {
         ) : (
           <VStack align="stretch" spacing={0}>
             {entries.map((e, i) => {
-              const meta = ACTIONS[e.action] ?? { label: e.action, color: "gray" };
+              const meta = ACTIONS[e.action] ?? {
+                label: e.action,
+                color: "gray",
+              };
               return (
                 <Flex
                   key={e.id}
@@ -754,7 +1070,12 @@ function ActivityPanel() {
                   borderTop={i === 0 ? undefined : "1px solid"}
                   borderColor="surface.border"
                 >
-                  <Badge colorScheme={meta.color} flexShrink={0} minW="92px" textAlign="center">
+                  <Badge
+                    colorScheme={meta.color}
+                    flexShrink={0}
+                    minW="92px"
+                    textAlign="center"
+                  >
                     {meta.label}
                   </Badge>
                   <Box flex={1} minW={0}>
@@ -766,7 +1087,12 @@ function ActivityPanel() {
                       {e.email}
                     </Text>
                   </Box>
-                  <Text fontSize="xs" color="ink.subtle" flexShrink={0} sx={{ fontVariantNumeric: "tabular-nums" }}>
+                  <Text
+                    fontSize="xs"
+                    color="ink.subtle"
+                    flexShrink={0}
+                    sx={{ fontVariantNumeric: "tabular-nums" }}
+                  >
                     {new Date(e.created_at * 1000).toLocaleString()}
                   </Text>
                 </Flex>
@@ -809,7 +1135,10 @@ function StoragePanel() {
 
   return (
     <>
-      <PanelHead title="Storage" sub="Database size and what's using it. Back the DB file up regularly (see DEPLOY.md)." />
+      <PanelHead
+        title="Storage"
+        sub="Database size and what's using it. Back the DB file up regularly (see DEPLOY.md)."
+      />
       {loading ? (
         <Text fontSize="sm" color="ink.muted">
           Loading…
@@ -821,7 +1150,11 @@ function StoragePanel() {
               <Text fontSize="xs" color="ink.subtle">
                 Database file
               </Text>
-              <Text fontSize="2xl" fontWeight={700} sx={{ fontVariantNumeric: "tabular-nums" }}>
+              <Text
+                fontSize="2xl"
+                fontWeight={700}
+                sx={{ fontVariantNumeric: "tabular-nums" }}
+              >
                 {humanBytes(data.db_bytes)}
               </Text>
             </Card>
@@ -829,7 +1162,11 @@ function StoragePanel() {
               <Text fontSize="xs" color="ink.subtle">
                 Uploaded files + images
               </Text>
-              <Text fontSize="2xl" fontWeight={700} sx={{ fontVariantNumeric: "tabular-nums" }}>
+              <Text
+                fontSize="2xl"
+                fontWeight={700}
+                sx={{ fontVariantNumeric: "tabular-nums" }}
+              >
                 {humanBytes(data.blob_bytes)}
               </Text>
             </Card>
@@ -849,7 +1186,10 @@ function StoragePanel() {
                   borderColor="surface.border"
                 >
                   <Code fontSize="xs">{t.name}</Code>
-                  <Text fontSize="sm" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                  <Text
+                    fontSize="sm"
+                    sx={{ fontVariantNumeric: "tabular-nums" }}
+                  >
                     {t.rows.toLocaleString()}
                   </Text>
                 </Flex>

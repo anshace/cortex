@@ -23,23 +23,29 @@ import {
   Switch,
   Text,
   Tooltip,
+  VStack,
   useColorMode,
   useToast,
-  VStack,
 } from "@chakra-ui/react";
-import { MouseEvent as ReactMouseEvent, useCallback, useEffect, useRef, useState } from "react";
+import {
+  MouseEvent as ReactMouseEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { FiMoon, FiSun } from "react-icons/fi";
-import useLocalStorageState from "use-local-storage-state";
 import {
   VscAccount,
   VscAdd,
   VscArrowLeft,
+  VscBell,
   VscCheck,
   VscChevronDown,
   VscChevronRight,
+  VscClose,
   VscCloudDownload,
   VscCloudUpload,
-  VscClose,
   VscCollapseAll,
   VscEdit,
   VscEllipsis,
@@ -56,22 +62,28 @@ import {
   VscSignOut,
   VscTrash,
 } from "react-icons/vsc";
+import useLocalStorageState from "use-local-storage-state";
 
-import ActivityBar, { groupLabel, Section } from "./ActivityBar";
-import { DEFAULT_NOTIF_PREFS, NotifPrefs } from "./Settings";
-import { playNotifSound } from "./notifSound";
-import * as api from "./api";
-import { FileRow, Group, Me, OrgData, Workspace, WorkspaceDetail } from "./api";
+import ActivityBar, { Section, groupLabel } from "./ActivityBar";
 import ChatChannels, { ChatTarget } from "./ChatChannels";
+import ChatView, {
+  ChatPrefs,
+  DEFAULT_PREFS,
+  WALLPAPERS,
+  WallpaperId,
+} from "./ChatView";
 import CommandPalette, { PaletteItem } from "./CommandPalette";
 import ContextMenu, { MenuState } from "./ContextMenu";
-import { fileIcon } from "./fileIcon";
-import ChatView, { ChatPrefs, DEFAULT_PREFS, WALLPAPERS, WallpaperId } from "./ChatView";
 import { ConfirmModal, PromptModal } from "./Dialogs";
 import EditorPane from "./EditorPane";
-import FileTree, { allFolderPaths, FileTreeHandle } from "./FileTree";
+import FileTree, { FileTreeHandle, allFolderPaths } from "./FileTree";
 import Loader from "./Loader";
+import { DEFAULT_NOTIF_PREFS, NotifPrefs } from "./Settings";
 import Settings from "./Settings";
+import * as api from "./api";
+import { FileRow, Group, Me, OrgData, Workspace, WorkspaceDetail } from "./api";
+import { fileIcon } from "./fileIcon";
+import { playNotifSound } from "./notifSound";
 import { PanelHeader, PanelIconButton } from "./ui";
 
 type Props = {
@@ -82,8 +94,19 @@ type Props = {
   onUpdated?: () => void; // refresh `me` after a profile/2FA change
 };
 
-type PromptCfg = { title: string; label?: string; initial?: string; cta?: string; onSubmit: (v: string) => void };
-type ConfirmCfg = { title: string; body: string; cta?: string; onConfirm: () => void };
+type PromptCfg = {
+  title: string;
+  label?: string;
+  initial?: string;
+  cta?: string;
+  onSubmit: (v: string) => void;
+};
+type ConfirmCfg = {
+  title: string;
+  body: string;
+  cta?: string;
+  onConfirm: () => void;
+};
 
 // An editor group holds a set of open file ids and which one is active. There
 // are one or two groups (split view). Files are stored by id and resolved to
@@ -106,7 +129,10 @@ function freePath(existing: Set<string>, path: string): string {
 function pruneGroups(gs: GroupState[], exist: Set<number>): GroupState[] {
   const mapped = gs.map((g) => {
     const ids = g.fileIds.filter((id) => exist.has(id));
-    const activeId = g.activeId != null && ids.includes(g.activeId) ? g.activeId : ids[ids.length - 1] ?? null;
+    const activeId =
+      g.activeId != null && ids.includes(g.activeId)
+        ? g.activeId
+        : (ids[ids.length - 1] ?? null);
     return { fileIds: ids, activeId };
   });
   const pruned = mapped.filter((g) => g.fileIds.length > 0);
@@ -122,14 +148,22 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   const [ws, setWs] = useState<WorkspaceDetail | null>(null);
   const [groups, setGroups] = useState<GroupState[]>(EMPTY_GROUPS);
   const [focused, setFocused] = useState(0);
-  const [sectionStored, setSection] = useLocalStorageState<Section>("cortex-section", { defaultValue: "explorer" });
+  const [sectionStored, setSection] = useLocalStorageState<Section>(
+    "cortex-section",
+    { defaultValue: "explorer" },
+  );
   const section: Section =
-    sectionStored === "chat" || sectionStored === "explorer" ? sectionStored : "explorer";
+    sectionStored === "chat" || sectionStored === "explorer"
+      ? sectionStored
+      : "explorer";
   const [chatTarget, setChatTarget] = useState<ChatTarget>({ kind: "group" });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [palette, setPalette] = useState<null | "files" | "commands">(null);
-  const [sidebarW, setSidebarW] = useLocalStorageState<number>("cortex-sidebar-w", { defaultValue: 260 });
+  const [sidebarW, setSidebarW] = useLocalStorageState<number>(
+    "cortex-sidebar-w",
+    { defaultValue: 260 },
+  );
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [prompt, setPrompt] = useState<PromptCfg | null>(null);
   const [confirm, setConfirm] = useState<ConfirmCfg | null>(null);
@@ -148,21 +182,34 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   // per-thread "last read" markers (persisted). A thread the user is actively
   // viewing is marked read automatically.
   const [overview, setOverview] = useState<api.ChatOverview | null>(null);
-  const [read, setRead] = useLocalStorageState<Record<string, number>>("cortex-chat-read", { defaultValue: {} });
+  const [read, setRead] = useLocalStorageState<Record<string, number>>(
+    "cortex-chat-read",
+    { defaultValue: {} },
+  );
   // Chat appearance prefs (wallpaper / font size / enter-to-send) — owned here
   // so the sidebar wallpaper picker and the chat pane share one source of truth.
-  const [rawChatPrefs, setRawChatPrefs] = useLocalStorageState<ChatPrefs>("cortex-chat-prefs", {
-    defaultValue: DEFAULT_PREFS,
-  });
+  const [rawChatPrefs, setRawChatPrefs] = useLocalStorageState<ChatPrefs>(
+    "cortex-chat-prefs",
+    {
+      defaultValue: DEFAULT_PREFS,
+    },
+  );
   const chatPrefs: ChatPrefs = {
     ...DEFAULT_PREFS,
     ...rawChatPrefs,
-    wallpaper: WALLPAPERS[rawChatPrefs.wallpaper] ? rawChatPrefs.wallpaper : DEFAULT_PREFS.wallpaper,
+    wallpaper: WALLPAPERS[rawChatPrefs.wallpaper]
+      ? rawChatPrefs.wallpaper
+      : DEFAULT_PREFS.wallpaper,
   };
-  // Notification preferences (desktop / sound / in-app toggle).
-  const [notifPrefs] = useLocalStorageState<NotifPrefs>("cortex-notif-prefs", {
-    defaultValue: DEFAULT_NOTIF_PREFS,
-  });
+  // Notification preferences (mode + desktop / sound / in-app toggles).
+  const [rawNotifPrefs] = useLocalStorageState<NotifPrefs>(
+    "cortex-notif-prefs",
+    {
+      defaultValue: DEFAULT_NOTIF_PREFS,
+    },
+  );
+  // Merge so blobs stored before `mode` existed fall back to the default.
+  const notifPrefs: NotifPrefs = { ...DEFAULT_NOTIF_PREFS, ...rawNotifPrefs };
   const readRef = useRef(read);
   readRef.current = read;
   const seeded = useRef(false);
@@ -220,16 +267,26 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     let stop = false;
     const poll = async () => {
       try {
-        const o = await api.getChatOverview(activeGroupId, orgId, readRef.current);
+        const o = await api.getChatOverview(
+          activeGroupId,
+          orgId,
+          readRef.current,
+        );
         if (stop) return;
         setOverview(o);
         if (!seeded.current) {
           seeded.current = true;
           setRead((prev) => {
             const next = { ...prev };
-            if (o.gs && activeGroupId != null && next[`g:${activeGroupId}`] == null) next[`g:${activeGroupId}`] = o.gs.last_id;
+            if (
+              o.gs &&
+              activeGroupId != null &&
+              next[`g:${activeGroupId}`] == null
+            )
+              next[`g:${activeGroupId}`] = o.gs.last_id;
             o.dms.forEach((d) => {
-              if (next[`dm:${d.peer_id}`] == null) next[`dm:${d.peer_id}`] = d.last_id;
+              if (next[`dm:${d.peer_id}`] == null)
+                next[`dm:${d.peer_id}`] = d.last_id;
             });
             return next;
           });
@@ -258,7 +315,8 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
           changed = true;
         }
       };
-      if (chatTarget.kind === "group" && activeGroupId != null && overview.gs) mark(`g:${activeGroupId}`, overview.gs.last_id);
+      if (chatTarget.kind === "group" && activeGroupId != null && overview.gs)
+        mark(`g:${activeGroupId}`, overview.gs.last_id);
       if (chatTarget.kind === "dm") {
         const e = overview.dms.find((d) => d.peer_id === chatTarget.userId);
         if (e) mark(`dm:${chatTarget.userId}`, e.last_id);
@@ -273,7 +331,10 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     const poll = async () => {
       try {
         const r = await api.getPresence(orgId);
-        if (!stop) setPresence(Object.fromEntries(r.presence.map((p) => [p.id, p.online])));
+        if (!stop)
+          setPresence(
+            Object.fromEntries(r.presence.map((p) => [p.id, p.online])),
+          );
       } catch {
         /* ignore */
       }
@@ -306,28 +367,99 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     };
     const myLocal = meNow.email.split("@")[0];
     const mentionsMe = (b: string) =>
-      (!!meNow.name && b.includes(`@${meNow.name}`)) || b.includes(`@${myLocal}`);
+      (!!meNow.name && b.includes(`@${meNow.name}`)) ||
+      b.includes(`@${myLocal}`);
+    // @everyone / @here / @channel count as a mention in group threads.
+    const broadcastMention = (b: string) =>
+      /@(everyone|here|channel)\b/i.test(b);
     const canNotify =
-      notifySeeded.current && "Notification" in window && Notification.permission === "granted";
+      notifySeeded.current &&
+      "Notification" in window &&
+      Notification.permission === "granted";
     const notifPrefsRef = notifPrefs;
 
-    const consider = (key: string, s: api.ThreadSummary | undefined | null, isWs: boolean, open: () => void) => {
+    const consider = (
+      key: string,
+      s: api.ThreadSummary | undefined | null,
+      isWs: boolean,
+      open: () => void,
+    ) => {
       if (!s || s.last_sender === myId) return;
+      // Completely silent — no sound, no toast, no desktop ping at all.
+      if (notifPrefsRef.mode === "silent") return;
       if (s.last_id <= (notifiedRef.current[key] ?? 0)) return;
       notifiedRef.current[key] = s.last_id;
-      const mention = s.body ? mentionsMe(s.body) : false;
+      const mention = s.body
+        ? mentionsMe(s.body) || (isWs && broadcastMention(s.body))
+        : false;
+      // Mentions-only mode: ignore everything that isn't aimed at me.
+      if (notifPrefsRef.mode === "mentions" && !mention) return;
       const viewing =
-        !document.hidden && sectionRef.current === "chat" && !settingsRef.current && activeKeyRef.current === key;
+        !document.hidden &&
+        sectionRef.current === "chat" &&
+        !settingsRef.current &&
+        activeKeyRef.current === key;
       if (viewing) return; // already looking at it
-      // Sound: play a chime for any non-self message when the app is in the foreground.
+      const who = isWs
+        ? `${nameOf(s.last_sender)} · group`
+        : nameOf(s.last_sender);
+      const body = s.body?.startsWith("![")
+        ? "📷 Photo"
+        : s.body || "New message";
+      // In-app toast: a clickable popup inside the app for every matching
+      // message while it's in the foreground (and even backgrounded ones,
+      // since desktop notifications may be blocked by the browser).
+      if (notifPrefsRef.inApp) {
+        toast({
+          position: "bottom-right",
+          duration: 5000,
+          render: ({ onClose }) => (
+            <Box
+              onClick={() => {
+                open();
+                onClose();
+              }}
+              cursor="pointer"
+              bg="surface.raised"
+              border="1px solid"
+              borderColor={mention ? "brand.500" : "surface.border"}
+              boxShadow="pop"
+              borderRadius="md"
+              px={4}
+              py={3}
+              minW="280px"
+              maxW="360px"
+            >
+              <Flex align="center" gap={2}>
+                {mention && (
+                  <Icon
+                    as={VscBell}
+                    color="brand.400"
+                    boxSize={4}
+                    flexShrink={0}
+                  />
+                )}
+                <Text fontSize="sm" fontWeight={600} isTruncated flex={1}>
+                  {mention ? `${who} mentioned you` : who}
+                </Text>
+              </Flex>
+              <Text fontSize="xs" color="ink.muted" noOfLines={2} mt={1}>
+                {body}
+              </Text>
+            </Box>
+          ),
+        });
+      }
+      // Sound: play a chime for any matching message when the app is in the foreground.
       if (!document.hidden && notifPrefsRef.sound) playNotifSound();
       // Desktop notification: only when backgrounded (or when @mentioned, even foreground).
       if (!canNotify) return;
       if (!mention && !document.hidden) return; // non-mentions only when backgrounded
       if (!notifPrefsRef.desktop) return; // user disabled desktop notifications
-      const who = isWs ? `${nameOf(s.last_sender)} · group` : nameOf(s.last_sender);
-      const body = s.body?.startsWith("![") ? "📷 Photo" : s.body || "New message";
-      const n = new Notification(mention ? `🔔 ${who} mentioned you` : who, { body, tag: key });
+      const n = new Notification(mention ? `🔔 ${who} mentioned you` : who, {
+        body,
+        tag: key,
+      });
       n.onclick = () => {
         window.focus();
         open();
@@ -341,9 +473,14 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       setChatTarget(t);
       setSection("chat");
     };
-    if (activeGroupId != null) consider(`g:${activeGroupId}`, overview.gs, true, () => openChat({ kind: "group" }));
+    if (activeGroupId != null)
+      consider(`g:${activeGroupId}`, overview.gs, true, () =>
+        openChat({ kind: "group" }),
+      );
     overview.dms.forEach((d) =>
-      consider(`dm:${d.peer_id}`, d, false, () => openChat({ kind: "dm", userId: d.peer_id })),
+      consider(`dm:${d.peer_id}`, d, false, () =>
+        openChat({ kind: "dm", userId: d.peer_id }),
+      ),
     );
     notifySeeded.current = true;
   }, [overview, activeGroupId]);
@@ -406,7 +543,15 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   }, [activeWsId, org]);
 
   useEffect(() => {
-    loadOrg().catch(() => setOrg({ org: null, groups: [], workspaces: [], members: [], isOwner: false }));
+    loadOrg().catch(() =>
+      setOrg({
+        org: null,
+        groups: [],
+        workspaces: [],
+        members: [],
+        isOwner: false,
+      }),
+    );
   }, [loadOrg]);
 
   // Keep the URL (/slug) in sync with the active workspace (member view only).
@@ -503,7 +648,8 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     setGroups((gs) => {
       const g = gs.map((x) => ({ ...x }));
       const cur = g[focused] ?? g[0];
-      if (!cur.fileIds.includes(file.id)) cur.fileIds = [...cur.fileIds, file.id];
+      if (!cur.fileIds.includes(file.id))
+        cur.fileIds = [...cur.fileIds, file.id];
       cur.activeId = file.id;
       return g;
     });
@@ -512,7 +658,9 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
 
   function selectTab(gi: number, id: number) {
     setSettingsOpen(false); // selecting a file tab leaves Settings
-    setGroups((gs) => gs.map((g, i) => (i === gi ? { ...g, activeId: id } : g)));
+    setGroups((gs) =>
+      gs.map((g, i) => (i === gi ? { ...g, activeId: id } : g)),
+    );
     setFocused(gi);
   }
 
@@ -525,7 +673,11 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       const mapped = gs.map((g, i) => {
         if (i !== gi) return g;
         const ids = g.fileIds.filter((x) => x !== id);
-        return { fileIds: ids, activeId: g.activeId === id ? ids[ids.length - 1] ?? null : g.activeId };
+        return {
+          fileIds: ids,
+          activeId:
+            g.activeId === id ? (ids[ids.length - 1] ?? null) : g.activeId,
+        };
       });
       const pruned = mapped.filter((g) => g.fileIds.length > 0);
       return pruned.length ? pruned : EMPTY_GROUPS;
@@ -557,11 +709,17 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   function moveTab(fromG: number, id: number, toG: number) {
     if (fromG === toG) return;
     setGroups((gs) => {
-      const g = gs.map((x) => ({ fileIds: [...x.fileIds], activeId: x.activeId }));
+      const g = gs.map((x) => ({
+        fileIds: [...x.fileIds],
+        activeId: x.activeId,
+      }));
       if (!g[fromG] || !g[toG]) return gs;
       g[fromG].fileIds = g[fromG].fileIds.filter((x) => x !== id);
-      if (g[fromG].activeId === id) g[fromG].activeId = g[fromG].fileIds[g[fromG].fileIds.length - 1] ?? null;
-      if (!g[toG].fileIds.includes(id)) g[toG].fileIds = [...g[toG].fileIds, id];
+      if (g[fromG].activeId === id)
+        g[fromG].activeId =
+          g[fromG].fileIds[g[fromG].fileIds.length - 1] ?? null;
+      if (!g[toG].fileIds.includes(id))
+        g[toG].fileIds = [...g[toG].fileIds, id];
       g[toG].activeId = id;
       const pruned = g.filter((x) => x.fileIds.length > 0);
       return pruned.length ? pruned : EMPTY_GROUPS;
@@ -574,7 +732,12 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     setGroups((gs) =>
       gs.map((g, i) =>
         i === gi
-          ? { fileIds: g.fileIds.includes(fileId) ? g.fileIds : [...g.fileIds, fileId], activeId: fileId }
+          ? {
+              fileIds: g.fileIds.includes(fileId)
+                ? g.fileIds
+                : [...g.fileIds, fileId],
+              activeId: fileId,
+            }
           : g,
       ),
     );
@@ -588,7 +751,12 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       if (gs.length >= 2) {
         return gs.map((g, i) =>
           i === 1
-            ? { fileIds: g.fileIds.includes(fileId) ? g.fileIds : [...g.fileIds, fileId], activeId: fileId }
+            ? {
+                fileIds: g.fileIds.includes(fileId)
+                  ? g.fileIds
+                  : [...g.fileIds, fileId],
+                activeId: fileId,
+              }
             : g,
         );
       }
@@ -597,7 +765,11 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     setFocused(1);
   }
 
-  async function run(fn: () => Promise<unknown>, then?: () => void, ok?: string) {
+  async function run(
+    fn: () => Promise<unknown>,
+    then?: () => void,
+    ok?: string,
+  ) {
     try {
       await fn();
       then?.();
@@ -796,22 +968,27 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     const existing = new Set(ws?.files?.map((f) => f.path) ?? []);
     const ok: string[] = [];
     const failed: string[] = [];
-    const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
-      while (queue.length) {
-        const { file, path } = queue.shift()!;
-        const rel = path.replace(/\\/g, "/").replace(/^\/+/, "");
-        if (!rel) continue;
-        const finalPath = dir ? `${dir}/${rel}` : rel;
-        const free = freePath(existing, finalPath);
-        try {
-          await api.uploadFile(activeWsId, file, free);
-          existing.add(free);
-          ok.push(free);
-        } catch (e) {
-          failed.push(`${free}: ${e instanceof Error ? e.message : "upload failed"}`);
+    const workers = Array.from(
+      { length: Math.min(4, queue.length) },
+      async () => {
+        while (queue.length) {
+          const { file, path } = queue.shift()!;
+          const rel = path.replace(/\\/g, "/").replace(/^\/+/, "");
+          if (!rel) continue;
+          const finalPath = dir ? `${dir}/${rel}` : rel;
+          const free = freePath(existing, finalPath);
+          try {
+            await api.uploadFile(activeWsId, file, free);
+            existing.add(free);
+            ok.push(free);
+          } catch (e) {
+            failed.push(
+              `${free}: ${e instanceof Error ? e.message : "upload failed"}`,
+            );
+          }
         }
-      }
-    });
+      },
+    );
     await Promise.all(workers);
     loadWs();
     if (failed.length === 0) {
@@ -832,31 +1009,39 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
 
   // Copy-paste / Duplicate: pull each file's bytes down and re-upload it under
   // the target path (auto-suffixed on collision).
-  async function copyItems(dir: string, items: { file: api.FileRow; rel: string }[]) {
+  async function copyItems(
+    dir: string,
+    items: { file: api.FileRow; rel: string }[],
+  ) {
     if (activeWsId == null) return;
     const queue = [...items];
     const existing = new Set(ws?.files?.map((f) => f.path) ?? []);
     const ok: string[] = [];
     const failed: string[] = [];
-    const workers = Array.from({ length: Math.min(3, queue.length) }, async () => {
-      while (queue.length) {
-        const { file, rel } = queue.shift()!;
-        const clean = rel.replace(/\\/g, "/").replace(/^\/+/, "");
-        if (!clean) continue;
-        const finalPath = dir ? `${dir}/${clean}` : clean;
-        const free = freePath(existing, finalPath);
-        try {
-          const blob = await api.fetchFileBlob(file);
-          const name = free.split("/").pop() || free;
-          const f = new File([blob], name, { type: blob.type || undefined });
-          await api.uploadFile(activeWsId, f, free);
-          existing.add(free);
-          ok.push(free);
-        } catch (e) {
-          failed.push(`${free}: ${e instanceof Error ? e.message : "copy failed"}`);
+    const workers = Array.from(
+      { length: Math.min(3, queue.length) },
+      async () => {
+        while (queue.length) {
+          const { file, rel } = queue.shift()!;
+          const clean = rel.replace(/\\/g, "/").replace(/^\/+/, "");
+          if (!clean) continue;
+          const finalPath = dir ? `${dir}/${clean}` : clean;
+          const free = freePath(existing, finalPath);
+          try {
+            const blob = await api.fetchFileBlob(file);
+            const name = free.split("/").pop() || free;
+            const f = new File([blob], name, { type: blob.type || undefined });
+            await api.uploadFile(activeWsId, f, free);
+            existing.add(free);
+            ok.push(free);
+          } catch (e) {
+            failed.push(
+              `${free}: ${e instanceof Error ? e.message : "copy failed"}`,
+            );
+          }
         }
-      }
-    });
+      },
+    );
     await Promise.all(workers);
     loadWs();
     if (failed.length === 0) {
@@ -914,8 +1099,19 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   if (!org.org) {
     return (
       <Flex direction="column" h="100vh" bg="surface.bg" color="ink.base">
-        <TopStrip onLogout={onLogout} onExit={onExit} colorMode={colorMode} toggleColorMode={toggleColorMode} />
-        <Center flex={1} flexDirection="column" gap={3} px={6} textAlign="center">
+        <TopStrip
+          onLogout={onLogout}
+          onExit={onExit}
+          colorMode={colorMode}
+          toggleColorMode={toggleColorMode}
+        />
+        <Center
+          flex={1}
+          flexDirection="column"
+          gap={3}
+          px={6}
+          textAlign="center"
+        >
           <Icon as={VscOrganization} fontSize="3xl" color="ink.subtle" />
           <Text fontSize="lg" fontWeight="semibold">
             You're not in an org yet
@@ -942,7 +1138,9 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   };
   // Owners/admins and a group's creator may manage its membership.
   const canManageGroup = (g?: Group) =>
-    !!g && g.scope === "group" && (me.role === "root" || me.role === "admin" || g.created_by === myId);
+    !!g &&
+    g.scope === "group" &&
+    (me.role === "root" || me.role === "admin" || g.created_by === myId);
   const activeKey =
     section === "chat" && !settingsOpen
       ? chatTarget.kind === "group"
@@ -962,11 +1160,16 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       .replace(/\s+/g, " ")
       .trim();
     const fromMe = s.last_sender === myId;
-    const prefix = fromMe ? "You: " : isGroup ? `${memberName(s.last_sender)}: ` : "";
+    const prefix = fromMe
+      ? "You: "
+      : isGroup
+        ? `${memberName(s.last_sender)}: `
+        : "";
     return prefix + (body || "New message");
   };
 
-  const groupUnread = activeKey === `g:${activeGroupId}` ? 0 : overview?.gs?.unread ?? 0;
+  const groupUnread =
+    activeKey === `g:${activeGroupId}` ? 0 : (overview?.gs?.unread ?? 0);
   // Per-group summaries for the messenger-style sidebar: every accessible
   // personal / group / org chat with its own preview, time and unread count.
   const groupThreads: Record<number, api.GroupThreadSummary> = {};
@@ -983,7 +1186,8 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     dmUnread[d.peer_id] = activeKey === `dm:${d.peer_id}` ? 0 : d.unread;
     dmPreview[d.peer_id] = summaryPreview(d, false);
   });
-  const chatUnreadCount = groupUnread + Object.values(dmUnread).reduce((a, b) => a + b, 0);
+  const chatUnreadCount =
+    groupUnread + Object.values(dmUnread).reduce((a, b) => a + b, 0);
 
   const allFiles = ws?.files ?? [];
   const filesById = new Map(allFiles.map((f) => [f.id, f]));
@@ -993,7 +1197,9 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       .filter((f): f is FileRow => !!f),
     activeFileId: g.activeId,
   }));
-  const treeActiveId = editorLike ? groups[focusedIdx]?.activeId ?? null : null;
+  const treeActiveId = editorLike
+    ? (groups[focusedIdx]?.activeId ?? null)
+    : null;
 
   // Quick Open (Ctrl+P): every real file in the workspace, openable by name.
   const fileItems: PaletteItem[] = allFiles
@@ -1022,19 +1228,85 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     setSection(s);
   };
   const commandItems: PaletteItem[] = [
-    { id: "goto", label: "Go to File…", hint: "Ctrl+P", icon: <Icon as={VscSearch} />, run: () => setPalette("files") },
-    { id: "settings", label: "Open Settings", hint: "Ctrl+,", icon: <Icon as={VscSettingsGear} />, run: () => setSettingsOpen(true) },
-    { id: "theme", label: `Switch to ${colorMode === "dark" ? "light" : "dark"} theme`, keywords: "color mode dark light", icon: <Icon as={colorMode === "dark" ? FiSun : FiMoon} />, run: toggleColorMode },
-    { id: "sidebar", label: "Toggle Sidebar", hint: "Ctrl+B", run: () => setSidebarCollapsed((c) => !c) },
-    { id: "newfile", label: "New File", icon: <Icon as={VscNewFile} />, run: () => goExplorerThen(() => treeRef.current?.startCreate("file")) },
-    { id: "newfolder", label: "New Folder", icon: <Icon as={VscNewFolder} />, run: () => goExplorerThen(() => treeRef.current?.startCreate("folder")) },
-    { id: "upload", label: "Upload Files…", icon: <Icon as={VscCloudUpload} />, run: () => requestUpload("") },
-    { id: "newgroup", label: "New Group", icon: <Icon as={VscOrganization} />, run: newGroup },
-    { id: "split", label: "Split Editor Right", run: () => splitGroup(focusedIdx) },
-    { id: "explorer", label: "Show Explorer", keywords: "files tree", run: () => showSection("explorer") },
-    { id: "chat", label: "Show Chat", keywords: "messages dm", run: () => showSection("chat") },
-    { id: "collapse", label: "Collapse All Folders", run: () => setCollapsed(new Set(allFolderPaths(allFiles))) },
-    { id: "signout", label: "Sign Out", icon: <Icon as={VscSignOut} />, run: onLogout },
+    {
+      id: "goto",
+      label: "Go to File…",
+      hint: "Ctrl+P",
+      icon: <Icon as={VscSearch} />,
+      run: () => setPalette("files"),
+    },
+    {
+      id: "settings",
+      label: "Open Settings",
+      hint: "Ctrl+,",
+      icon: <Icon as={VscSettingsGear} />,
+      run: () => setSettingsOpen(true),
+    },
+    {
+      id: "theme",
+      label: `Switch to ${colorMode === "dark" ? "light" : "dark"} theme`,
+      keywords: "color mode dark light",
+      icon: <Icon as={colorMode === "dark" ? FiSun : FiMoon} />,
+      run: toggleColorMode,
+    },
+    {
+      id: "sidebar",
+      label: "Toggle Sidebar",
+      hint: "Ctrl+B",
+      run: () => setSidebarCollapsed((c) => !c),
+    },
+    {
+      id: "newfile",
+      label: "New File",
+      icon: <Icon as={VscNewFile} />,
+      run: () => goExplorerThen(() => treeRef.current?.startCreate("file")),
+    },
+    {
+      id: "newfolder",
+      label: "New Folder",
+      icon: <Icon as={VscNewFolder} />,
+      run: () => goExplorerThen(() => treeRef.current?.startCreate("folder")),
+    },
+    {
+      id: "upload",
+      label: "Upload Files…",
+      icon: <Icon as={VscCloudUpload} />,
+      run: () => requestUpload(""),
+    },
+    {
+      id: "newgroup",
+      label: "New Group",
+      icon: <Icon as={VscOrganization} />,
+      run: newGroup,
+    },
+    {
+      id: "split",
+      label: "Split Editor Right",
+      run: () => splitGroup(focusedIdx),
+    },
+    {
+      id: "explorer",
+      label: "Show Explorer",
+      keywords: "files tree",
+      run: () => showSection("explorer"),
+    },
+    {
+      id: "chat",
+      label: "Show Chat",
+      keywords: "messages dm",
+      run: () => showSection("chat"),
+    },
+    {
+      id: "collapse",
+      label: "Collapse All Folders",
+      run: () => setCollapsed(new Set(allFolderPaths(allFiles))),
+    },
+    {
+      id: "signout",
+      label: "Sign Out",
+      icon: <Icon as={VscSignOut} />,
+      run: onLogout,
+    },
   ];
 
   return (
@@ -1109,7 +1381,13 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
               onSelectGroup={selectGroupChat}
               dmUnread={dmUnread}
               dmPreview={dmPreview}
-              dmAt={overview?.dms ? Object.fromEntries(overview.dms.map((d) => [d.peer_id, d.at])) : undefined}
+              dmAt={
+                overview?.dms
+                  ? Object.fromEntries(
+                      overview.dms.map((d) => [d.peer_id, d.at]),
+                    )
+                  : undefined
+              }
               presence={presence}
               prefs={chatPrefs}
               onPrefsChange={setRawChatPrefs}
@@ -1175,7 +1453,9 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                           borderRadius="md"
                           cursor="pointer"
                           bg={active ? "accent.tint" : "transparent"}
-                          _hover={{ bg: active ? "accent.tint" : "surface.hover" }}
+                          _hover={{
+                            bg: active ? "accent.tint" : "surface.hover",
+                          }}
                           w="full"
                           onClick={() => selectWorkspace(w.id)}
                           onContextMenu={(e) => {
@@ -1200,11 +1480,28 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                             });
                           }}
                         >
-                          <Icon as={VscFiles} boxSize="13px" color={active ? "brand.400" : "ink.subtle"} flexShrink={0} />
-                          <Text fontSize="13px" isTruncated flex={1} color={active ? "ink.base" : "ink.muted"}>
+                          <Icon
+                            as={VscFiles}
+                            boxSize="13px"
+                            color={active ? "brand.400" : "ink.subtle"}
+                            flexShrink={0}
+                          />
+                          <Text
+                            fontSize="13px"
+                            isTruncated
+                            flex={1}
+                            color={active ? "ink.base" : "ink.muted"}
+                          >
                             {w.name}
                           </Text>
-                          {active && <Icon as={VscCheck} color="brand.400" boxSize="13px" flexShrink={0} />}
+                          {active && (
+                            <Icon
+                              as={VscCheck}
+                              color="brand.400"
+                              boxSize="13px"
+                              flexShrink={0}
+                            />
+                          )}
                         </Flex>
                       );
                     })}
@@ -1247,7 +1544,13 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                             py="4px"
                           >
                             <MenuItem
-                              icon={<Icon as={VscCloudUpload} fontSize="16px" color="ink.muted" />}
+                              icon={
+                                <Icon
+                                  as={VscCloudUpload}
+                                  fontSize="16px"
+                                  color="ink.muted"
+                                />
+                              }
                               fontSize="13px"
                               borderRadius="sm"
                               onClick={() => requestUpload("")}
@@ -1255,7 +1558,13 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                               Upload files…
                             </MenuItem>
                             <MenuItem
-                              icon={<Icon as={VscFolderOpened} fontSize="16px" color="ink.muted" />}
+                              icon={
+                                <Icon
+                                  as={VscFolderOpened}
+                                  fontSize="16px"
+                                  color="ink.muted"
+                                />
+                              }
                               fontSize="13px"
                               borderRadius="sm"
                               onClick={() => requestUploadFolder("")}
@@ -1265,14 +1574,23 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                           </MenuList>
                         </Menu>
                       </Tooltip>
-                      <Tooltip label="Download workspace (.zip)" openDelay={400}>
+                      <Tooltip
+                        label="Download workspace (.zip)"
+                        openDelay={400}
+                      >
                         <PanelIconButton
                           aria-label="Download workspace as zip"
                           icon={<VscCloudDownload />}
                           onClick={() =>
                             api
                               .downloadWorkspaceZip(activeWs.id, activeWs.name)
-                              .catch(() => toast({ title: "Workspace export failed", status: "error", duration: 4000 }))
+                              .catch(() =>
+                                toast({
+                                  title: "Workspace export failed",
+                                  status: "error",
+                                  duration: 4000,
+                                }),
+                              )
                           }
                         />
                       </Tooltip>
@@ -1290,8 +1608,11 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                           onClick={() => {
                             const folders = allFolderPaths(allFiles);
                             const allCollapsed =
-                              folders.length > 0 && folders.every((p) => collapsed.has(p));
-                            setCollapsed(allCollapsed ? new Set() : new Set(folders));
+                              folders.length > 0 &&
+                              folders.every((p) => collapsed.has(p));
+                            setCollapsed(
+                              allCollapsed ? new Set() : new Set(folders),
+                            );
                           }}
                         />
                       </Tooltip>
@@ -1318,7 +1639,8 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                   />
                   {allFiles.length === 0 && (
                     <Text fontSize="xs" color="ink.subtle" px={2} py={2}>
-                      No files yet. Right-click, use the buttons above, or drop files here.
+                      No files yet. Right-click, use the buttons above, or drop
+                      files here.
                     </Text>
                   )}
                 </Box>
@@ -1353,7 +1675,11 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
           groupMemberCount={
             activeGroup?.scope === "group" ? memberIds.length : undefined
           }
-          canClearGroup={me.role === "admin" || me.role === "root" || activeGroup?.created_by === myId}
+          canClearGroup={
+            me.role === "admin" ||
+            me.role === "root" ||
+            activeGroup?.created_by === myId
+          }
           prefs={chatPrefs}
           onPrefsChange={setRawChatPrefs}
         />
@@ -1373,7 +1699,11 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
           onSplitFile={splitFile}
           settingsActive={settingsOpen}
           settingsNode={
-            <Settings me={me} onClose={() => setSettingsOpen(false)} onUpdated={() => onUpdated?.()} />
+            <Settings
+              me={me}
+              onClose={() => setSettingsOpen(false)}
+              onUpdated={() => onUpdated?.()}
+            />
           }
           onCloseSettings={() => setSettingsOpen(false)}
         />
@@ -1387,7 +1717,10 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         onChange={(e) => {
           uploadFiles(
             uploadDir.current,
-            Array.from(e.target.files ?? []).map((f) => ({ file: f, path: f.name })),
+            Array.from(e.target.files ?? []).map((f) => ({
+              file: f,
+              path: f.name,
+            })),
           );
           e.target.value = "";
         }}
@@ -1431,7 +1764,9 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       <CommandPalette
         isOpen={palette !== null}
         onClose={() => setPalette(null)}
-        placeholder={palette === "commands" ? "Type a command…" : "Search files by name…"}
+        placeholder={
+          palette === "commands" ? "Type a command…" : "Search files by name…"
+        }
         items={palette === "commands" ? commandItems : fileItems}
       />
 
@@ -1443,7 +1778,12 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         isCentered
       >
         <AlertDialogOverlay bg="blackAlpha.600">
-          <AlertDialogContent bg="surface.panel" border="1px solid" borderColor="surface.border" mx={4}>
+          <AlertDialogContent
+            bg="surface.panel"
+            border="1px solid"
+            borderColor="surface.border"
+            mx={4}
+          >
             <AlertDialogHeader fontSize="md">New group</AlertDialogHeader>
             <AlertDialogBody>
               <FormControl mb={3}>
@@ -1454,7 +1794,11 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                   autoFocus
                   placeholder="e.g. Design team"
                   value={groupDraft?.name ?? ""}
-                  onChange={(e) => setGroupDraft((d) => (d ? { ...d, name: e.target.value } : d))}
+                  onChange={(e) =>
+                    setGroupDraft((d) =>
+                      d ? { ...d, name: e.target.value } : d,
+                    )
+                  }
                   onKeyDown={(e) => e.key === "Enter" && createGroupNow()}
                 />
               </FormControl>
@@ -1486,7 +1830,9 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                     borderRadius="md"
                     border="1px solid"
                     borderColor={
-                      groupDraft?.scope === opt.key ? "brand.400" : "surface.border"
+                      groupDraft?.scope === opt.key
+                        ? "brand.400"
+                        : "surface.border"
                     }
                     bg={
                       groupDraft?.scope === opt.key
@@ -1494,9 +1840,23 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                         : "surface.raised"
                     }
                     _hover={{ borderColor: "brand.300" }}
-                    onClick={() => setGroupDraft((d) => (d ? { ...d, scope: opt.key as "group" | "personal" } : d))}
+                    onClick={() =>
+                      setGroupDraft((d) =>
+                        d
+                          ? { ...d, scope: opt.key as "group" | "personal" }
+                          : d,
+                      )
+                    }
                   >
-                    <Icon as={opt.icon} boxSize="18px" color={groupDraft?.scope === opt.key ? "brand.400" : "ink.muted"} />
+                    <Icon
+                      as={opt.icon}
+                      boxSize="18px"
+                      color={
+                        groupDraft?.scope === opt.key
+                          ? "brand.400"
+                          : "ink.muted"
+                      }
+                    />
                     <Box textAlign="left" minW={0}>
                       <Text fontSize="sm" fontWeight={600} color="ink.base">
                         {opt.title}
@@ -1510,7 +1870,12 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
               </VStack>
             </AlertDialogBody>
             <AlertDialogFooter>
-              <Button variant="ghost" size="sm" mr={2} onClick={() => setGroupDraft(null)}>
+              <Button
+                variant="ghost"
+                size="sm"
+                mr={2}
+                onClick={() => setGroupDraft(null)}
+              >
                 Cancel
               </Button>
               <Button
@@ -1534,7 +1899,12 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         isCentered
       >
         <AlertDialogOverlay bg="blackAlpha.600">
-          <AlertDialogContent bg="surface.panel" border="1px solid" borderColor="surface.border" mx={4}>
+          <AlertDialogContent
+            bg="surface.panel"
+            border="1px solid"
+            borderColor="surface.border"
+            mx={4}
+          >
             <AlertDialogHeader fontSize="md">
               <HStack spacing={2}>
                 <Text>Members</Text>
@@ -1556,9 +1926,18 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
             </AlertDialogHeader>
             <AlertDialogBody maxH="360px" overflowY="auto">
               <Text fontSize="xs" color="ink.subtle" mb={2}>
-                Only these people can see “{membersOf?.name}” and its workspaces.
+                Only these people can see “{membersOf?.name}” and its
+                workspaces.
               </Text>
-              <Flex align="center" gap={2} bg="surface.hover" borderRadius="lg" px={2.5} py={1.5} mb={2}>
+              <Flex
+                align="center"
+                gap={2}
+                bg="surface.hover"
+                borderRadius="lg"
+                px={2.5}
+                py={1.5}
+                mb={2}
+              >
                 <Icon as={VscSearch} color="ink.subtle" flexShrink={0} />
                 <Input
                   variant="unstyled"
@@ -1580,9 +1959,12 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                 )}
               </Flex>
               {org.members
-                .filter((m) =>
-                  !memberQuery.trim() ||
-                  (m.name + " " + m.email).toLowerCase().includes(memberQuery.trim().toLowerCase()),
+                .filter(
+                  (m) =>
+                    !memberQuery.trim() ||
+                    (m.name + " " + m.email)
+                      .toLowerCase()
+                      .includes(memberQuery.trim().toLowerCase()),
                 )
                 .map((m) => {
                   const isOwner = m.id === membersOf?.created_by;
@@ -1613,12 +1995,22 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                           <Text fontSize="sm" color="ink.base" isTruncated>
                             {m.name || m.email}
                             {isOwner && (
-                              <Text as="span" fontSize="xs" color="ink.subtle" ml={1.5}>
+                              <Text
+                                as="span"
+                                fontSize="xs"
+                                color="ink.subtle"
+                                ml={1.5}
+                              >
                                 owner
                               </Text>
                             )}
                             {!isOwner && m.role === "admin" && (
-                              <Text as="span" fontSize="xs" color="ink.subtle" ml={1.5}>
+                              <Text
+                                as="span"
+                                fontSize="xs"
+                                color="ink.subtle"
+                                ml={1.5}
+                              >
                                 admin
                               </Text>
                             )}
@@ -1660,7 +2052,11 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                 )}
             </AlertDialogBody>
             <AlertDialogFooter>
-              <Button size="sm" colorScheme="brand" onClick={() => setMembersOf(null)}>
+              <Button
+                size="sm"
+                colorScheme="brand"
+                onClick={() => setMembersOf(null)}
+              >
                 Done
               </Button>
             </AlertDialogFooter>
@@ -1683,9 +2079,21 @@ function TopStrip({
   toggleColorMode: () => void;
 }) {
   return (
-    <HStack px={4} h={12} borderBottom="1px solid" borderColor="surface.border" bg="surface.panel">
+    <HStack
+      px={4}
+      h={12}
+      borderBottom="1px solid"
+      borderColor="surface.border"
+      bg="surface.panel"
+    >
       {onExit && (
-        <IconButton aria-label="Back" icon={<VscArrowLeft />} size="sm" variant="ghost" onClick={onExit} />
+        <IconButton
+          aria-label="Back"
+          icon={<VscArrowLeft />}
+          size="sm"
+          variant="ghost"
+          onClick={onExit}
+        />
       )}
       <Box flex={1} />
       <IconButton
@@ -1696,7 +2104,14 @@ function TopStrip({
         color="ink.muted"
         onClick={toggleColorMode}
       />
-      <IconButton aria-label="Sign out" icon={<VscSignOut />} size="sm" variant="ghost" color="ink.muted" onClick={onLogout} />
+      <IconButton
+        aria-label="Sign out"
+        icon={<VscSignOut />}
+        size="sm"
+        variant="ghost"
+        color="ink.muted"
+        onClick={onLogout}
+      />
     </HStack>
   );
 }
