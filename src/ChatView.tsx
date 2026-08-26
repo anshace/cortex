@@ -47,6 +47,7 @@ import {
   LuTrash2,
 } from "react-icons/lu";
 import {
+  VscArrowDown,
   VscCheck,
   VscClearAll,
   VscClose,
@@ -57,6 +58,7 @@ import ReactMarkdown, { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { ChatTarget } from "./ChatChannels";
+import ChatAvatar from "./ChatAvatar";
 import { ConfirmModal } from "./Dialogs";
 import * as api from "./api";
 import { ChatMessage, Me, Member, Presence } from "./api";
@@ -763,6 +765,15 @@ function ChatView({
   const [typing, setTyping] = useState<number[]>([]);
   const [presence, setPresence] = useState<Record<number, Presence>>({});
   const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  // Floating “jump to latest” pill: appears when you've scrolled away from the
+  // bottom so a long thread never leaves you stranded.
+  const [showJump, setShowJump] = useState(false);
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    setShowJump(el.scrollHeight - el.scrollTop - el.clientHeight > 240);
+  }, []);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const prevCount = useRef(0);
   const lastTypingPing = useRef(0);
@@ -1252,12 +1263,9 @@ function ChatView({
         <Flex align="center" gap={2.5} minW={0}>
           {peer ? (
             <Box position="relative" flexShrink={0}>
-              <Avatar
-                size="sm"
-                boxSize="34px"
+              <ChatAvatar
                 name={peer.name || peer.email}
-                bg="brand.600"
-                color="white"
+                size={34}
               />
               <Box
                 position="absolute"
@@ -1322,14 +1330,17 @@ function ChatView({
         </Tooltip>
       </Flex>
 
-      <Box
-        flex={1}
-        minH={0}
-        overflowY="auto"
-        overflowX="hidden"
-        px={{ base: 2, md: 4 }}
-        py={3}
-      >
+      <Flex flex={1} minH={0} position="relative">
+        <Box
+          ref={scrollRef as never}
+          onScroll={onScroll}
+          flex={1}
+          minW={0}
+          overflowY="auto"
+          overflowX="hidden"
+          px={{ base: 2, md: 4 }}
+          py={3}
+        >
         {messages.length === 0 ? (
           <Center flexDirection="column" gap={3} py={20} color="ink.muted">
             <Icon as={VscComment} fontSize="3xl" color="ink.subtle" />
@@ -1721,14 +1732,7 @@ function ChatView({
                         {grouped ? (
                           <Box w="28px" flexShrink={0} />
                         ) : (
-                          <Avatar
-                            size="sm"
-                            boxSize="28px"
-                            name={label}
-                            bg={`hsl(${hueOf(m.email)}, 45%, 45%)`}
-                            color="white"
-                            flexShrink={0}
-                          />
+                          <ChatAvatar name={label} size={28} />
                         )}
                         {bubble}
                         {actions}
@@ -1742,7 +1746,31 @@ function ChatView({
           </Flex>
         )}
         {typingNames.length > 0 && <TypingBubble names={typingNames} />}
-      </Box>
+        </Box>
+        {showJump && (
+          <Tooltip label="Jump to latest">
+            <IconButton
+              aria-label="Jump to latest message"
+              icon={<VscArrowDown />}
+              size="sm"
+              position="absolute"
+              bottom="12px"
+              right="16px"
+              borderRadius="full"
+              bg="surface.raised"
+              color="ink.base"
+              boxShadow="pop"
+              border="1px solid"
+              borderColor="surface.border"
+              _hover={{ bg: "surface.hover" }}
+              onClick={() => {
+                setShowJump(false);
+                bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+              }}
+            />
+          </Tooltip>
+        )}
+      </Flex>
 
       {editing != null && (
         <Flex
