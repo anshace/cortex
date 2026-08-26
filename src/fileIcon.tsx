@@ -34,6 +34,7 @@ import {
 } from "react-icons/si";
 import {
   VscDatabase,
+  VscEdit,
   VscFile,
   VscFileBinary,
   VscFileCode,
@@ -102,6 +103,8 @@ const MAP: Record<string, IconSpec> = {
   fish: { icon: SiGnubash, color: "#4eaa25" },
   md: { icon: SiMarkdown, color: "#9aa7b6" },
   markdown: { icon: SiMarkdown, color: "#9aa7b6" },
+  // Whiteboard scenes (Excalidraw)
+  board: { icon: VscEdit, color: "#6965db" },
   json: { icon: SiJson, color: "#cbcb41" },
   jsonc: { icon: SiJson, color: "#cbcb41" },
   yml: { icon: SiYaml, color: "#cb171e" },

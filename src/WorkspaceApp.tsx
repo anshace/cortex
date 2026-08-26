@@ -1295,6 +1295,13 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       run: () => goExplorerThen(() => treeRef.current?.startCreate("folder")),
     },
     {
+      id: "newboard",
+      label: "New Whiteboard",
+      keywords: "draw sketch diagram excalidraw board shapes ideas",
+      icon: <Icon as={VscEdit} />,
+      run: () => goExplorerThen(() => treeRef.current?.startCreate("board")),
+    },
+    {
       id: "upload",
       label: "Upload Files…",
       icon: <Icon as={VscCloudUpload} />,
