@@ -238,6 +238,30 @@ export async function downloadWorkspaceZip(wsId: number, fallbackName: string): 
   a.remove();
   URL.revokeObjectURL(url);
 }
+
+// ----- whiteboards (.board files; Excalidraw scene stored as a binary blob) -----
+// The initial empty scene uploaded when a board is created.
+export function emptyBoardScene(): string {
+  return JSON.stringify({ type: "excalidraw", version: 2, source: "cortex", elements: [], appState: { viewBackgroundColor: "#ffffff" } });
+}
+// Fetch the raw scene JSON of a board file.
+export async function loadBoard(file: FileRow): Promise<string> {
+  const res = await fetch(rawUrl(file), { credentials: "include" });
+  if (!res.ok) throw new Error("could not load board");
+  return res.text();
+}
+// Overwrite a board's scene (autosave). Server-side this is PUT /files/:id/blob,
+// which only accepts binary-kind files — .board uploads are always binary.
+export async function saveBoard(fileId: number, scene: unknown): Promise<void> {
+  await json(
+    await fetch(`/api/files/${fileId}/blob`, {
+      method: "PUT",
+      credentials: "include",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: JSON.stringify(scene),
+    }),
+  );
+}
 export async function deleteFile(id: number): Promise<void> {
   await json(await fetch(`/api/files/${id}`, opts("DELETE")));
 }

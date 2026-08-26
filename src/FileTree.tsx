@@ -106,7 +106,7 @@ function visibleOrder(
 }
 
 export type FileTreeHandle = {
-  startCreate: (kind: "file" | "folder") => void;
+  startCreate: (kind: "file" | "folder" | "board") => void;
   /** Download every currently selected file; returns how many were started. */
   downloadSelected: () => number;
 };
@@ -206,7 +206,7 @@ async function collectDrops(
 }
 
 type EditState = { path: string; initial: string } | null;
-type CreateState = { parent: string; kind: "file" | "folder" } | null;
+type CreateState = { parent: string; kind: "file" | "folder" | "board" } | null;
 type ClipboardState = {
   mode: "cut" | "copy";
   items: { file: FileRow; rel: string }[];
@@ -247,7 +247,7 @@ const FileTree = forwardRef<FileTreeHandle, Props>(
     const lastClick = useRef<number | null>(null);
 
     useImperativeHandle(ref, () => ({
-      startCreate: (kind) => {
+      startCreate: (kind: "file" | "folder" | "board") => {
         setEditing(null);
         setRootOpen(true);
         setCreating({ parent: "", kind });
@@ -271,7 +271,7 @@ const FileTree = forwardRef<FileTreeHandle, Props>(
       );
     }
 
-    function startCreateIn(parent: string, kind: "file" | "folder") {
+    function startCreateIn(parent: string, kind: "file" | "folder" | "board") {
       setEditing(null);
       if (parent && collapsed.has(parent)) onToggle(parent);
       setCreating({ parent, kind });
@@ -280,7 +280,11 @@ const FileTree = forwardRef<FileTreeHandle, Props>(
     function commitCreate(name: string) {
       if (!creating) return;
       const base = creating.parent ? `${creating.parent}/${name}` : name;
-      onCreate(creating.kind === "folder" ? `${base}/.keep` : base);
+      if (creating.kind === "folder") onCreate(`${base}/.keep`);
+      else if (creating.kind === "board")
+        // Whiteboard files always carry the .board extension.
+        onCreate(/\.board$/i.test(base) ? base : `${base}.board`);
+      else onCreate(base);
       setCreating(null);
     }
 
@@ -471,6 +475,11 @@ const FileTree = forwardRef<FileTreeHandle, Props>(
           label: "New File",
           icon: VscNewFile,
           onClick: () => startCreateIn(folderPath, "file"),
+        },
+        {
+          label: "New Board",
+          icon: VscEdit,
+          onClick: () => startCreateIn(folderPath, "board"),
         },
         {
           label: "New Folder",
@@ -993,7 +1002,7 @@ function InlineInput({
   onCancel,
 }: {
   depth: number;
-  kind: "file" | "folder";
+  kind: "file" | "folder" | "board";
   initial?: string;
   onCommit: (name: string) => void;
   onCancel: () => void;
