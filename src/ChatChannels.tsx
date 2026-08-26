@@ -1,5 +1,4 @@
 import {
-  Avatar,
   Badge,
   Box,
   Button,
@@ -21,7 +20,6 @@ import {
   VscSettingsGear,
 } from "react-icons/vsc";
 
-import { Group, GroupThreadSummary, Me, Member } from "./api";
 import {
   ChatPrefs,
   FONT_LABELS,
@@ -29,6 +27,7 @@ import {
   WALLPAPER_IDS,
   WallpaperId,
 } from "./ChatView";
+import { Group, GroupThreadSummary, Me, Member } from "./api";
 
 export type ChatTarget = { kind: "group" } | { kind: "dm"; userId: number };
 
@@ -188,22 +187,6 @@ function Row({
   );
 }
 
-function Label({ children }: { children: string }) {
-  return (
-    <Text
-      px={4}
-      py={1}
-      fontSize="11px"
-      fontWeight={700}
-      textTransform="uppercase"
-      letterSpacing="0.05em"
-      color="ink.subtle"
-    >
-      {children}
-    </Text>
-  );
-}
-
 function ChatChannels({
   me,
   groups,
@@ -221,6 +204,7 @@ function ChatChannels({
   onPrefsChange,
 }: Props) {
   const [query, setQuery] = useState("");
+  const [tab, setTab] = useState<"all" | "people" | "groups">("all");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const q = query.trim().toLowerCase();
 
@@ -239,19 +223,55 @@ function ChatChannels({
     }),
     [groups],
   );
-  const filteredPeers = q
-    ? peers.filter((p) => (p.name + " " + p.email).toLowerCase().includes(q))
-    : peers;
+  const groupLabel = (g: Group) =>
+    g.scope === "personal" ? "Personal" : g.name;
 
-  const groupLabel = (g: Group) => (g.scope === "personal" ? "Personal" : g.name);
+  // Unified conversation list sorted by last activity — when a message lands
+  // anywhere, that conversation bubbles to the top like any real messenger.
+  type Item = { kind: "dm"; member: Member } | { kind: "group"; group: Group };
+  const items = useMemo(() => {
+    const dmItems: Item[] = peers.map((member) => ({ kind: "dm", member }));
+    const groupItems: Item[] = [...byScope.personal, ...byScope.group].map(
+      (group) => ({ kind: "group", group }),
+    );
+    const atOf = (it: Item) =>
+      it.kind === "dm"
+        ? (dmAt?.[it.member.id] ?? 0)
+        : (groupThreads[it.group.id]?.at ?? 0);
+    return [...dmItems, ...groupItems].sort((a, b) => atOf(b) - atOf(a));
+  }, [peers, byScope, dmAt, groupThreads]);
 
-  const groupRow = (g: Group) => {
+  const itemMatches = (it: Item) => {
+    if (!q) return true;
+    return it.kind === "dm"
+      ? (it.member.name + " " + it.member.email).toLowerCase().includes(q)
+      : groupLabel(it.group).toLowerCase().includes(q);
+  };
+
+  const renderItem = (it: Item) => {
+    if (it.kind === "dm") {
+      const p = it.member;
+      return (
+        <Row
+          key={`dm-${p.id}`}
+          active={target.kind === "dm" && target.userId === p.id}
+          avatarName={p.name || p.email}
+          label={p.name || p.email}
+          sub={dmPreview?.[p.id]}
+          badge={p.role === "admin" ? "admin" : undefined}
+          unread={dmUnread?.[p.id]}
+          online={presence?.[p.id] ?? false}
+          time={dmAt?.[p.id] ? listTime(dmAt[p.id]) : undefined}
+          onClick={() => onSelect({ kind: "dm", userId: p.id })}
+        />
+      );
+    }
+    const g = it.group;
     const t = groupThreads[g.id];
-    const active = target.kind === "group" && activeGroupId === g.id;
     return (
       <Row
-        key={g.id}
-        active={active}
+        key={`g-${g.id}`}
+        active={target.kind === "group" && activeGroupId === g.id}
         avatarName={groupLabel(g)}
         label={groupLabel(g)}
         sub={t?.body ?? "No messages yet"}
@@ -262,10 +282,13 @@ function ChatChannels({
     );
   };
 
-  const groupMatch = (g: Group) =>
-    !q || groupLabel(g).toLowerCase().includes(q) || g.scope.includes(q);
-
-  const hasGroups = byScope.personal.length + byScope.group.length > 0;
+  const visible = items.filter(
+    (it) =>
+      itemMatches(it) &&
+      (tab === "all" ||
+        (tab === "people" && it.kind === "dm") ||
+        (tab === "groups" && it.kind === "group")),
+  );
 
   return (
     <Flex direction="column" flex={1} minH={0} overflowY="auto" py={2}>
@@ -299,6 +322,39 @@ function ChatChannels({
             />
           )}
         </Flex>
+      </Box>
+
+      {/* All / People / Groups filter — WhatsApp-style segmented tabs. */}
+      <Box px={3} pb={2} flexShrink={0}>
+        <HStack spacing={1} bg="surface.hover" borderRadius="full" p="3px">
+          {(
+            [
+              ["all", "All"],
+              ["people", "People"],
+              ["groups", "Groups"],
+            ] as const
+          ).map(([id, label]) => (
+            <Box
+              key={id}
+              as="button"
+              type="button"
+              flex={1}
+              py="4px"
+              px={2}
+              borderRadius="full"
+              fontSize="12px"
+              fontWeight={600}
+              userSelect="none"
+              transition="all 0.15s ease"
+              bg={tab === id ? "brand.500" : "transparent"}
+              color={tab === id ? "white" : "ink.muted"}
+              _hover={tab === id ? undefined : { color: "ink.base" }}
+              onClick={() => setTab(id)}
+            >
+              {label}
+            </Box>
+          ))}
+        </HStack>
       </Box>
 
       {/* Chat appearance settings — collapsed under one toggle button. */}
@@ -339,159 +395,144 @@ function ChatChannels({
 
         <Collapse in={settingsOpen} unmountOnExit>
           <Box pt={2}>
-        <HStack spacing={1.5}>
-          {WALLPAPER_IDS.map((k) => {
-            const w = WALLPAPERS[k];
-            const active = prefs.wallpaper === k;
-            return (
-              <Box
-                key={k}
-                as="button"
-                type="button"
-                aria-label={`Wallpaper: ${w.label}`}
-                title={w.label}
-                position="relative"
-                flex={1}
-                h="40px"
-                borderRadius="md"
-                border="1px solid"
-                borderColor={active ? "brand.400" : "surface.borderStrong"}
-                overflow="hidden"
-                boxShadow={active ? "0 0 0 2px var(--chakra-colors-brand-400)" : undefined}
-                _hover={{ borderColor: "brand.300" }}
-                onClick={() => onPrefsChange({ ...prefs, wallpaper: k })}
-                bg={w.url ? undefined : "surface.hover"}
-              >
-                {w.url ? (
+            <HStack spacing={1.5}>
+              {WALLPAPER_IDS.map((k) => {
+                const w = WALLPAPERS[k];
+                const active = prefs.wallpaper === k;
+                return (
                   <Box
-                    position="absolute"
-                    inset={0}
-                    style={{
-                      backgroundImage: `url("${w.url}")`,
-                      backgroundColor: w.color,
-                      backgroundSize: "cover",
-                      backgroundPosition: "center",
-                    }}
-                  />
-                ) : (
-                  <Center position="absolute" inset={0} color="ink.subtle">
-                    <Box
-                      boxSize="18px"
-                      borderRadius="full"
-                      border="2px solid"
-                      borderColor="ink.subtle"
-                      opacity={0.8}
-                    />
-                  </Center>
-                )}
-                {active && (
-                  <Center position="absolute" inset={0}>
-                    <Icon
-                      as={VscCheck}
-                      boxSize="14px"
-                      color="white"
-                      bg="rgba(0,0,0,0.45)"
-                      borderRadius="full"
-                      p="1px"
-                    />
-                  </Center>
-                )}
-              </Box>
-            );
-          })}
-        </HStack>
+                    key={k}
+                    as="button"
+                    type="button"
+                    aria-label={`Wallpaper: ${w.label}`}
+                    title={w.label}
+                    position="relative"
+                    flex={1}
+                    h="40px"
+                    borderRadius="md"
+                    border="1px solid"
+                    borderColor={active ? "brand.400" : "surface.borderStrong"}
+                    overflow="hidden"
+                    boxShadow={
+                      active
+                        ? "0 0 0 2px var(--chakra-colors-brand-400)"
+                        : undefined
+                    }
+                    _hover={{ borderColor: "brand.300" }}
+                    onClick={() => onPrefsChange({ ...prefs, wallpaper: k })}
+                    bg={w.url ? undefined : "surface.hover"}
+                  >
+                    {w.url ? (
+                      <Box
+                        position="absolute"
+                        inset={0}
+                        style={{
+                          backgroundImage: `url("${w.url}")`,
+                          backgroundColor: w.color,
+                          backgroundSize: "cover",
+                          backgroundPosition: "center",
+                        }}
+                      />
+                    ) : (
+                      <Center position="absolute" inset={0} color="ink.subtle">
+                        <Box
+                          boxSize="18px"
+                          borderRadius="full"
+                          border="2px solid"
+                          borderColor="ink.subtle"
+                          opacity={0.8}
+                        />
+                      </Center>
+                    )}
+                    {active && (
+                      <Center position="absolute" inset={0}>
+                        <Icon
+                          as={VscCheck}
+                          boxSize="14px"
+                          color="white"
+                          bg="rgba(0,0,0,0.45)"
+                          borderRadius="full"
+                          p="1px"
+                        />
+                      </Center>
+                    )}
+                  </Box>
+                );
+              })}
+            </HStack>
 
-        {/* Message size */}
-        <HStack spacing={1.5} mt={2.5} justify="space-between" align="center">
-          <Text fontSize="xs" fontWeight={600} color="ink.muted" flexShrink={0}>
-            Message size
-          </Text>
-          <HStack spacing={1}>
-            {(["sm", "md", "lg"] as ChatPrefs["fontSize"][]).map((s) => (
-              <Button
-                key={s}
-                size="xs"
-                h="22px"
-                px={2}
-                minW="auto"
-                fontSize="11px"
-                variant={prefs.fontSize === s ? "solid" : "ghost"}
-                colorScheme={prefs.fontSize === s ? "brand" : undefined}
-                onClick={() => onPrefsChange({ ...prefs, fontSize: s })}
+            {/* Message size */}
+            <HStack
+              spacing={1.5}
+              mt={2.5}
+              justify="space-between"
+              align="center"
+            >
+              <Text
+                fontSize="xs"
+                fontWeight={600}
+                color="ink.muted"
+                flexShrink={0}
               >
-                {FONT_LABELS[s]}
-              </Button>
-            ))}
-          </HStack>
-        </HStack>
+                Message size
+              </Text>
+              <HStack spacing={1}>
+                {(["sm", "md", "lg"] as ChatPrefs["fontSize"][]).map((s) => (
+                  <Button
+                    key={s}
+                    size="xs"
+                    h="22px"
+                    px={2}
+                    minW="auto"
+                    fontSize="11px"
+                    variant={prefs.fontSize === s ? "solid" : "ghost"}
+                    colorScheme={prefs.fontSize === s ? "brand" : undefined}
+                    onClick={() => onPrefsChange({ ...prefs, fontSize: s })}
+                  >
+                    {FONT_LABELS[s]}
+                  </Button>
+                ))}
+              </HStack>
+            </HStack>
 
-        {/* Enter to send */}
-        <Flex justify="space-between" align="center" gap={3} mt={2.5}>
-          <Box minW={0}>
-            <Text fontSize="xs" fontWeight={600} color="ink.muted">
-              Enter to send
-            </Text>
-            <Text fontSize="10px" color="ink.subtle">
-              {prefs.enterToSend
-                ? "Enter sends · Shift+Enter adds a line"
-                : "Enter adds a line · Ctrl+Enter sends"}
-            </Text>
-          </Box>
-          <Switch
-            size="sm"
-            colorScheme="brand"
-            isChecked={prefs.enterToSend}
-            onChange={(e) =>
-              onPrefsChange({ ...prefs, enterToSend: e.target.checked })
-            }
-          />
-        </Flex>
+            {/* Enter to send */}
+            <Flex justify="space-between" align="center" gap={3} mt={2.5}>
+              <Box minW={0}>
+                <Text fontSize="xs" fontWeight={600} color="ink.muted">
+                  Enter to send
+                </Text>
+                <Text fontSize="10px" color="ink.subtle">
+                  {prefs.enterToSend
+                    ? "Enter sends · Shift+Enter adds a line"
+                    : "Enter adds a line · Ctrl+Enter sends"}
+                </Text>
+              </Box>
+              <Switch
+                size="sm"
+                colorScheme="brand"
+                isChecked={prefs.enterToSend}
+                onChange={(e) =>
+                  onPrefsChange({ ...prefs, enterToSend: e.target.checked })
+                }
+              />
+            </Flex>
           </Box>
         </Collapse>
       </Box>
 
-      {byScope.personal.filter(groupMatch).length > 0 && (
-        <Box mt={1}>
-          <Label>Personal</Label>
-          {byScope.personal.filter(groupMatch).map(groupRow)}
-        </Box>
-      )}
+      {visible.map(renderItem)}
 
-      {byScope.group.filter(groupMatch).length > 0 && (
-        <Box mt={2}>
-          <Label>Groups</Label>
-          {byScope.group.filter(groupMatch).map(groupRow)}
-        </Box>
-      )}
-
-      {!hasGroups && !q && (
-        <Text px={4} py={1.5} fontSize="xs" color="ink.subtle">
-          No chats yet — create a group to start one.
+      {visible.length === 0 && (
+        <Text px={4} py={2} fontSize="xs" color="ink.subtle">
+          {q
+            ? "No chats match your search."
+            : tab === "people"
+              ? "No one else in your org yet."
+              : tab === "groups"
+                ? "No groups yet — create one to start chatting."
+                : "No chats yet."}
         </Text>
       )}
-
-      <Box mt={2}>
-        <Label>Direct Messages</Label>
-        {filteredPeers.map((p) => (
-          <Row
-            key={p.id}
-            active={target.kind === "dm" && target.userId === p.id}
-            avatarName={p.name || p.email}
-            label={p.name || p.email}
-            sub={dmPreview?.[p.id]}
-            badge={p.role === "admin" ? "admin" : undefined}
-            unread={dmUnread?.[p.id]}
-            online={presence?.[p.id] ?? false}
-            time={dmAt?.[p.id] ? listTime(dmAt[p.id]) : undefined}
-            onClick={() => onSelect({ kind: "dm", userId: p.id })}
-          />
-        ))}
-        {filteredPeers.length === 0 && (
-          <Text px={4} py={2} fontSize="xs" color="ink.subtle">
-            {q ? "No chats match your search." : "No one else in your org yet."}
-          </Text>
-        )}
-      </Box>
     </Flex>
   );
 }
