@@ -402,6 +402,14 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(with_db(db.clone()))
         .and_then(export_workspace);
 
+    // Whiteboard scene saves: overwrite a binary file's stored blob.
+    let put_blob = warp::path!("files" / i64 / "blob")
+        .and(warp::put())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::body::bytes())
+        .and_then(put_file_blob);
+
     let move_file = warp::path!("files" / i64)
         .and(warp::put())
         .and(with_auth(db.clone()))
@@ -580,6 +588,7 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .or(remove_member)
         .or(create_ws_in_group)
         .or(upload)
+        .or(put_blob)
         .or(raw)
         .or(download)
         .or(export_ws)
@@ -906,9 +915,12 @@ async fn upload_file(
     // Text uploads (source, .txt, .md, JSON…) open in the editor; store them as
     // seeded OT documents so they're readable and collaboratively editable.
     // Anything that isn't valid UTF-8, contains a NUL byte, or is large stays a
-    // binary blob. ponytail: 1 MB text cap keeps huge files out of the in-memory
-    // OT model; raise it if real docs get truncated to binary.
-    let text = if bytes.len() <= 1_000_000 {
+    // binary blob. Whiteboard scenes (.board) stay binary even though the JSON
+    // is valid UTF-8 — they're overwritten wholesale by the client via the blob
+    // route, never edited as text. ponytail: 1 MB text cap keeps huge files out
+    // of the in-memory OT model; raise it if real docs get truncated to binary.
+    let is_board = filename.to_lowercase().ends_with(".board");
+    let text = if !is_board && bytes.len() <= 1_000_000 {
         std::str::from_utf8(&bytes)
             .ok()
             .filter(|s| !s.contains('\0'))
@@ -972,6 +984,30 @@ async fn file_allowed(db: &Database, user: &User, file_id: i64) -> bool {
     match db.file_org(file_id).await.ok().flatten() {
         Some(org) => user.role == "root" || Some(org) == user.org_id,
         None => false,
+    }
+}
+
+/// Overwrite a binary file's stored blob (whiteboard scene autosaves).
+async fn put_file_blob(
+    file_id: i64,
+    user: User,
+    db: Database,
+    raw: bytes::Bytes,
+) -> Result<impl Reply, Rejection> {
+    if !file_allowed(&db, &user, file_id).await {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    let file = match db.get_file(file_id).await.ok().flatten() {
+        Some(f) => f,
+        None => return Ok(err(StatusCode::NOT_FOUND, "no such file")),
+    };
+    // Never let this route clobber an OT-backed text document.
+    if file.kind != "binary" {
+        return Ok(err(StatusCode::BAD_REQUEST, "not a binary file"));
+    }
+    match db.store_blob(file_id, &raw).await {
+        Ok(_) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
+        Err(_) => Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not store file")),
     }
 }
 

@@ -40,6 +40,7 @@ import HtmlPreview from "./HtmlPreview";
 import * as api from "./api";
 import { FileRow } from "./api";
 import BinaryView from "./BinaryView";
+import Whiteboard from "./Whiteboard";
 import { useEditorPrefs } from "./editorPrefs";
 import { registerThemes, resolveMonacoTheme, useEditorThemeId } from "./editorThemes";
 import { fileIcon } from "./fileIcon";
@@ -561,7 +562,9 @@ function EditorGroup({
   }
 
   const activeFile = openFiles.find((f) => f.id === activeFileId);
-  const isBinary = activeFile?.kind === "binary";
+  // Whiteboard files (.board) open in the Excalidraw canvas, not Monaco.
+  const isBoard = /\.board$/i.test(activeFile?.path ?? "");
+  const isBinary = activeFile?.kind === "binary" && !isBoard;
   const docId = isBinary ? undefined : activeFile?.doc_id;
   const autoLang = activeFile ? extToLang(activeFile.path) : "plaintext";
   const language = langOverride ?? autoLang;
@@ -969,7 +972,7 @@ function EditorGroup({
 
       {/* Editor. Kept mounted (display:none) while the Preview tab is shown so
           the live document state survives switching back and forth. */}
-      <Box flex={1} minH={0} minW={0} display={isBinary || settingsHere || previewActive ? "none" : "block"}>
+      <Box flex={1} minH={0} minW={0} display={isBinary || isBoard || settingsHere || previewActive ? "none" : "block"}>
         <Editor
           theme={resolveMonacoTheme(themeId, colorMode === "dark")}
           beforeMount={registerThemes}
@@ -993,6 +996,8 @@ function EditorGroup({
           {isHtml ? <HtmlPreview text={mdText} file={activeFile} /> : <MarkdownPreview text={mdText} />}
         </Flex>
       )}
+      {/* Whiteboards take the whole body with the Excalidraw canvas. */}
+      {isBoard && !settingsHere && activeFile && <Whiteboard file={activeFile} />}
       {/* Settings is an overlay tab while it takes the body. */}
       {isBinary && !settingsHere && activeFile && <BinaryView file={activeFile} canManage={canManage} />}
       {settingsHere && settingsNode}

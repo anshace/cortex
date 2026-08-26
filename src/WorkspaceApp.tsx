@@ -953,7 +953,17 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   function createPath(path: string) {
     if (activeWsId == null) return;
     run(async () => {
-      const { file } = await api.createFile(activeWsId, path);
+      let file: api.FileRow;
+      if (/\.board$/i.test(path)) {
+        // Whiteboards are binary-kind files seeded with an empty Excalidraw
+        // scene (createFile would make an OT text doc the blob route rejects).
+        const scene = new File([api.emptyBoardScene()], path, {
+          type: "application/octet-stream",
+        });
+        ({ file } = await api.uploadFile(activeWsId, scene, path));
+      } else {
+        ({ file } = await api.createFile(activeWsId, path));
+      }
       loadWs();
       if (!path.endsWith("/.keep")) openFile(file);
     });
@@ -1543,6 +1553,13 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                           aria-label="New folder"
                           icon={<VscNewFolder />}
                           onClick={() => treeRef.current?.startCreate("folder")}
+                        />
+                      </Tooltip>
+                      <Tooltip label="New whiteboard" openDelay={400}>
+                        <PanelIconButton
+                          aria-label="New whiteboard"
+                          icon={<VscEdit />}
+                          onClick={() => treeRef.current?.startCreate("board")}
                         />
                       </Tooltip>
                       <Tooltip label="Upload" openDelay={400}>
