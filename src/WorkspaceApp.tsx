@@ -387,13 +387,30 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       if (!s || s.last_sender === myId) return;
       // Completely silent — no sound, no toast, no desktop ping at all.
       if (notifPrefsRef.mode === "silent") return;
-      if (s.last_id <= (notifiedRef.current[key] ?? 0)) return;
+      // First sighting of this thread since page load: record its position
+      // WITHOUT notifying. Without this seed, the pre-existing backlog of
+      // already-read messages all ping on load (the old bug).
+      const prevId = notifiedRef.current[key];
+      if (prevId == null) {
+        notifiedRef.current[key] = s.last_id;
+        return;
+      }
+      if (s.last_id <= prevId) return;
       notifiedRef.current[key] = s.last_id;
       const mention = s.body
         ? mentionsMe(s.body) || (isWs && broadcastMention(s.body))
         : false;
       // Mentions-only mode: ignore everything that isn't aimed at me.
       if (notifPrefsRef.mode === "mentions" && !mention) return;
+      // Already read — here or on another device (the server's unread count is
+      // computed from the read markers this client keeps sending). Mentions
+      // always get through so you never miss one.
+      if (
+        !mention &&
+        s.unread === 0 &&
+        s.last_id <= Math.max(prevId, readRef.current[key] ?? 0)
+      )
+        return;
       const viewing =
         !document.hidden &&
         sectionRef.current === "chat" &&

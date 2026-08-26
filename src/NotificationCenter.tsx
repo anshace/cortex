@@ -24,6 +24,7 @@ import {
 } from "react-icons/vsc";
 
 import { ChatTarget } from "./ChatChannels";
+import ChatAvatar from "./ChatAvatar";
 import * as api from "./api";
 import { Member } from "./api";
 
@@ -293,14 +294,9 @@ export default function NotificationCenter({
                   _hover={{ bg: "surface.hover" }}
                   onClick={() => navigateTo(evt)}
                 >
-                  <Avatar
-                    size="sm"
-                    name={evt.senderName}
-                    bg={evt.isMention ? "brand.500" : "gray.500"}
-                    color="white"
-                    flexShrink={0}
-                    mt={0.5}
-                  />
+                  <Box flexShrink={0} mt={0.5}>
+                    <ChatAvatar name={evt.senderName} size={32} />
+                  </Box>
                   <Box flex={1} minW={0}>
                     <Flex align="center" gap={1.5} mb={0.5}>
                       <Text fontSize="xs" fontWeight={600} isTruncated>

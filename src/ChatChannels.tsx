@@ -28,6 +28,7 @@ import {
   WallpaperId,
 } from "./ChatView";
 import { Group, GroupThreadSummary, Me, Member } from "./api";
+import ChatAvatar from "./ChatAvatar";
 
 export type ChatTarget = { kind: "group" } | { kind: "dm"; userId: number };
 
@@ -105,16 +106,11 @@ function Row({
       onClick={onClick}
     >
       <Box position="relative" flexShrink={0}>
-        <Center
-          boxSize="34px"
-          borderRadius="lg"
-          bg={active ? accent : "surface.hover"}
-          color={active ? "white" : "ink.muted"}
-          fontWeight={700}
-          fontSize="14px"
-        >
-          {(avatarName || "?").charAt(0).toUpperCase()}
-        </Center>
+        <ChatAvatar
+          name={avatarName || "?"}
+          size={34}
+          radius="lg"
+        />
         {online !== undefined && (
           <Box
             position="absolute"
