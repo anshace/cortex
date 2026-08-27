@@ -407,6 +407,7 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(warp::put())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(warp::header::optional::<i64>("x-cortex-revision"))
         .and(warp::body::bytes())
         .and_then(put_file_blob);
 
@@ -979,12 +980,13 @@ async fn upload_file(
     Ok(warp::reply::json(&json!({ "file": file })).into_response())
 }
 
-/// Whether the user may access a file (same org, or root).
+/// Whether the user may access a file through its workspace scope.
 async fn file_allowed(db: &Database, user: &User, file_id: i64) -> bool {
-    match db.file_org(file_id).await.ok().flatten() {
-        Some(org) => user.role == "root" || Some(org) == user.org_id,
-        None => false,
-    }
+    let file = match db.get_file(file_id).await.ok().flatten() {
+        Some(file) => file,
+        None => return false,
+    };
+    ensure_ws(db, user, file.workspace_id).await.is_ok()
 }
 
 /// Overwrite a binary file's stored blob (whiteboard scene autosaves).
@@ -992,6 +994,7 @@ async fn put_file_blob(
     file_id: i64,
     user: User,
     db: Database,
+    expected_revision: Option<i64>,
     raw: bytes::Bytes,
 ) -> Result<impl Reply, Rejection> {
     if !file_allowed(&db, &user, file_id).await {
@@ -1005,9 +1008,25 @@ async fn put_file_blob(
     if file.kind != "binary" {
         return Ok(err(StatusCode::BAD_REQUEST, "not a binary file"));
     }
-    match db.store_blob(file_id, &raw).await {
-        Ok(_) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
-        Err(_) => Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not store file")),
+    let expected_revision = match expected_revision {
+        Some(revision) => revision,
+        None => return Ok(err(StatusCode::BAD_REQUEST, "missing file revision")),
+    };
+    match db
+        .store_blob_at_revision(file_id, &raw, expected_revision)
+        .await
+    {
+        Ok(Some(revision)) => {
+            Ok(warp::reply::json(&json!({ "ok": true, "revision": revision })).into_response())
+        }
+        Ok(None) => Ok(err(
+            StatusCode::CONFLICT,
+            "file changed; retry with latest revision",
+        )),
+        Err(_) => Ok(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not store file",
+        )),
     }
 }
 
@@ -1021,9 +1040,9 @@ async fn raw_file(file_id: i64, user: User, db: Database) -> Result<impl Reply, 
     };
     // Text files are stored as OT documents; serve their current text so the HTML
     // preview can inline sibling CSS/JS. Binary files serve their stored blob.
-    let (bytes, mime) = if file.kind == "binary" {
-        let bytes = db
-            .load_blob(file.id)
+    let (bytes, mime, revision) = if file.kind == "binary" {
+        let (bytes, revision) = db
+            .load_blob_with_revision(file.id)
             .await
             .ok()
             .flatten()
@@ -1032,6 +1051,7 @@ async fn raw_file(file_id: i64, user: User, db: Database) -> Result<impl Reply, 
             bytes,
             file.mime
                 .unwrap_or_else(|| "application/octet-stream".to_string()),
+            revision,
         )
     } else {
         let text = db
@@ -1039,10 +1059,15 @@ async fn raw_file(file_id: i64, user: User, db: Database) -> Result<impl Reply, 
             .await
             .map(|d| d.text)
             .unwrap_or_default();
-        (text.into_bytes(), "text/plain; charset=utf-8".to_string())
+        (
+            text.into_bytes(),
+            "text/plain; charset=utf-8".to_string(),
+            0,
+        )
     };
     let resp = warp::http::Response::builder()
         .header("content-type", mime)
+        .header("x-cortex-revision", revision)
         .body(Body::from(bytes))
         .expect("valid response");
     Ok(resp)

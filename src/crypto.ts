@@ -32,12 +32,27 @@ async function handshake(): Promise<Session> {
     false,
     [],
   );
-  const kp = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+  const kp = await crypto.subtle.generateKey(
+    { name: "ECDH", namedCurve: "P-256" },
+    false,
+    ["deriveBits"],
+  );
   const myRaw = await crypto.subtle.exportKey("raw", kp.publicKey);
-  const sharedBits = await crypto.subtle.deriveBits({ name: "ECDH", public: serverKey }, kp.privateKey, 256);
-  const hkdf = await crypto.subtle.importKey("raw", sharedBits, "HKDF", false, ["deriveKey"]);
+  const sharedBits = await crypto.subtle.deriveBits(
+    { name: "ECDH", public: serverKey },
+    kp.privateKey,
+    256,
+  );
+  const hkdf = await crypto.subtle.importKey("raw", sharedBits, "HKDF", false, [
+    "deriveKey",
+  ]);
   const key = await crypto.subtle.deriveKey(
-    { name: "HKDF", hash: "SHA-256", salt: te.encode("cortex-salt-v1"), info: te.encode("cortex-payload-v1") },
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: te.encode("cortex-salt-v1"),
+      info: te.encode("cortex-payload-v1"),
+    },
     hkdf,
     { name: "AES-GCM", length: 256 },
     false,
@@ -47,17 +62,29 @@ async function handshake(): Promise<Session> {
 }
 
 function session(): Promise<Session> {
-  if (!sessionP) sessionP = handshake().catch((e) => ((sessionP = null), Promise.reject(e)));
+  if (!sessionP)
+    sessionP = handshake().catch((e) => ((sessionP = null), Promise.reject(e)));
   return sessionP;
 }
 
 async function seal(key: CryptoKey, plaintext: string) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, te.encode(plaintext));
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    te.encode(plaintext),
+  );
   return { iv: bufToB64(iv), ct: bufToB64(ct) };
 }
-async function open(key: CryptoKey, env: { iv: string; ct: string }): Promise<string> {
-  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64ToBuf(env.iv) }, key, b64ToBuf(env.ct));
+async function open(
+  key: CryptoKey,
+  env: { iv: string; ct: string },
+): Promise<string> {
+  const pt = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: b64ToBuf(env.iv) },
+    key,
+    b64ToBuf(env.ct),
+  );
   return td.decode(pt);
 }
 
@@ -65,23 +92,41 @@ async function open(key: CryptoKey, env: { iv: string; ct: string }): Promise<st
 export function getSession(): Promise<Session> {
   return session();
 }
-export function wsSeal(key: CryptoKey, plaintext: string): Promise<{ iv: string; ct: string }> {
+export function resetSession(): void {
+  sessionP = null;
+}
+export function wsSeal(
+  key: CryptoKey,
+  plaintext: string,
+): Promise<{ iv: string; ct: string }> {
   return seal(key, plaintext);
 }
-export function wsOpen(key: CryptoKey, env: { iv: string; ct: string }): Promise<string> {
+export function wsOpen(
+  key: CryptoKey,
+  env: { iv: string; ct: string },
+): Promise<string> {
   return open(key, env);
 }
 
 class DecryptError extends Error {}
 
-async function run<T>(path: string, opts: { method: string; body?: unknown }, s: Session): Promise<T> {
+async function run<T>(
+  path: string,
+  opts: { method: string; body?: unknown },
+  s: Session,
+): Promise<T> {
   const headers: Record<string, string> = { "X-Cortex-EPK": s.epk };
   let body: string | undefined;
   if (opts.body !== undefined) {
     headers["Content-Type"] = "application/json";
     body = JSON.stringify(await seal(s.key, JSON.stringify(opts.body)));
   }
-  const res = await fetch(path, { method: opts.method, credentials: "include", headers, body });
+  const res = await fetch(path, {
+    method: opts.method,
+    credentials: "include",
+    headers,
+    body,
+  });
   const text = await res.text();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let data: any = {};
@@ -104,13 +149,17 @@ async function run<T>(path: string, opts: { method: string; body?: unknown }, s:
 // Encrypted fetch. On a decrypt failure (e.g. the server restarted with a new
 // key), re-handshake and retry GETs; POSTs re-handshake and surface the error so
 // we never risk sending a message twice.
-export async function encFetch<T>(path: string, opts: { method: string; body?: unknown } = { method: "GET" }): Promise<T> {
+export async function encFetch<T>(
+  path: string,
+  opts: { method: string; body?: unknown } = { method: "GET" },
+): Promise<T> {
   try {
     return await run<T>(path, opts, await session());
   } catch (e) {
     if (e instanceof DecryptError) {
       sessionP = null;
-      if ((opts.method || "GET") === "GET") return await run<T>(path, opts, await session());
+      if ((opts.method || "GET") === "GET")
+        return await run<T>(path, opts, await session());
     }
     throw e;
   }

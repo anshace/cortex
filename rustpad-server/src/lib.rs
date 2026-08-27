@@ -13,10 +13,11 @@ use serde::Serialize;
 use tokio::time::{self, Instant};
 use warp::{filters::BoxedFilter, ws::Ws, Filter, Rejection, Reply};
 
-use crate::{database::Database, rustpad::Rustpad};
+use crate::{board::BoardHub, database::Database, rustpad::Rustpad};
 
 pub mod account;
 pub mod auth;
+mod board;
 pub mod crypto;
 pub mod database;
 mod ot;
@@ -59,6 +60,8 @@ impl warp::reject::Reject for CustomReject {}
 struct ServerState {
     /// Concurrent map storing in-memory documents.
     documents: Arc<DashMap<String, Document>>,
+    /// Ephemeral presence relays keyed by whiteboard file id.
+    boards: Arc<DashMap<i64, Arc<BoardHub>>>,
     /// Connection to the database pool, if persistence is enabled.
     database: Option<Database>,
 }
@@ -105,14 +108,14 @@ pub fn server(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
     // - worker-src 'self' blob:               → Monaco language web workers.
     // - connect-src 'self'                     → same-origin API + the OT WebSocket.
     // - img/font data: & blob:                 → inlined assets, pasted images.
-    // - frame-src 'self'                        → the sandboxed HTML-preview iframe.
+    // - frame/object blob:                     → sandboxed HTML and fetched PDF previews.
     // Set CSP_REPORT_ONLY=1 to emit it as report-only first (logs violations in
     // the browser console without blocking) while verifying a deploy.
-    const CSP: &str = "default-src 'self'; base-uri 'self'; object-src 'none'; \
+    const CSP: &str = "default-src 'self'; base-uri 'self'; object-src blob:; \
         frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:; \
         font-src 'self' data:; style-src 'self' 'unsafe-inline'; \
         script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; \
-        connect-src 'self' wss: ws:; frame-src 'self'";
+        connect-src 'self'; frame-src 'self' blob:";
     let csp_header = if std::env::var("CSP_REPORT_ONLY").is_ok() {
         "content-security-policy-report-only"
     } else {
@@ -160,6 +163,7 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
 
     let state = ServerState {
         documents: Default::default(),
+        boards: Default::default(),
         database: config.database,
     };
     tokio::spawn(cleaner(state.clone(), config.expiry_days));
@@ -190,6 +194,29 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
                     return Err(warp::reject::custom(auth::Forbidden));
                 }
                 socket_handler(id, ws, state).await
+            },
+        );
+
+    let board_socket = warp::path!("board-socket" / i64)
+        .and(auth::with_auth(db.clone()))
+        .and(warp::ws())
+        .and(db_filter.clone())
+        .and(state_filter.clone())
+        .and_then(
+            |file_id: i64,
+             user: database::User,
+             ws: Ws,
+             db: Database,
+             state: ServerState| async move {
+                if !file_allowed(&db, &user, file_id).await {
+                    return Err(warp::reject::custom(auth::Forbidden));
+                }
+                let name = if user.name.trim().is_empty() {
+                    user.email
+                } else {
+                    user.name
+                };
+                board_socket_handler(file_id, name, ws, state).await
             },
         );
 
@@ -224,10 +251,48 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         .or(account_routes)
         .or(workspace_routes)
         .or(socket)
+        .or(board_socket)
         .or(text)
         .or(stats)
         .recover(auth::handle_rejection)
         .boxed()
+}
+
+async fn file_allowed(db: &Database, user: &database::User, file_id: i64) -> bool {
+    if user.role == "root" {
+        return true;
+    }
+    match db.file_ws_info(file_id).await.ok().flatten() {
+        Some((group_id, org, scope, created_by)) => {
+            if Some(org) != user.org_id {
+                return false;
+            }
+            match scope.as_str() {
+                "org" => true,
+                "personal" => created_by == user.id,
+                "group" => db
+                    .is_group_member(group_id, user.id)
+                    .await
+                    .unwrap_or(false),
+                _ => false,
+            }
+        }
+        None => false,
+    }
+}
+
+async fn board_socket_handler(
+    file_id: i64,
+    user_name: String,
+    ws: Ws,
+    state: ServerState,
+) -> Result<impl Reply, Rejection> {
+    let hub = state
+        .boards
+        .entry(file_id)
+        .or_insert_with(|| Arc::new(BoardHub::default()))
+        .clone();
+    Ok(ws.on_upgrade(move |socket| async move { hub.on_connection(socket, user_name).await }))
 }
 
 /// Whether a user may access the document `doc_id` (root bypasses; otherwise

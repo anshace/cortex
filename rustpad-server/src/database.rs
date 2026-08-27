@@ -999,6 +999,25 @@ impl Database {
         Ok(row)
     }
 
+    /// The group, org, visibility scope and creator for a file's workspace.
+    #[allow(clippy::type_complexity)]
+    pub async fn file_ws_info(
+        &self,
+        file_id: i64,
+    ) -> Result<Option<(i64, i64, String, i64)>> {
+        let row: Option<(i64, i64, String, i64)> = sqlx::query_as(
+            r#"SELECT g.id, g.org_id, g.scope, g.created_by
+               FROM file f
+               JOIN workspace w ON w.id = f.workspace_id
+               JOIN groups g ON g.id = w.group_id
+               WHERE f.id = $1"#,
+        )
+        .bind(file_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     // ----- Files -----
 
     /// Create a file row in a workspace.
@@ -1070,13 +1089,36 @@ impl Database {
     pub async fn store_blob(&self, file_id: i64, data: &[u8]) -> Result<()> {
         sqlx::query(
             r#"INSERT INTO file_blob (file_id, data) VALUES ($1, $2)
-               ON CONFLICT(file_id) DO UPDATE SET data = excluded.data"#,
+               ON CONFLICT(file_id) DO UPDATE SET
+                 data = excluded.data,
+                 revision = file_blob.revision + 1"#,
         )
         .bind(file_id)
         .bind(data)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Replace a blob only if it still has the revision read by the client.
+    pub async fn store_blob_at_revision(
+        &self,
+        file_id: i64,
+        data: &[u8],
+        expected_revision: i64,
+    ) -> Result<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            r#"UPDATE file_blob
+               SET data = $1, revision = revision + 1
+               WHERE file_id = $2 AND revision = $3
+               RETURNING revision"#,
+        )
+        .bind(data)
+        .bind(file_id)
+        .bind(expected_revision)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|result| result.0))
     }
 
     /// Load raw bytes for a binary file.
@@ -1087,6 +1129,16 @@ impl Database {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.map(|r| r.0))
+    }
+
+    /// Load a binary file's bytes together with its concurrency revision.
+    pub async fn load_blob_with_revision(&self, file_id: i64) -> Result<Option<(Vec<u8>, i64)>> {
+        Ok(
+            sqlx::query_as(r#"SELECT data, revision FROM file_blob WHERE file_id = $1"#)
+                .bind(file_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     /// Delete a file row and its underlying content (OT document or blob).
