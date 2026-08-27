@@ -20,9 +20,21 @@ import {
   useToast,
 } from "@chakra-ui/react";
 import Editor from "@monaco-editor/react";
-import { KeyCode, KeyMod, editor } from "monaco-editor/esm/vs/editor/editor.api";
-import { DragEvent, Fragment, MouseEvent as ReactMouseEvent, ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import useLocalStorageState from "use-local-storage-state";
+import {
+  KeyCode,
+  KeyMod,
+  editor,
+} from "monaco-editor/esm/vs/editor/editor.api";
+import {
+  DragEvent,
+  Fragment,
+  MouseEvent as ReactMouseEvent,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { FiDownload, FiMousePointer } from "react-icons/fi";
 import {
   VscCheck,
@@ -33,18 +45,22 @@ import {
   VscSettingsGear,
   VscSplitHorizontal,
 } from "react-icons/vsc";
+import useLocalStorageState from "use-local-storage-state";
 
-import MarkdownPreview from "./MarkdownPreview";
+import BinaryView from "./BinaryView";
 import HtmlPreview from "./HtmlPreview";
-
+import Logo from "./Logo";
+import MarkdownPreview from "./MarkdownPreview";
+import Whiteboard from "./Whiteboard";
 import * as api from "./api";
 import { FileRow } from "./api";
-import BinaryView from "./BinaryView";
-import Whiteboard from "./Whiteboard";
 import { useEditorPrefs } from "./editorPrefs";
-import { registerThemes, resolveMonacoTheme, useEditorThemeId } from "./editorThemes";
+import {
+  registerThemes,
+  resolveMonacoTheme,
+  useEditorThemeId,
+} from "./editorThemes";
 import { fileIcon } from "./fileIcon";
-import Logo from "./Logo";
 import Rustpad, { UserInfo } from "./rustpad";
 
 type Connection = "connected" | "disconnected" | "desynchronized";
@@ -164,7 +180,11 @@ function StatusCell({
       spacing="5px"
       cursor={onClick ? "pointer" : "default"}
       color={color ?? "ink.muted"}
-      _hover={onClick ? { bg: "surface.hover", color: color ?? "ink.base" } : undefined}
+      _hover={
+        onClick
+          ? { bg: "surface.hover", color: color ?? "ink.base" }
+          : undefined
+      }
       title={title}
       onClick={onClick}
       whiteSpace="nowrap"
@@ -195,7 +215,11 @@ type StatusInfo = {
 // The one and only status bar, spanning the full pane, driven by the focused group.
 function StatusBar({ info }: { info: StatusInfo }) {
   const connectionColor =
-    info.connection === "connected" ? "green.400" : info.connection === "desynchronized" ? "red.400" : "orange.300";
+    info.connection === "connected"
+      ? "green.400"
+      : info.connection === "desynchronized"
+        ? "red.400"
+        : "orange.300";
   return (
     <Flex
       h="22px"
@@ -217,34 +241,69 @@ function StatusBar({ info }: { info: StatusInfo }) {
       {info.showStats && (
         <StatusCell title="Lines · words · characters">
           <Text>
-            {info.counts.rows} lines · {info.counts.words} words · {info.counts.chars} chars
+            {info.counts.rows} lines · {info.counts.words} words ·{" "}
+            {info.counts.chars} chars
           </Text>
         </StatusCell>
       )}
       <HStack h="full" px="8px" spacing="3px" color="ink.muted">
-        <Box as="button" px="3px" _hover={{ color: "ink.base" }} title="Smaller (Ctrl -)" onClick={() => info.setFont(info.fontSize - 1)}>
+        <Box
+          as="button"
+          px="3px"
+          _hover={{ color: "ink.base" }}
+          title="Smaller (Ctrl -)"
+          onClick={() => info.setFont(info.fontSize - 1)}
+        >
           A−
         </Box>
         <Text minW="32px" textAlign="center" color="ink.base">
           {info.fontSize}px
         </Text>
-        <Box as="button" px="3px" _hover={{ color: "ink.base" }} title="Larger (Ctrl +)" onClick={() => info.setFont(info.fontSize + 1)}>
+        <Box
+          as="button"
+          px="3px"
+          _hover={{ color: "ink.base" }}
+          title="Larger (Ctrl +)"
+          onClick={() => info.setFont(info.fontSize + 1)}
+        >
           A+
         </Box>
       </HStack>
       <Menu placement="top-start" isLazy>
-        <MenuButton h="full" px="10px" title="Select language" _hover={{ bg: "surface.hover" }} _active={{ bg: "surface.hover" }}>
+        <MenuButton
+          h="full"
+          px="10px"
+          title="Select language"
+          _hover={{ bg: "surface.hover" }}
+          _active={{ bg: "surface.hover" }}
+        >
           <HStack spacing="5px" color="ink.base">
             <Text>{info.language}</Text>
             <Icon as={VscChevronUp} fontSize="10px" color="ink.subtle" />
           </HStack>
         </MenuButton>
-        <MenuList bg="surface.raised" borderColor="surface.border" boxShadow="pop" maxH="320px" overflowY="auto" py={1} minW="180px">
+        <MenuList
+          bg="surface.raised"
+          borderColor="surface.border"
+          boxShadow="pop"
+          maxH="320px"
+          overflowY="auto"
+          py={1}
+          minW="180px"
+        >
           {LANGUAGES.map((l) => (
-            <MenuItem key={l} bg="transparent" _hover={{ bg: "surface.hover" }} fontSize="sm" onClick={() => info.setLang(l)}>
+            <MenuItem
+              key={l}
+              bg="transparent"
+              _hover={{ bg: "surface.hover" }}
+              fontSize="sm"
+              onClick={() => info.setLang(l)}
+            >
               <HStack w="full" spacing={2}>
                 <Text flex={1}>{l}</Text>
-                {l === info.language && <Icon as={VscCheck} color="brand.400" />}
+                {l === info.language && (
+                  <Icon as={VscCheck} color="brand.400" />
+                )}
               </HStack>
             </MenuItem>
           ))}
@@ -273,10 +332,18 @@ function StatusBar({ info }: { info: StatusInfo }) {
           >
             <Icon as={VscCircleFilled} fontSize="8px" />
             <Text textTransform="capitalize">{info.connection}</Text>
-            {info.collaborators.length > 0 && <Text color="ink.muted">· {info.collaborators.length + 1}</Text>}
+            {info.collaborators.length > 0 && (
+              <Text color="ink.muted">· {info.collaborators.length + 1}</Text>
+            )}
           </HStack>
         </PopoverTrigger>
-        <PopoverContent bg="surface.raised" borderColor="surface.border" boxShadow="pop" w="240px" _focusVisible={{ outline: "none" }}>
+        <PopoverContent
+          bg="surface.raised"
+          borderColor="surface.border"
+          boxShadow="pop"
+          w="240px"
+          _focusVisible={{ outline: "none" }}
+        >
           <PopoverArrow bg="surface.raised" />
           <PopoverBody>
             <HStack mb={2} color={connectionColor}>
@@ -297,7 +364,11 @@ function StatusBar({ info }: { info: StatusInfo }) {
             </HStack>
             {info.collaborators.map((u, i) => (
               <HStack key={i} spacing={2} mb={1}>
-                <Box boxSize="8px" borderRadius="full" bg={`hsl(${u.hue}, 55%, 48%)`} />
+                <Box
+                  boxSize="8px"
+                  borderRadius="full"
+                  bg={`hsl(${u.hue}, 55%, 48%)`}
+                />
                 <Text fontSize="sm" color="ink.base">
                   {u.name}
                 </Text>
@@ -314,8 +385,12 @@ function StatusBar({ info }: { info: StatusInfo }) {
 function EditorPane(props: EditorPaneProps) {
   const { groups } = props;
   const empty = groups.every((g) => g.files.length === 0);
-  const [statuses, setStatuses] = useState<Record<number, StatusInfo | null>>({});
-  const [ratio, setRatio] = useLocalStorageState<number>("cortex-split-ratio", { defaultValue: 0.5 });
+  const [statuses, setStatuses] = useState<Record<number, StatusInfo | null>>(
+    {},
+  );
+  const [ratio, setRatio] = useLocalStorageState<number>("cortex-split-ratio", {
+    defaultValue: 0.5,
+  });
   const rowRef = useRef<HTMLDivElement>(null);
 
   const handleStatus = useCallback((i: number, info: StatusInfo | null) => {
@@ -329,7 +404,9 @@ function EditorPane(props: EditorPaneProps) {
     if (!row) return;
     const rect = row.getBoundingClientRect();
     const move = (ev: MouseEvent) =>
-      setRatio(Math.min(0.8, Math.max(0.2, (ev.clientX - rect.left) / rect.width)));
+      setRatio(
+        Math.min(0.8, Math.max(0.2, (ev.clientX - rect.left) / rect.width)),
+      );
     const up = () => {
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
@@ -344,9 +421,17 @@ function EditorPane(props: EditorPaneProps) {
 
   if (empty && !props.settingsActive) {
     return (
-      <Center flex={1} minW={0} flexDirection="column" gap={4} bg="surface.bg" px={6} textAlign="center" position="relative">
-        <Box position="absolute" top={2} right={2}>
-        </Box>
+      <Center
+        flex={1}
+        minW={0}
+        flexDirection="column"
+        gap={4}
+        bg="surface.bg"
+        px={6}
+        textAlign="center"
+        position="relative"
+      >
+        <Box position="absolute" top={2} right={2}></Box>
         <Box opacity={0.45}>
           <Logo size={48} />
         </Box>
@@ -355,8 +440,8 @@ function EditorPane(props: EditorPaneProps) {
             No file open
           </Text>
           <Text fontSize="sm" color="ink.muted" mt={1.5} maxW="xs">
-            Open a file from the Explorer to edit together in real time. Split the
-            view to work on two files side by side.
+            Open a file from the Explorer to edit together in real time. Split
+            the view to work on two files side by side.
           </Text>
         </Box>
       </Center>
@@ -366,7 +451,13 @@ function EditorPane(props: EditorPaneProps) {
   const status = statuses[props.focused] ?? null;
 
   return (
-    <Flex flex={1} minW={0} direction="column" overflow="hidden" bg="surface.bg">
+    <Flex
+      flex={1}
+      minW={0}
+      direction="column"
+      overflow="hidden"
+      bg="surface.bg"
+    >
       <Flex ref={rowRef} flex={1} minH={0} minW={0}>
         {groups.map((g, i) => (
           <Fragment key={i}>
@@ -408,7 +499,8 @@ function EditorPane(props: EditorPaneProps) {
                 onDrop={(p, split) => {
                   if (split) props.onSplitFile(p.id);
                   else if (p.kind === "file") props.onOpenInGroup(i, p.id);
-                  else if (p.g != null && p.g !== i) props.onMoveTab(p.g, p.id, i);
+                  else if (p.g != null && p.g !== i)
+                    props.onMoveTab(p.g, p.id, i);
                 }}
               />
             </Flex>
@@ -509,7 +601,11 @@ function EditorGroup({
     const model = ed.getModel();
     if (!model) return;
     const value = model.getValue();
-    setCounts({ rows: model.getLineCount(), words: countWords(value), chars: value.length });
+    setCounts({
+      rows: model.getLineCount(),
+      words: countWords(value),
+      chars: value.length,
+    });
     setMdText(value);
   }
 
@@ -526,19 +622,25 @@ function EditorGroup({
     ed.addCommand(KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KeyP, () => {
       ed.trigger("keyboard", "editor.action.quickCommand", {});
     });
-    ed.addCommand(KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KeyV, () => previewToggleRef.current());
+    ed.addCommand(KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KeyV, () =>
+      previewToggleRef.current(),
+    );
     ed.addCommand(KeyMod.Alt | KeyCode.KeyZ, () => {
       const wordWrap = !prefsRef.current.wordWrap;
       setPrefs({ ...prefsRef.current, wordWrap });
       ed.updateOptions({ wordWrap: wordWrap ? "on" : "off" });
     });
     ed.addCommand(KeyMod.CtrlCmd | KeyCode.Tab, () => cycleTab(1));
-    ed.addCommand(KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.Tab, () => cycleTab(-1));
+    ed.addCommand(KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.Tab, () =>
+      cycleTab(-1),
+    );
     ed.addCommand(KeyMod.CtrlCmd | KeyCode.KeyW, () => {
       const { activeFileId, onCloseTab } = stateRef.current;
       if (activeFileId != null) onCloseTab(activeFileId);
     });
-    ed.onDidChangeCursorPosition((e) => setPos({ ln: e.position.lineNumber, col: e.position.column }));
+    ed.onDidChangeCursorPosition((e) =>
+      setPos({ ln: e.position.lineNumber, col: e.position.column }),
+    );
     ed.onDidChangeModelContent(() => recount(ed));
     ed.onDidFocusEditorText(() => onFocus());
     recount(ed);
@@ -565,7 +667,7 @@ function EditorGroup({
   // Whiteboard files (.board) open in the Excalidraw canvas, not Monaco.
   const isBoard = /\.board$/i.test(activeFile?.path ?? "");
   const isBinary = activeFile?.kind === "binary" && !isBoard;
-  const docId = isBinary ? undefined : activeFile?.doc_id;
+  const docId = isBinary || isBoard ? undefined : activeFile?.doc_id;
   const autoLang = activeFile ? extToLang(activeFile.path) : "plaintext";
   const language = langOverride ?? autoLang;
   const isMarkdown = /\.(md|markdown)$/i.test(activeFile?.path ?? "");
@@ -619,14 +721,18 @@ function EditorGroup({
 
   useEffect(() => {
     if (connection === "connected") {
-      rustpad.current?.setInfo({ name: userLabel, hue: hueFromString(userLabel) });
+      rustpad.current?.setInfo({
+        name: userLabel,
+        hue: hueFromString(userLabel),
+      });
     }
   }, [connection, userLabel]);
 
   // Publish this group's status up to the single bottom status bar (hidden for
   // binary files / the Settings tab).
   useEffect(() => {
-    if (isBinary || settingsHere) {
+    // Boards / binary files / Settings carry their own chrome, no text status bar.
+    if (isBinary || isBoard || settingsHere) {
       onStatus(index, null);
       return;
     }
@@ -647,11 +753,31 @@ function EditorGroup({
         ? () =>
             api
               .downloadFile(activeFile)
-              .catch(() => toast({ title: "Download failed", status: "error", duration: 3000 }))
+              .catch(() =>
+                toast({
+                  title: "Download failed",
+                  status: "error",
+                  duration: 3000,
+                }),
+              )
         : undefined,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [index, isBinary, settingsHere, pos, counts, prefs.fontSize, prefs.showStats, language, connection, users, activeFile, canManage, userLabel]);
+  }, [
+    index,
+    isBinary,
+    settingsHere,
+    pos,
+    counts,
+    prefs.fontSize,
+    prefs.showStats,
+    language,
+    connection,
+    users,
+    activeFile,
+    canManage,
+    userLabel,
+  ]);
 
   // Clear our slot when this group unmounts (e.g. a split pane is closed).
   useEffect(() => () => onStatus(index, null), [index, onStatus]);
@@ -661,7 +787,8 @@ function EditorGroup({
     e.stopPropagation();
     try {
       const p = JSON.parse(e.dataTransfer.getData("text/plain"));
-      if (p.preview) setPreviewPos(atIndex); // move the preview tab within this strip
+      if (p.preview)
+        setPreviewPos(atIndex); // move the preview tab within this strip
       else onTabDropAt(p, atIndex);
     } catch {
       /* ignore */
@@ -686,7 +813,12 @@ function EditorGroup({
     <HStack
       key="__preview__"
       draggable
-      onDragStart={(e: DragEvent) => e.dataTransfer.setData("text/plain", JSON.stringify({ preview: true, g: index }))}
+      onDragStart={(e: DragEvent) =>
+        e.dataTransfer.setData(
+          "text/plain",
+          JSON.stringify({ preview: true, g: index }),
+        )
+      }
       onDragOver={(e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -704,11 +836,19 @@ function EditorGroup({
       borderColor="surface.border"
       borderTop="1px solid"
       borderTopColor={previewActive && isFocused ? "brand.500" : "transparent"}
-      _hover={{ color: "ink.base", bg: previewActive ? "surface.bg" : "surface.hover" }}
+      _hover={{
+        color: "ink.base",
+        bg: previewActive ? "surface.bg" : "surface.hover",
+      }}
       transition="background 0.1s ease"
       onClick={() => setView("preview")}
     >
-      <Icon as={VscOpenPreview} fontSize="14px" flexShrink={0} color="brand.400" />
+      <Icon
+        as={VscOpenPreview}
+        fontSize="14px"
+        flexShrink={0}
+        color="brand.400"
+      />
       <Text fontSize="13px" whiteSpace="nowrap">
         Preview
       </Text>
@@ -798,7 +938,12 @@ function EditorGroup({
           }}
         >
           {splitHover && (
-            <HStack color="brand.400" fontWeight={600} fontSize="sm" pointerEvents="none">
+            <HStack
+              color="brand.400"
+              fontWeight={600}
+              fontSize="sm"
+              pointerEvents="none"
+            >
               <Icon as={VscSplitHorizontal} />
               <Text>Split right</Text>
             </HStack>
@@ -825,7 +970,8 @@ function EditorGroup({
           onDrop={stripDrop}
         >
           {openFiles.map((f, i) => {
-            const active = f.id === activeFileId && !settingsHere && !previewActive;
+            const active =
+              f.id === activeFileId && !settingsHere && !previewActive;
             const { icon: fIcon, color: fColor } = fileIcon(f.path);
             const tabName = f.path.split("/").pop();
             return (
@@ -834,7 +980,10 @@ function EditorGroup({
                 <HStack
                   draggable
                   onDragStart={(e: DragEvent) =>
-                    e.dataTransfer.setData("text/plain", JSON.stringify({ g: index, id: f.id }))
+                    e.dataTransfer.setData(
+                      "text/plain",
+                      JSON.stringify({ g: index, id: f.id }),
+                    )
                   }
                   onDragOver={(e) => {
                     e.preventDefault();
@@ -852,15 +1001,25 @@ function EditorGroup({
                   borderRight="1px solid"
                   borderColor="surface.border"
                   borderTop="1px solid"
-                  borderTopColor={active && isFocused ? "brand.500" : "transparent"}
-                  _hover={{ color: "ink.base", bg: active ? "surface.bg" : "surface.hover" }}
+                  borderTopColor={
+                    active && isFocused ? "brand.500" : "transparent"
+                  }
+                  _hover={{
+                    color: "ink.base",
+                    bg: active ? "surface.bg" : "surface.hover",
+                  }}
                   transition="background 0.1s ease"
                   onClick={() => {
                     setView("editor");
                     onSelectTab(f.id);
                   }}
                 >
-                  <Icon as={fIcon} color={fColor} fontSize="14px" flexShrink={0} />
+                  <Icon
+                    as={fIcon}
+                    color={fColor}
+                    fontSize="14px"
+                    flexShrink={0}
+                  />
                   <Text fontSize="13px" whiteSpace="nowrap">
                     {tabName}
                   </Text>
@@ -923,56 +1082,77 @@ function EditorGroup({
               </Flex>
             </HStack>
           )}
-
         </Flex>
 
-        <Flex align="center" gap={1} px={2} flexShrink={0} borderLeft="1px solid" borderColor="surface.border">
-            {previewable && (
-              <Tooltip label={previewActive ? "Back to editor" : "Open preview tab"} openDelay={300}>
-                <Flex
-                  boxSize="26px"
-                  borderRadius="4px"
-                  align="center"
-                  justify="center"
-                  cursor="pointer"
-                  color={previewActive ? "brand.400" : "ink.muted"}
-                  _hover={{ bg: "surface.hover", color: previewActive ? "brand.400" : "ink.base" }}
-                  onClick={() => {
-                    if (previewActive) {
-                      setView("editor"); // keep the tab, just show the editor
-                    } else {
-                      if (!preview) setPreviewPos(openFiles.length);
-                      setPreview(true);
-                      setView("preview");
-                    }
-                  }}
-                >
-                  <Icon as={VscOpenPreview} fontSize="16px" />
-                </Flex>
-              </Tooltip>
-            )}
-            {canSplit && (
-              <Tooltip label="Split editor right" openDelay={300}>
-                <Flex
-                  boxSize="26px"
-                  borderRadius="4px"
-                  align="center"
-                  justify="center"
-                  cursor="pointer"
-                  color="ink.muted"
-                  _hover={{ bg: "surface.hover", color: "ink.base" }}
-                  onClick={onSplit}
-                >
-                  <Icon as={VscSplitHorizontal} fontSize="16px" />
-                </Flex>
-              </Tooltip>
-            )}
+        <Flex
+          align="center"
+          gap={1}
+          px={2}
+          flexShrink={0}
+          borderLeft="1px solid"
+          borderColor="surface.border"
+        >
+          {previewable && (
+            <Tooltip
+              label={previewActive ? "Back to editor" : "Open preview tab"}
+              openDelay={300}
+            >
+              <Flex
+                boxSize="26px"
+                borderRadius="4px"
+                align="center"
+                justify="center"
+                cursor="pointer"
+                color={previewActive ? "brand.400" : "ink.muted"}
+                _hover={{
+                  bg: "surface.hover",
+                  color: previewActive ? "brand.400" : "ink.base",
+                }}
+                onClick={() => {
+                  if (previewActive) {
+                    setView("editor"); // keep the tab, just show the editor
+                  } else {
+                    if (!preview) setPreviewPos(openFiles.length);
+                    setPreview(true);
+                    setView("preview");
+                  }
+                }}
+              >
+                <Icon as={VscOpenPreview} fontSize="16px" />
+              </Flex>
+            </Tooltip>
+          )}
+          {canSplit && (
+            <Tooltip label="Split editor right" openDelay={300}>
+              <Flex
+                boxSize="26px"
+                borderRadius="4px"
+                align="center"
+                justify="center"
+                cursor="pointer"
+                color="ink.muted"
+                _hover={{ bg: "surface.hover", color: "ink.base" }}
+                onClick={onSplit}
+              >
+                <Icon as={VscSplitHorizontal} fontSize="16px" />
+              </Flex>
+            </Tooltip>
+          )}
         </Flex>
       </Flex>
 
       {/* Editor. Kept mounted (display:none) while the Preview tab is shown so
           the live document state survives switching back and forth. */}
-      <Box flex={1} minH={0} minW={0} display={isBinary || isBoard || settingsHere || previewActive ? "none" : "block"}>
+      <Box
+        flex={1}
+        minH={0}
+        minW={0}
+        display={
+          isBinary || isBoard || settingsHere || previewActive
+            ? "none"
+            : "block"
+        }
+      >
         <Editor
           theme={resolveMonacoTheme(themeId, colorMode === "dark")}
           beforeMount={registerThemes}
@@ -993,13 +1173,21 @@ function EditorGroup({
       </Box>
       {previewActive && (
         <Flex direction="column" flex={1} minH={0} minW={0}>
-          {isHtml ? <HtmlPreview text={mdText} file={activeFile} /> : <MarkdownPreview text={mdText} />}
+          {isHtml ? (
+            <HtmlPreview text={mdText} file={activeFile} />
+          ) : (
+            <MarkdownPreview text={mdText} file={activeFile} />
+          )}
         </Flex>
       )}
-      {/* Whiteboards take the whole body with the Excalidraw canvas. */}
-      {isBoard && !settingsHere && activeFile && <Whiteboard file={activeFile} />}
+      {/* Whiteboards fill the editor group and can opt into fullscreen. */}
+      {isBoard && !settingsHere && activeFile && (
+        <Whiteboard key={activeFile.id} file={activeFile} />
+      )}
       {/* Settings is an overlay tab while it takes the body. */}
-      {isBinary && !settingsHere && activeFile && <BinaryView file={activeFile} canManage={canManage} />}
+      {isBinary && !settingsHere && activeFile && (
+        <BinaryView key={activeFile.id} file={activeFile} canManage={canManage} />
+      )}
       {settingsHere && settingsNode}
     </Flex>
   );

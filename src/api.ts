@@ -116,12 +116,23 @@ export async function updateName(name: string): Promise<void> {
 export async function updateUsername(username: string): Promise<void> {
   await json(await fetch("/api/profile/username", opts("POST", { username })));
 }
-export async function changePassword(current: string, newPassword: string): Promise<void> {
-  await json(await fetch("/api/profile/password", opts("POST", { current, new: newPassword })));
+export async function changePassword(
+  current: string,
+  newPassword: string,
+): Promise<void> {
+  await json(
+    await fetch(
+      "/api/profile/password",
+      opts("POST", { current, new: newPassword }),
+    ),
+  );
 }
 
 // ----- two-factor (TOTP / authenticator app) -----
-export async function setup2fa(): Promise<{ secret: string; otpauth_url: string }> {
+export async function setup2fa(): Promise<{
+  secret: string;
+  otpauth_url: string;
+}> {
   return json(await fetch("/api/2fa/setup", opts("POST")));
 }
 export async function enable2fa(code: string): Promise<void> {
@@ -136,7 +147,9 @@ export async function adminReset2fa(id: number): Promise<void> {
 
 // ----- org / workspaces -----
 export async function getOrg(orgId?: number): Promise<OrgData> {
-  return json(await fetch(`/api/org${orgQ(orgId)}`, { credentials: "include" }));
+  return json(
+    await fetch(`/api/org${orgQ(orgId)}`, { credentials: "include" }),
+  );
 }
 // Create a group (the top-level hub) with a visibility scope.
 export async function createGroup(
@@ -157,15 +170,33 @@ export async function renameGroup(id: number, name: string): Promise<void> {
 export async function deleteGroup(id: number): Promise<void> {
   await json(await fetch(`/api/groups/${id}`, opts("DELETE")));
 }
-export async function addGroupMember(groupId: number, userId: number): Promise<void> {
-  await json(await fetch(`/api/groups/${groupId}/members`, opts("POST", { user_id: userId })));
+export async function addGroupMember(
+  groupId: number,
+  userId: number,
+): Promise<void> {
+  await json(
+    await fetch(
+      `/api/groups/${groupId}/members`,
+      opts("POST", { user_id: userId }),
+    ),
+  );
 }
-export async function removeGroupMember(groupId: number, userId: number): Promise<void> {
-  await json(await fetch(`/api/groups/${groupId}/members/${userId}`, opts("DELETE")));
+export async function removeGroupMember(
+  groupId: number,
+  userId: number,
+): Promise<void> {
+  await json(
+    await fetch(`/api/groups/${groupId}/members/${userId}`, opts("DELETE")),
+  );
 }
 // Create a workspace (file project) inside a group.
-export async function createWsInGroup(groupId: number, name: string): Promise<{ workspace: Workspace }> {
-  return json(await fetch(`/api/groups/${groupId}/workspaces`, opts("POST", { name })));
+export async function createWsInGroup(
+  groupId: number,
+  name: string,
+): Promise<{ workspace: Workspace }> {
+  return json(
+    await fetch(`/api/groups/${groupId}/workspaces`, opts("POST", { name })),
+  );
 }
 export async function getWorkspace(id: number): Promise<WorkspaceDetail> {
   return json(await fetch(`/api/workspaces/${id}`, { credentials: "include" }));
@@ -178,8 +209,16 @@ export async function deleteWorkspace(id: number): Promise<void> {
 }
 
 // ----- files -----
-export async function createFile(workspaceId: number, path: string): Promise<{ file: FileRow }> {
-  return json(await fetch("/api/files", opts("POST", { workspace_id: workspaceId, path })));
+export async function createFile(
+  workspaceId: number,
+  path: string,
+): Promise<{ file: FileRow }> {
+  return json(
+    await fetch(
+      "/api/files",
+      opts("POST", { workspace_id: workspaceId, path }),
+    ),
+  );
 }
 // A file queued for upload, with the folder-relative path it should be stored
 // at (may contain slashes — the server creates the full path from the filename).
@@ -204,7 +243,9 @@ export async function uploadFile(
 // Fetch a file's bytes without triggering the browser download (used by
 // Duplicate / Copy-paste to re-upload it under a new name).
 export async function fetchFileBlob(file: FileRow): Promise<Blob> {
-  const res = await fetch(`/api/files/${file.id}/download`, { credentials: "include" });
+  const res = await fetch(`/api/files/${file.id}/download`, {
+    credentials: "include",
+  });
   if (!res.ok) throw new Error("download failed");
   return res.blob();
 }
@@ -212,7 +253,9 @@ export function rawUrl(file: FileRow): string {
   return `/api/files/${file.id}/raw`;
 }
 export async function downloadFile(file: FileRow): Promise<void> {
-  const res = await fetch(`/api/files/${file.id}/download`, { credentials: "include" });
+  const res = await fetch(`/api/files/${file.id}/download`, {
+    credentials: "include",
+  });
   if (!res.ok) throw new Error("download failed");
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
@@ -225,8 +268,13 @@ export async function downloadFile(file: FileRow): Promise<void> {
   URL.revokeObjectURL(url);
 }
 // Download the entire workspace as a single zip archive.
-export async function downloadWorkspaceZip(wsId: number, fallbackName: string): Promise<void> {
-  const res = await fetch(`/api/workspaces/${wsId}/export`, { credentials: "include" });
+export async function downloadWorkspaceZip(
+  wsId: number,
+  fallbackName: string,
+): Promise<void> {
+  const res = await fetch(`/api/workspaces/${wsId}/export`, {
+    credentials: "include",
+  });
   if (!res.ok) throw new Error("export failed");
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
@@ -242,25 +290,44 @@ export async function downloadWorkspaceZip(wsId: number, fallbackName: string): 
 // ----- whiteboards (.board files; Excalidraw scene stored as a binary blob) -----
 // The initial empty scene uploaded when a board is created.
 export function emptyBoardScene(): string {
-  return JSON.stringify({ type: "excalidraw", version: 2, source: "cortex", elements: [], appState: { viewBackgroundColor: "#ffffff" } });
+  return JSON.stringify({
+    type: "excalidraw",
+    version: 2,
+    source: "cortex",
+    elements: [],
+    appState: { viewBackgroundColor: "#ffffff" },
+  });
 }
 // Fetch the raw scene JSON of a board file.
-export async function loadBoard(file: FileRow): Promise<string> {
+export async function loadBoard(
+  file: FileRow,
+): Promise<{ text: string; revision: number }> {
   const res = await fetch(rawUrl(file), { credentials: "include" });
   if (!res.ok) throw new Error("could not load board");
-  return res.text();
+  return {
+    text: await res.text(),
+    revision: Number(res.headers.get("x-cortex-revision") ?? 0),
+  };
 }
 // Overwrite a board's scene (autosave). Server-side this is PUT /files/:id/blob,
 // which only accepts binary-kind files — .board uploads are always binary.
-export async function saveBoard(fileId: number, scene: unknown): Promise<void> {
-  await json(
+export async function saveBoard(
+  fileId: number,
+  scene: string,
+  revision: number,
+): Promise<number> {
+  const result = await json<{ ok: true; revision: number }>(
     await fetch(`/api/files/${fileId}/blob`, {
       method: "PUT",
       credentials: "include",
-      headers: { "Content-Type": "application/octet-stream" },
-      body: JSON.stringify(scene),
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Cortex-Revision": String(revision),
+      },
+      body: scene,
     }),
   );
+  return Number.isFinite(result.revision) ? result.revision : revision;
 }
 export async function deleteFile(id: number): Promise<void> {
   await json(await fetch(`/api/files/${id}`, opts("DELETE")));
@@ -274,14 +341,23 @@ export async function moveFile(id: number, path: string): Promise<void> {
 export async function getGroupChat(groupId: number): Promise<ChatThread> {
   return encFetch(`/api/chat?group_id=${groupId}`);
 }
-export async function postGroupChat(groupId: number, body: string): Promise<void> {
-  await encFetch(`/api/chat?group_id=${groupId}`, { method: "POST", body: { body } });
+export async function postGroupChat(
+  groupId: number,
+  body: string,
+): Promise<void> {
+  await encFetch(`/api/chat?group_id=${groupId}`, {
+    method: "POST",
+    body: { body },
+  });
 }
 export async function clearGroupChat(groupId: number): Promise<void> {
   await json(await fetch(`/api/chat?group_id=${groupId}`, opts("DELETE")));
 }
 // Edit / delete your own message (author-scoped on the server).
-export async function editWorkspaceChat(id: number, body: string): Promise<void> {
+export async function editWorkspaceChat(
+  id: number,
+  body: string,
+): Promise<void> {
   await encFetch(`/api/chat/${id}`, { method: "PATCH", body: { body } });
 }
 export async function deleteWorkspaceChatMsg(id: number): Promise<void> {
@@ -292,10 +368,17 @@ export async function deleteWorkspaceChatMsg(id: number): Promise<void> {
 function dmQ(withId: number, orgId?: number) {
   return `/api/dm?with=${withId}${orgId != null ? `&org=${orgId}` : ""}`;
 }
-export async function getDm(withId: number, orgId?: number): Promise<ChatThread> {
+export async function getDm(
+  withId: number,
+  orgId?: number,
+): Promise<ChatThread> {
   return encFetch(dmQ(withId, orgId));
 }
-export async function postDm(withId: number, body: string, orgId?: number): Promise<void> {
+export async function postDm(
+  withId: number,
+  body: string,
+  orgId?: number,
+): Promise<void> {
   await encFetch(dmQ(withId, orgId), { method: "POST", body: { body } });
 }
 export async function clearDm(withId: number, orgId?: number): Promise<void> {
@@ -309,25 +392,58 @@ export async function deleteDmMsg(id: number): Promise<void> {
 }
 
 // ----- presence, typing, reactions -----
-export async function getPresence(orgId?: number): Promise<{ presence: Presence[] }> {
-  return json(await fetch(`/api/presence${orgQ(orgId)}`, { credentials: "include" }));
+export async function getPresence(
+  orgId?: number,
+): Promise<{ presence: Presence[] }> {
+  return json(
+    await fetch(`/api/presence${orgQ(orgId)}`, { credentials: "include" }),
+  );
 }
 // Heartbeat / typing pings are best-effort — never surface their errors.
 export async function pingPresence(): Promise<void> {
-  try { await fetch("/api/presence", opts("POST")); } catch { /* ignore */ }
+  try {
+    await fetch("/api/presence", opts("POST"));
+  } catch {
+    /* ignore */
+  }
 }
 export async function pingTypingGroup(groupId: number): Promise<void> {
-  try { await fetch(`/api/chat/typing?group_id=${groupId}`, opts("POST")); } catch { /* ignore */ }
+  try {
+    await fetch(`/api/chat/typing?group_id=${groupId}`, opts("POST"));
+  } catch {
+    /* ignore */
+  }
 }
-export async function pingTypingDm(withId: number, orgId?: number): Promise<void> {
-  try { await fetch(`/api/dm/typing?with=${withId}${orgId != null ? `&org=${orgId}` : ""}`, opts("POST")); } catch { /* ignore */ }
+export async function pingTypingDm(
+  withId: number,
+  orgId?: number,
+): Promise<void> {
+  try {
+    await fetch(
+      `/api/dm/typing?with=${withId}${orgId != null ? `&org=${orgId}` : ""}`,
+      opts("POST"),
+    );
+  } catch {
+    /* ignore */
+  }
 }
-export async function toggleReaction(kind: "ws" | "dm", msgId: number, emoji: string): Promise<void> {
-  await encFetch(`/api/reaction`, { method: "POST", body: { kind, msg_id: msgId, emoji } });
+export async function toggleReaction(
+  kind: "ws" | "dm",
+  msgId: number,
+  emoji: string,
+): Promise<void> {
+  await encFetch(`/api/reaction`, {
+    method: "POST",
+    body: { kind, msg_id: msgId, emoji },
+  });
 }
 
 // ----- storage stats (owner / admin) -----
-export type StorageStats = { db_bytes: number; blob_bytes: number; tables: { name: string; rows: number }[] };
+export type StorageStats = {
+  db_bytes: number;
+  blob_bytes: number;
+  tables: { name: string; rows: number }[];
+};
 export async function getStorage(): Promise<StorageStats> {
   return json(await fetch("/api/admin/storage", { credentials: "include" }));
 }
@@ -384,12 +500,19 @@ export async function getAudit(): Promise<{ entries: AuditEntry[] }> {
 }
 
 // Images pasted into chat: stored org-scoped, separate from workspace files.
-export async function uploadChatImage(file: File, orgId?: number): Promise<{ id: number; url: string }> {
+export async function uploadChatImage(
+  file: File,
+  orgId?: number,
+): Promise<{ id: number; url: string }> {
   const fd = new FormData();
   fd.append("file", file);
   const q = orgId != null ? `?org=${orgId}` : "";
   return json(
-    await fetch(`/api/chat-image${q}`, { method: "POST", credentials: "include", body: fd }),
+    await fetch(`/api/chat-image${q}`, {
+      method: "POST",
+      credentials: "include",
+      body: fd,
+    }),
   );
 }
 
@@ -412,8 +535,13 @@ export async function adminUpdateUser(
 ): Promise<void> {
   await json(await fetch(`/api/admin/users/${id}`, opts("POST", patch)));
 }
-export async function adminResetPassword(id: number, password: string): Promise<void> {
-  await json(await fetch(`/api/admin/users/${id}/password`, opts("POST", { password })));
+export async function adminResetPassword(
+  id: number,
+  password: string,
+): Promise<void> {
+  await json(
+    await fetch(`/api/admin/users/${id}/password`, opts("POST", { password })),
+  );
 }
 export async function adminDeleteUser(id: number): Promise<void> {
   await json(await fetch(`/api/admin/users/${id}`, opts("DELETE")));
@@ -423,7 +551,10 @@ export async function adminDeleteUser(id: number): Promise<void> {
 export async function adminListOrgs(): Promise<{ orgs: AdminOrg[] }> {
   return json(await fetch("/api/admin/orgs", { credentials: "include" }));
 }
-export async function adminCreateOrg(name: string, slug: string): Promise<void> {
+export async function adminCreateOrg(
+  name: string,
+  slug: string,
+): Promise<void> {
   await json(await fetch("/api/admin/orgs", opts("POST", { name, slug })));
 }
 export async function adminRenameOrg(id: number, name: string): Promise<void> {

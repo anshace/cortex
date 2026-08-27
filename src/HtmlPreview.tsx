@@ -10,6 +10,7 @@ import { FileRow } from "./api";
 function resolvePath(dir: string, href: string): string | null {
   let p = href.trim();
   if (/^(https?:|data:|blob:|#|mailto:|\/\/)/i.test(p)) return null;
+  p = p.split(/[?#]/, 1)[0];
   if (p.startsWith("/")) p = p.slice(1);
   else p = dir ? `${dir}/${p}` : p;
   const out: string[] = [];
@@ -21,9 +22,13 @@ function resolvePath(dir: string, href: string): string | null {
   return out.join("/");
 }
 
-// Inline linked stylesheets and scripts from the workspace so the sandboxed
-// iframe (which has no base URL) renders styled and interactive.
-function inlineAssets(html: string, dir: string, assets: Record<string, string>): string {
+// Inline linked stylesheets from the workspace so the sandboxed srcDoc frame
+// renders accurately without granting uploaded documents script execution.
+function inlineAssets(
+  html: string,
+  dir: string,
+  assets: Record<string, string>,
+): string {
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, "text/html");
 
@@ -42,23 +47,13 @@ function inlineAssets(html: string, dir: string, assets: Record<string, string>)
     }
   }
 
-  for (const script of Array.from(doc.querySelectorAll("script[src]"))) {
-    const src = script.getAttribute("src");
-    if (!src) continue;
-    const p = resolvePath(dir, src);
-    if (p != null && assets[p] != null) {
-      const inline = doc.createElement("script");
-      inline.textContent = `\n${assets[p]}\n`;
-      script.replaceWith(inline);
-    }
-  }
+  for (const script of Array.from(doc.querySelectorAll("script")))
+    script.remove();
 
   return doc.documentElement.outerHTML;
 }
 
-// Renders live HTML in a sandboxed iframe: scripts run but the frame is walled
-// off from our origin (no same-origin), so a previewed page can't touch
-// cookies/session or break out of the pane.
+// Renders uploaded HTML as a static document in a fully sandboxed iframe.
 function HtmlPreview({ text, file }: { text: string; file?: FileRow }) {
   const [assets, setAssets] = useState<Record<string, string>>({});
 
@@ -73,11 +68,15 @@ function HtmlPreview({ text, file }: { text: string; file?: FileRow }) {
     (async () => {
       try {
         const ws = await api.getWorkspace(file.workspace_id);
-        const siblings = ws.files.filter((f) => f.kind === "text" && f.id !== file.id);
+        const siblings = ws.files.filter(
+          (f) => f.kind === "text" && f.id !== file.id,
+        );
         const entries = await Promise.all(
           siblings.map(async (f) => {
             try {
-              const res = await fetch(api.rawUrl(f), { credentials: "include" });
+              const res = await fetch(api.rawUrl(f), {
+                credentials: "include",
+              });
               return [f.path, res.ok ? await res.text() : ""] as const;
             } catch {
               return [f.path, ""] as const;
@@ -94,16 +93,27 @@ function HtmlPreview({ text, file }: { text: string; file?: FileRow }) {
     };
   }, [file?.id, file?.workspace_id]);
 
-  const dir = file && file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "";
-  const doc = useMemo(() => (file ? inlineAssets(text, dir, assets) : text), [text, dir, assets, file]);
+  const dir =
+    file && file.path.includes("/")
+      ? file.path.slice(0, file.path.lastIndexOf("/"))
+      : "";
+  const doc = useMemo(
+    () => (file ? inlineAssets(text, dir, assets) : text),
+    [text, dir, assets, file],
+  );
 
   return (
     <Box flex={1} minH={0} bg="white">
       <iframe
         title="HTML preview"
         srcDoc={doc}
-        sandbox="allow-scripts allow-forms allow-popups allow-modals"
-        style={{ width: "100%", height: "100%", border: "none", background: "white" }}
+        sandbox=""
+        style={{
+          width: "100%",
+          height: "100%",
+          border: "none",
+          background: "white",
+        }}
       />
     </Box>
   );
