@@ -57,8 +57,8 @@ import {
 import ReactMarkdown, { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-import { ChatTarget } from "./ChatChannels";
 import ChatAvatar from "./ChatAvatar";
+import { ChatTarget } from "./ChatChannels";
 import { ConfirmModal } from "./Dialogs";
 import * as api from "./api";
 import { ChatMessage, Me, Member, Presence } from "./api";
@@ -97,7 +97,11 @@ export type ChatPrefs = {
   enterToSend: boolean;
 };
 
-export const DEFAULT_PREFS: ChatPrefs = { wallpaper: "none", fontSize: "md", enterToSend: true };
+export const DEFAULT_PREFS: ChatPrefs = {
+  wallpaper: "none",
+  fontSize: "md",
+  enterToSend: true,
+};
 
 // Three one-click photo wallpapers shipped from /public — kept small enough to
 // load instantly, and dark enough / soft enough that message bubbles stay
@@ -500,6 +504,24 @@ const markdownComponents: Components = {
         />
       );
     }
+    // Chat attachments embedded mid-message download as files; a plain link
+    // would just render the bytes in a new tab.
+    if (href?.startsWith("/api/chat-image")) {
+      return (
+        <Box
+          as="button"
+          cursor="pointer"
+          onClick={() => {
+            void api.downloadChatAttachment(
+              href,
+              href.split("/").pop() || "file",
+            );
+          }}
+        >
+          {children}
+        </Box>
+      );
+    }
     return (
       <a href={href} target="_blank" rel="noreferrer">
         {children}
@@ -512,7 +534,6 @@ const markdownComponents: Components = {
     <MediaImage src={src ?? ""} name={alt ?? "Image"} compact />
   ),
 };
-
 // When a message body is *exactly* one attachment (nothing else), it renders as
 // a sleek one-piece card instead of a markdown card nested inside the bubble.
 type SingleAttach = {
@@ -554,7 +575,9 @@ function WaveBars({ playing, mine }: { playing: boolean; mine: boolean }) {
           transformOrigin="center"
           sx={
             playing
-              ? { animation: `${waveKey} 0.9s ease-in-out ${i * 0.08}s infinite` }
+              ? {
+                  animation: `${waveKey} 0.9s ease-in-out ${i * 0.08}s infinite`,
+                }
               : undefined
           }
         />
@@ -793,7 +816,8 @@ function ChatView({
   // Stop the recorder and release the mic if the view unmounts mid-recording.
   useEffect(() => {
     return () => {
-      if (recTimerRef.current != null) window.clearInterval(recTimerRef.current);
+      if (recTimerRef.current != null)
+        window.clearInterval(recTimerRef.current);
       recStreamRef.current?.getTracks().forEach((t) => t.stop());
     };
   }, []);
@@ -923,7 +947,11 @@ function ChatView({
 
   async function react(msgId: number, emoji: string) {
     try {
-      await api.toggleReaction(target.kind === "group" ? "ws" : "dm", msgId, emoji);
+      await api.toggleReaction(
+        target.kind === "group" ? "ws" : "dm",
+        msgId,
+        emoji,
+      );
       await load();
     } catch (e) {
       toast({
@@ -1037,7 +1065,10 @@ function ChatView({
       const mime = MediaRecorder.isTypeSupported("audio/webm")
         ? "audio/webm"
         : "";
-      const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      const rec = new MediaRecorder(
+        stream,
+        mime ? { mimeType: mime } : undefined,
+      );
       recorderRef.current = rec;
       recChunksRef.current = [];
       rec.ondataavailable = (e) => {
@@ -1263,10 +1294,7 @@ function ChatView({
         <Flex align="center" gap={2.5} minW={0}>
           {peer ? (
             <Box position="relative" flexShrink={0}>
-              <ChatAvatar
-                name={peer.name || peer.email}
-                size={34}
-              />
+              <ChatAvatar name={peer.name || peer.email} size={34} />
               <Box
                 position="absolute"
                 bottom="-1px"
@@ -1310,9 +1338,7 @@ function ChatView({
         {/* Settings moved to the sidebar next to the wallpaper picker. */}
         {/* Always reserve the slot so showing/hiding it never reflows the header. */}
         <Tooltip
-          label={
-            target.kind === "group" ? "Clear chat" : "Clear conversation"
-          }
+          label={target.kind === "group" ? "Clear chat" : "Clear conversation"}
           maxW="200px"
         >
           <IconButton
@@ -1341,297 +1367,141 @@ function ChatView({
           px={{ base: 2, md: 4 }}
           py={3}
         >
-        {messages.length === 0 ? (
-          <Center flexDirection="column" gap={3} py={20} color="ink.muted">
-            <Icon as={VscComment} fontSize="3xl" color="ink.subtle" />
-            <Text fontSize="sm">
-              {canSend
-                ? "No messages yet. Say hello 👋"
-                : "Pick a conversation to start."}
-            </Text>
-          </Center>
-        ) : (
-          <Flex direction="column">
-            {messages.map((m, i) => {
-              const mine = m.email === me.email;
-              const label = m.author || m.email;
-              const callsMe = !mine && mentionsMe(m.body);
-              const prev = messages[i - 1];
-              const newDay = !prev || !sameDay(prev.created_at, m.created_at);
-              // Group consecutive messages from the same author (within 5 min, same
-              // day): hide the repeated avatar/name and tighten spacing, WhatsApp-style.
-              const grouped =
-                !!prev &&
-                !newDay &&
-                prev.email === m.email &&
-                m.created_at - prev.created_at < 300;
-              // The timestamp sits bottom-right; reserve room on the last text line
-              // for it with an inline spacer so it doesn't overlap the message.
-              const metaText = `${m.edited_at ? "edited · " : ""}${timeOf(m.created_at)}`;
-              const metaW =
-                Math.round(metaText.length * 5.6 + 10) + (mine ? 18 : 0);
+          {messages.length === 0 ? (
+            <Center flexDirection="column" gap={3} py={20} color="ink.muted">
+              <Icon as={VscComment} fontSize="3xl" color="ink.subtle" />
+              <Text fontSize="sm">
+                {canSend
+                  ? "No messages yet. Say hello 👋"
+                  : "Pick a conversation to start."}
+              </Text>
+            </Center>
+          ) : (
+            <Flex direction="column">
+              {messages.map((m, i) => {
+                const mine = m.email === me.email;
+                const label = m.author || m.email;
+                const callsMe = !mine && mentionsMe(m.body);
+                const prev = messages[i - 1];
+                const newDay = !prev || !sameDay(prev.created_at, m.created_at);
+                // Group consecutive messages from the same author (within 5 min, same
+                // day): hide the repeated avatar/name and tighten spacing, WhatsApp-style.
+                const grouped =
+                  !!prev &&
+                  !newDay &&
+                  prev.email === m.email &&
+                  m.created_at - prev.created_at < 300;
+                // The timestamp sits bottom-right; reserve room on the last text line
+                // for it with an inline spacer so it doesn't overlap the message.
+                const metaText = `${m.edited_at ? "edited · " : ""}${timeOf(m.created_at)}`;
+                const metaW =
+                  Math.round(metaText.length * 5.6 + 10) + (mine ? 18 : 0);
 
-              const actions = (
-                <HStack
-                  spacing={0.5}
-                  opacity={0}
-                  _groupHover={{ opacity: 1 }}
-                  transition="opacity 0.12s"
-                  flexShrink={0}
-                  alignSelf="center"
-                >
-                  <ReactionPicker onPick={(e) => react(m.id, e)} />
-                  <CopyButton text={m.body} />
-                  {mine && (
-                    <>
-                      <IconButton
-                        aria-label="Edit message"
-                        icon={<Icon as={LuPencil} />}
-                        size="xs"
-                        variant="ghost"
-                        color="ink.subtle"
-                        _hover={{ color: "ink.base", bg: "surface.hover" }}
-                        onClick={() => startEdit(m)}
-                      />
-                      <IconButton
-                        aria-label="Delete message"
-                        icon={<Icon as={LuTrash2} />}
-                        size="xs"
-                        variant="ghost"
-                        color="ink.subtle"
-                        _hover={{ color: "red.400", bg: "surface.hover" }}
-                        onClick={() => setConfirmDel(m.id)}
-                      />
-                    </>
-                  )}
-                </HStack>
-              );
+                const actions = (
+                  <HStack
+                    spacing={0.5}
+                    opacity={0}
+                    _groupHover={{ opacity: 1 }}
+                    transition="opacity 0.12s"
+                    flexShrink={0}
+                    alignSelf="center"
+                  >
+                    <ReactionPicker onPick={(e) => react(m.id, e)} />
+                    <CopyButton text={m.body} />
+                    {mine && (
+                      <>
+                        <IconButton
+                          aria-label="Edit message"
+                          icon={<Icon as={LuPencil} />}
+                          size="xs"
+                          variant="ghost"
+                          color="ink.subtle"
+                          _hover={{ color: "ink.base", bg: "surface.hover" }}
+                          onClick={() => startEdit(m)}
+                        />
+                        <IconButton
+                          aria-label="Delete message"
+                          icon={<Icon as={LuTrash2} />}
+                          size="xs"
+                          variant="ghost"
+                          color="ink.subtle"
+                          _hover={{ color: "red.400", bg: "surface.hover" }}
+                          onClick={() => setConfirmDel(m.id)}
+                        />
+                      </>
+                    )}
+                  </HStack>
+                );
 
-              // Integrated tail on the first message of a run: a small
-              // right-triangle clipped from the SAME background as the bubble,
-              // attached at the TOP corner (WhatsApp style) instead of a
-              // detached rotated square. The bubble corner where it attaches
-              // gets a flatter radius so the two merge seamlessly.
-              const tail = !grouped && (
-                <Box
-                  position="absolute"
-                  top="0"
-                  right={mine ? "-6px" : undefined}
-                  left={mine ? undefined : "-6px"}
-                  zIndex={0}
-                  aria-hidden
-                >
+                // Integrated tail on the first message of a run: a small
+                // right-triangle clipped from the SAME background as the bubble,
+                // attached at the TOP corner (WhatsApp style) instead of a
+                // detached rotated square. The bubble corner where it attaches
+                // gets a flatter radius so the two merge seamlessly.
+                const tail = !grouped && (
                   <Box
-                    w="12px"
-                    h="12px"
-                    bg={mine ? "brand.500" : "chat.incoming"}
-                    clipPath={
-                      mine
-                        ? "polygon(0 0, 100% 0, 0 100%)"
-                        : "polygon(100% 0, 0 0, 100% 100%)"
-                    }
-                  />
-                </Box>
-              );
-
-              // Single-attachment messages render as sleek one-piece cards
-              // (image fills the bubble edge-to-edge; voice/file get a compact
-              // row) instead of a markdown card nested inside the bubble.
-              const att = singleAttachment(m.body);
-              const ticks = mine && (
-                <Box
-                  as="span"
-                  display="inline-flex"
-                  alignItems="flex-end"
-                  color={tickColor}
-                  aria-label={tickCount === 2 ? "Read" : "Sent"}
-                >
-                  {Array.from({ length: tickCount }).map((_, k) => (
-                    <Icon
-                      key={k}
-                      as={VscCheck}
-                      boxSize="9px"
-                      mr={k === 0 && tickCount === 2 ? "-4px" : undefined}
-                    />
-                  ))}
-                </Box>
-              );
-
-              const bubble = (
-                <Box maxW={{ base: "82%", md: "68%" }} minW={0}>
-                  {att && att.kind === "image" ? (
+                    position="absolute"
+                    top="0"
+                    right={mine ? "-6px" : undefined}
+                    left={mine ? undefined : "-6px"}
+                    zIndex={0}
+                    aria-hidden
+                  >
                     <Box
-                      position="relative"
-                      borderRadius="12px"
-                      overflow="hidden"
-                      boxShadow="0 1px 1px rgba(0,0,0,0.14)"
-                      border={callsMe ? "1px solid" : undefined}
-                      borderColor={callsMe ? "brand.400" : undefined}
-                    >
-                      <MediaImage src={att.url} name={att.name} />
-                      <Box
-                        position="absolute"
-                        insetX={0}
-                        bottom={0}
-                        h="52px"
-                        bgGradient="linear(to-t, rgba(0,0,0,0.5), transparent)"
-                      />
-                      <Text
-                        position="absolute"
-                        bottom="5px"
-                        right="9px"
-                        fontSize="10px"
-                        lineHeight="1"
-                        whiteSpace="nowrap"
-                        display="inline-flex"
-                        alignItems="center"
-                        gap="2px"
-                        color={mine && tickColor ? tickColor : "white"}
-                      >
-                        <Box as="span">{metaText}</Box>
-                        {ticks}
-                      </Text>
-                    </Box>
-                  ) : (
-                    <Box
-                      position="relative"
+                      w="12px"
+                      h="12px"
                       bg={mine ? "brand.500" : "chat.incoming"}
-                      color={mine ? "white" : "chat.incomingText"}
-                      border={mine || !callsMe ? undefined : "1px solid"}
-                      borderColor={callsMe ? "brand.400" : undefined}
-                      boxShadow={
-                        callsMe
-                          ? "0 0 0 1px var(--chakra-colors-brand-400)"
-                          : "0 1px 1px rgba(0,0,0,0.14)"
+                      clipPath={
+                        mine
+                          ? "polygon(0 0, 100% 0, 0 100%)"
+                          : "polygon(100% 0, 0 0, 100% 100%)"
                       }
-                      borderRadius="16px"
-                      borderTopRightRadius={
-                        mine && !grouped ? "6px" : "16px"
-                      }
-                      borderTopLeftRadius={
-                        !mine && !grouped ? "6px" : "16px"
-                      }
-                      px="10px"
-                      py="5px"
-                      fontSize={fontSize}
-                    >
-                      {tail}
-                      {!mine && !grouped && (
-                        <Text
-                          fontSize="xs"
-                          fontWeight={700}
-                          mb="1px"
-                          color={`hsl(${hueOf(m.email)}, 60%, 62%)`}
-                          isTruncated
-                        >
-                          {label}
-                        </Text>
-                      )}
+                    />
+                  </Box>
+                );
+
+                // Single-attachment messages render as sleek one-piece cards
+                // (image fills the bubble edge-to-edge; voice/file get a compact
+                // row) instead of a markdown card nested inside the bubble.
+                const att = singleAttachment(m.body);
+                const ticks = mine && (
+                  <Box
+                    as="span"
+                    display="inline-flex"
+                    alignItems="flex-end"
+                    color={tickColor}
+                    aria-label={tickCount === 2 ? "Read" : "Sent"}
+                  >
+                    {Array.from({ length: tickCount }).map((_, k) => (
+                      <Icon
+                        key={k}
+                        as={VscCheck}
+                        boxSize="9px"
+                        mr={k === 0 && tickCount === 2 ? "-4px" : undefined}
+                      />
+                    ))}
+                  </Box>
+                );
+
+                const bubble = (
+                  <Box maxW={{ base: "82%", md: "68%" }} minW={0}>
+                    {att && att.kind === "image" ? (
                       <Box
                         position="relative"
-                        zIndex={1}
-                        pr={att ? `${metaW + 6}px` : undefined}
+                        borderRadius="12px"
+                        overflow="hidden"
+                        boxShadow="0 1px 1px rgba(0,0,0,0.14)"
+                        border={callsMe ? "1px solid" : undefined}
+                        borderColor={callsMe ? "brand.400" : undefined}
                       >
-                        {att ? (
-                          att.kind === "voice" ? (
-                            <AudioBubble src={att.url} mine={mine} />
-                          ) : (
-                            <Box
-                              as="a"
-                              href={att.url}
-                              target="_blank"
-                              rel="noreferrer"
-                              display="block"
-                            >
-                              <Flex align="center" gap={2.5} py={1}>
-                                <Center
-                                  boxSize="38px"
-                                  borderRadius="10px"
-                                  bg={
-                                    mine ? "whiteAlpha.250" : "blackAlpha.200"
-                                  }
-                                  color={mine ? "white" : "ink.base"}
-                                  flexShrink={0}
-                                >
-                                  <Icon as={LuFileText} boxSize="18px" />
-                                </Center>
-                                <Box minW={0} flex={1}>
-                                  <Text
-                                    fontSize={fontSize}
-                                    fontWeight={600}
-                                    color={mine ? "white" : "ink.base"}
-                                    isTruncated
-                                  >
-                                    {att.name}
-                                  </Text>
-                                  <Text
-                                    fontSize="xs"
-                                    color={
-                                      mine ? "whiteAlpha.700" : "ink.subtle"
-                                    }
-                                  >
-                                    Tap to download
-                                  </Text>
-                                </Box>
-                                <Icon
-                                  as={LuDownload}
-                                  boxSize="16px"
-                                  color={
-                                    mine ? "whiteAlpha.800" : "ink.muted"
-                                  }
-                                  flexShrink={0}
-                                />
-                              </Flex>
-                            </Box>
-                          )
-                        ) : (
-                          <Box
-                            sx={{
-                              ...mdSx,
-                              "& > p": { display: "inline" },
-                              "& .mention": {
-                                fontWeight: 700,
-                                color: mine
-                                  ? "white"
-                                  : "var(--chakra-colors-brand-300)",
-                              },
-                              "& .mention-me": {
-                                bg: mine
-                                  ? "whiteAlpha.300"
-                                  : "var(--chakra-colors-accent-tint)",
-                                borderRadius: "4px",
-                                px: "3px",
-                              },
-                            }}
-                          >
-                            <ReactMarkdown
-                              remarkPlugins={[remarkGfm]}
-                              rehypePlugins={rehypePlugins}
-                              components={markdownComponents}
-                            >
-                              {m.body}
-                            </ReactMarkdown>
-                            {/* Timestamp flows inline right after the text (Telegram
-                                style) so short bubbles hug their content instead of
-                                being stretched by a reserved spacer. */}
-                            <Text
-                              as="span"
-                              display="inline-flex"
-                              alignItems="flex-end"
-                              whiteSpace="nowrap"
-                              gap="2px"
-                              ml={1.5}
-                              fontSize="10px"
-                              lineHeight="1"
-                              color={mine ? "whiteAlpha.800" : "chat.incomingMeta"}
-                            >
-                              <Box as="span">{metaText}</Box>
-                              {ticks}
-                            </Text>
-                          </Box>
-                        )}
-                      </Box>
-                      {att && (
+                        <MediaImage src={att.url} name={att.name} />
+                        <Box
+                          position="absolute"
+                          insetX={0}
+                          bottom={0}
+                          h="52px"
+                          bgGradient="linear(to-t, rgba(0,0,0,0.5), transparent)"
+                        />
                         <Text
                           position="absolute"
                           bottom="5px"
@@ -1642,110 +1512,283 @@ function ChatView({
                           display="inline-flex"
                           alignItems="center"
                           gap="2px"
-                          color={mine ? "whiteAlpha.800" : "chat.incomingMeta"}
+                          color={mine && tickColor ? tickColor : "white"}
                         >
                           <Box as="span">{metaText}</Box>
                           {ticks}
                         </Text>
-                      )}
-                    </Box>
-                  )}
-                  {m.reactions && m.reactions.length > 0 && (
-                    <HStack
-                      spacing={1}
-                      mt="-7px"
-                      ml={mine ? "auto" : "6px"}
-                      w="fit-content"
-                      flexWrap="wrap"
-                      justify={mine ? "flex-end" : "flex-start"}
-                      position="relative"
-                      zIndex={1}
-                    >
-                      {m.reactions.map((r) => (
-                        <Button
-                          key={r.emoji}
-                          size="xs"
-                          h="20px"
-                          minW="auto"
-                          px={1.5}
-                          borderRadius="full"
-                          variant="solid"
-                          border="1px solid"
-                          borderColor={
-                            r.mine ? "brand.400" : "chat.incomingBorder"
-                          }
-                          bg="surface.panel"
-                          color="ink.base"
-                          fontWeight={500}
-                          fontSize="11px"
-                          boxShadow="0 1px 2px rgba(0,0,0,0.18)"
-                          _hover={{ bg: "surface.hover" }}
-                          onClick={() => react(m.id, r.emoji)}
-                        >
-                          {r.emoji} {r.count}
-                        </Button>
-                      ))}
-                    </HStack>
-                  )}
-                </Box>
-              );
-
-              return (
-                <Fragment key={m.id}>
-                  {newDay && (
-                    <Center my={4}>
-                      <Text
-                        px={3}
-                        py={1}
-                        fontSize="11px"
-                        fontWeight={600}
-                        color="ink.muted"
-                        bg="surface.panel"
-                        border="1px solid"
-                        borderColor="chat.incomingBorder"
-                        borderRadius="full"
-                        boxShadow="0 1px 1px rgba(0,0,0,0.12)"
-                      >
-                        {dayLabel(m.created_at)}
-                      </Text>
-                    </Center>
-                  )}
-                  <Flex
-                    role="group"
-                    gap={2}
-                    align="flex-start"
-                    justify={mine ? "flex-end" : "flex-start"}
-                    mt={grouped ? "2px" : "8px"}
-                    animation={`${msgIn} 0.18s ease`}
-                    // The bubble tail (rotated square) pokes ~9px past the
-                    // bubble edge; padding the row keeps it inside the
-                    // scrollable area so no horizontal scrollbar shows up.
-                    pr={mine ? "12px" : 0}
-                  >
-                    {mine ? (
-                      <>
-                        {actions}
-                        {bubble}
-                      </>
+                      </Box>
                     ) : (
-                      <>
-                        {grouped ? (
-                          <Box w="28px" flexShrink={0} />
-                        ) : (
-                          <ChatAvatar name={label} size={28} />
+                      <Box
+                        position="relative"
+                        bg={mine ? "brand.500" : "chat.incoming"}
+                        color={mine ? "white" : "chat.incomingText"}
+                        border={mine || !callsMe ? undefined : "1px solid"}
+                        borderColor={callsMe ? "brand.400" : undefined}
+                        boxShadow={
+                          callsMe
+                            ? "0 0 0 1px var(--chakra-colors-brand-400)"
+                            : "0 1px 1px rgba(0,0,0,0.14)"
+                        }
+                        borderRadius="16px"
+                        borderTopRightRadius={mine && !grouped ? "6px" : "16px"}
+                        borderTopLeftRadius={!mine && !grouped ? "6px" : "16px"}
+                        px="10px"
+                        py="5px"
+                        fontSize={fontSize}
+                      >
+                        {tail}
+                        {!mine && !grouped && (
+                          <Text
+                            fontSize="xs"
+                            fontWeight={700}
+                            mb="1px"
+                            color={`hsl(${hueOf(m.email)}, 60%, 62%)`}
+                            isTruncated
+                          >
+                            {label}
+                          </Text>
                         )}
-                        {bubble}
-                        {actions}
-                      </>
+                        <Box
+                          position="relative"
+                          zIndex={1}
+                          pr={att ? `${metaW + 6}px` : undefined}
+                        >
+                          {att ? (
+                            att.kind === "voice" ? (
+                              <AudioBubble src={att.url} mine={mine} />
+                            ) : (
+                              <Box
+                                as="button"
+                                display="block"
+                                w="full"
+                                textAlign="left"
+                                cursor="pointer"
+                                onClick={() => {
+                                  if (att.kind === "image") {
+                                    window.open(att.url, "_blank", "noopener");
+                                    return;
+                                  }
+                                  // Files download directly; navigating to the
+                                  // URL would just render it in a new tab.
+                                  api
+                                    .downloadChatAttachment(att.url, att.name)
+                                    .catch(() =>
+                                      toast({
+                                        title: "Download failed",
+                                        status: "error",
+                                        duration: 3000,
+                                      }),
+                                    );
+                                }}
+                              >
+                                <Flex align="center" gap={2.5} py={1}>
+                                  <Center
+                                    boxSize="38px"
+                                    borderRadius="10px"
+                                    bg={
+                                      mine ? "whiteAlpha.250" : "blackAlpha.200"
+                                    }
+                                    color={mine ? "white" : "ink.base"}
+                                    flexShrink={0}
+                                  >
+                                    <Icon as={LuFileText} boxSize="18px" />
+                                  </Center>
+                                  <Box minW={0} flex={1}>
+                                    <Text
+                                      fontSize={fontSize}
+                                      fontWeight={600}
+                                      color={mine ? "white" : "ink.base"}
+                                      isTruncated
+                                    >
+                                      {att.name}
+                                    </Text>
+                                    <Text
+                                      fontSize="xs"
+                                      color={
+                                        mine ? "whiteAlpha.700" : "ink.subtle"
+                                      }
+                                    >
+                                      Tap to download
+                                    </Text>
+                                  </Box>
+                                  <Icon
+                                    as={LuDownload}
+                                    boxSize="16px"
+                                    color={
+                                      mine ? "whiteAlpha.800" : "ink.muted"
+                                    }
+                                    flexShrink={0}
+                                  />
+                                </Flex>
+                              </Box>
+                            )
+                          ) : (
+                            <Box
+                              sx={{
+                                ...mdSx,
+                                "& > p": { display: "inline" },
+                                "& .mention": {
+                                  fontWeight: 700,
+                                  color: mine
+                                    ? "white"
+                                    : "var(--chakra-colors-brand-300)",
+                                },
+                                "& .mention-me": {
+                                  bg: mine
+                                    ? "whiteAlpha.300"
+                                    : "var(--chakra-colors-accent-tint)",
+                                  borderRadius: "4px",
+                                  px: "3px",
+                                },
+                              }}
+                            >
+                              <ReactMarkdown
+                                remarkPlugins={[remarkGfm]}
+                                rehypePlugins={rehypePlugins}
+                                components={markdownComponents}
+                              >
+                                {m.body}
+                              </ReactMarkdown>
+                              {/* Timestamp flows inline right after the text (Telegram
+                                style) so short bubbles hug their content instead of
+                                being stretched by a reserved spacer. */}
+                              <Text
+                                as="span"
+                                display="inline-flex"
+                                alignItems="flex-end"
+                                whiteSpace="nowrap"
+                                gap="2px"
+                                ml={1.5}
+                                fontSize="10px"
+                                lineHeight="1"
+                                color={
+                                  mine ? "whiteAlpha.800" : "chat.incomingMeta"
+                                }
+                              >
+                                <Box as="span">{metaText}</Box>
+                                {ticks}
+                              </Text>
+                            </Box>
+                          )}
+                        </Box>
+                        {att && (
+                          <Text
+                            position="absolute"
+                            bottom="5px"
+                            right="9px"
+                            fontSize="10px"
+                            lineHeight="1"
+                            whiteSpace="nowrap"
+                            display="inline-flex"
+                            alignItems="center"
+                            gap="2px"
+                            color={
+                              mine ? "whiteAlpha.800" : "chat.incomingMeta"
+                            }
+                          >
+                            <Box as="span">{metaText}</Box>
+                            {ticks}
+                          </Text>
+                        )}
+                      </Box>
                     )}
-                  </Flex>
-                </Fragment>
-              );
-            })}
-            <div ref={bottomRef} />
-          </Flex>
-        )}
-        {typingNames.length > 0 && <TypingBubble names={typingNames} />}
+                    {m.reactions && m.reactions.length > 0 && (
+                      <HStack
+                        spacing={1}
+                        mt="-7px"
+                        ml={mine ? "auto" : "6px"}
+                        w="fit-content"
+                        flexWrap="wrap"
+                        justify={mine ? "flex-end" : "flex-start"}
+                        position="relative"
+                        zIndex={1}
+                      >
+                        {m.reactions.map((r) => (
+                          <Button
+                            key={r.emoji}
+                            size="xs"
+                            h="20px"
+                            minW="auto"
+                            px={1.5}
+                            borderRadius="full"
+                            variant="solid"
+                            border="1px solid"
+                            borderColor={
+                              r.mine ? "brand.400" : "chat.incomingBorder"
+                            }
+                            bg="surface.panel"
+                            color="ink.base"
+                            fontWeight={500}
+                            fontSize="11px"
+                            boxShadow="0 1px 2px rgba(0,0,0,0.18)"
+                            _hover={{ bg: "surface.hover" }}
+                            onClick={() => react(m.id, r.emoji)}
+                          >
+                            {r.emoji} {r.count}
+                          </Button>
+                        ))}
+                      </HStack>
+                    )}
+                  </Box>
+                );
+
+                return (
+                  <Fragment key={m.id}>
+                    {newDay && (
+                      <Center my={4}>
+                        <Text
+                          px={3}
+                          py={1}
+                          fontSize="11px"
+                          fontWeight={600}
+                          color="ink.muted"
+                          bg="surface.panel"
+                          border="1px solid"
+                          borderColor="chat.incomingBorder"
+                          borderRadius="full"
+                          boxShadow="0 1px 1px rgba(0,0,0,0.12)"
+                        >
+                          {dayLabel(m.created_at)}
+                        </Text>
+                      </Center>
+                    )}
+                    <Flex
+                      role="group"
+                      gap={2}
+                      align="flex-start"
+                      justify={mine ? "flex-end" : "flex-start"}
+                      mt={grouped ? "2px" : "8px"}
+                      animation={`${msgIn} 0.18s ease`}
+                      // The bubble tail (rotated square) pokes ~9px past the
+                      // bubble edge; padding the row keeps it inside the
+                      // scrollable area so no horizontal scrollbar shows up.
+                      pr={mine ? "12px" : 0}
+                    >
+                      {mine ? (
+                        <>
+                          {actions}
+                          {bubble}
+                        </>
+                      ) : (
+                        <>
+                          {grouped ? (
+                            <Box w="28px" flexShrink={0} />
+                          ) : (
+                            <ChatAvatar name={label} size={28} />
+                          )}
+                          {bubble}
+                          {actions}
+                        </>
+                      )}
+                    </Flex>
+                  </Fragment>
+                );
+              })}
+              <div ref={bottomRef} />
+            </Flex>
+          )}
+          {typingNames.length > 0 && <TypingBubble names={typingNames} />}
         </Box>
         {showJump && (
           <Tooltip label="Jump to latest">

@@ -429,9 +429,7 @@ function EditorPane(props: EditorPaneProps) {
         bg="surface.bg"
         px={6}
         textAlign="center"
-        position="relative"
       >
-        <Box position="absolute" top={2} right={2}></Box>
         <Box opacity={0.45}>
           <Logo size={48} />
         </Box>
@@ -444,6 +442,31 @@ function EditorPane(props: EditorPaneProps) {
             the view to work on two files side by side.
           </Text>
         </Box>
+        <HStack spacing={2} mt={2}>
+          {[
+            { keys: "Ctrl P", label: "Find a file" },
+            { keys: "Ctrl Shift P", label: "Commands" },
+            { keys: "Ctrl B", label: "Toggle sidebar" },
+          ].map((s) => (
+            <HStack
+              key={s.keys}
+              spacing={1.5}
+              px={2.5}
+              py={1}
+              borderRadius="md"
+              border="1px solid"
+              borderColor="surface.border"
+              bg="surface.panel"
+            >
+              <Text fontSize="11px" fontFamily="mono" color="ink.muted">
+                {s.keys}
+              </Text>
+              <Text fontSize="11px" color="ink.subtle">
+                {s.label}
+              </Text>
+            </HStack>
+          ))}
+        </HStack>
       </Center>
     );
   }
@@ -751,15 +774,13 @@ function EditorGroup({
       setLang: setLangOverride,
       download: activeFile
         ? () =>
-            api
-              .downloadFile(activeFile)
-              .catch(() =>
-                toast({
-                  title: "Download failed",
-                  status: "error",
-                  duration: 3000,
-                }),
-              )
+            api.downloadFile(activeFile).catch(() =>
+              toast({
+                title: "Download failed",
+                status: "error",
+                duration: 3000,
+              }),
+            )
         : undefined,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1186,7 +1207,11 @@ function EditorGroup({
       )}
       {/* Settings is an overlay tab while it takes the body. */}
       {isBinary && !settingsHere && activeFile && (
-        <BinaryView key={activeFile.id} file={activeFile} canManage={canManage} />
+        <BinaryView
+          key={activeFile.id}
+          file={activeFile}
+          canManage={canManage}
+        />
       )}
       {settingsHere && settingsNode}
     </Flex>

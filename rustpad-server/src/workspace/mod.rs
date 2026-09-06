@@ -562,6 +562,25 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(with_db(db.clone()))
         .and_then(admin_storage);
 
+    // Whole-instance migration (root only): export every table + blobs as one
+    // zip, or restore such a zip into this instance.
+    let admin_export_all_r = warp::path!("admin" / "export-all")
+        .and(warp::get())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(admin_export_all);
+
+    let admin_import_all_r = warp::path!("admin" / "import-all")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(warp::body::bytes())
+        .and(with_db(db.clone()))
+        .and_then(admin_import_all);
+
+    // Boxed separately: the main chain sits right at the compiler's nesting
+    // limit, so each additional route must erase its type before joining.
+    let admin_all_r = admin_export_all_r.or(admin_import_all_r).boxed();
+
     // Chat images (pasted into chat) — stored separately from workspace files.
     let post_chat_image = warp::path!("chat-image")
         .and(warp::post())
@@ -601,6 +620,7 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .or(delete_file)
         .or(audit_r)
         .or(storage_r)
+        .or(admin_all_r)
         .boxed();
 
     let chat_routes = chat_overview_r
@@ -1675,6 +1695,125 @@ async fn admin_storage(user: User, db: Database) -> Result<impl Reply, Rejection
         "tables": tables,
     }))
     .into_response())
+}
+
+/// Whole-instance export (root only): every migrated table plus blobs,
+/// packaged as a single zip with a manifest.json.
+async fn admin_export_all(user: User, db: Database) -> Result<impl Reply, Rejection> {
+    if user.role != "root" {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    let mut tables_obj = serde_json::Map::new();
+    for table in Database::MIGRATE_TABLES {
+        match db.export_table(table).await {
+            Ok(rows) => {
+                tables_obj.insert((*table).to_string(), serde_json::Value::Array(rows));
+            }
+            Err(_) => {
+                return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "export failed"));
+            }
+        }
+    }
+    let manifest = json!({
+        "cortex_export": 1,
+        "exported_at": now_secs(),
+        "tables": serde_json::Value::Object(tables_obj),
+    });
+    let body = match serde_json::to_vec(&manifest) {
+        Ok(b) => b,
+        Err(_) => {
+            return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "export failed"));
+        }
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        use std::io::Write as _;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        if zip.start_file("manifest.json", options).is_err()
+            || zip.write_all(&body).is_err()
+            || zip.finish().is_err()
+        {
+            return Ok(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to create archive",
+            ));
+        }
+    }
+    let _ = db
+        .audit(
+            user.org_id,
+            Some(user.id),
+            "export_all",
+            Some("full instance export"),
+            now_secs(),
+        )
+        .await;
+    let resp = warp::http::Response::builder()
+        .header("content-disposition", "attachment; filename=\"cortex-export.zip\"")
+        .header("content-type", "application/zip")
+        .body(Body::from(buf))
+        .expect("valid response");
+    Ok(resp.into_response())
+}
+
+/// Whole-instance import (root only): replace everything in this instance with
+/// the contents of a previous export. Destructive — the current dataset is
+/// wiped first (inside one transaction) and all users are signed out.
+async fn admin_import_all(
+    user: User,
+    body: bytes::Bytes,
+    db: Database,
+) -> Result<impl Reply, Rejection> {
+    if user.role != "root" {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(body)) {
+        Ok(a) => a,
+        Err(_) => {
+            return Ok(err(StatusCode::BAD_REQUEST, "not a valid export archive"));
+        }
+    };
+    let manifest: serde_json::Value = match archive
+        .by_name("manifest.json")
+        .ok()
+        .map(|f| serde_json::from_reader(f))
+    {
+        Some(Ok(m)) => m,
+        _ => {
+            return Ok(err(StatusCode::BAD_REQUEST, "missing manifest.json"));
+        }
+    };
+    if manifest["cortex_export"] != json!(1) {
+        return Ok(err(StatusCode::BAD_REQUEST, "unrecognized export format"));
+    }
+    let tables = manifest["tables"].as_object();
+    let mut restore: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    for table in Database::MIGRATE_TABLES {
+        let rows = tables
+            .and_then(|t| t.get(*table))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        restore.push(((*table).to_string(), rows));
+    }
+    match db.import_replace_all(&restore).await {
+        Ok(()) => {}
+        Err(_) => {
+            return Ok(err(StatusCode::BAD_REQUEST, "import failed; nothing changed"));
+        }
+    }
+    let _ = db
+        .audit(
+            None,
+            Some(user.id),
+            "import_all",
+            Some("full instance import"),
+            now_secs(),
+        )
+        .await;
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
 /// Store an image pasted into chat; returns its id + URL.

@@ -273,7 +273,11 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
           readRef.current,
         );
         if (stop) return;
-        setOverview(o);
+        // Polls replace the whole object every 5s; skip the update when nothing
+        // changed so the app doesn't re-render on idle.
+        setOverview((prev) =>
+          prev && JSON.stringify(prev) === JSON.stringify(o) ? prev : o,
+        );
         if (!seeded.current) {
           seeded.current = true;
           setRead((prev) => {
@@ -331,10 +335,13 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     const poll = async () => {
       try {
         const r = await api.getPresence(orgId);
-        if (!stop)
-          setPresence(
-            Object.fromEntries(r.presence.map((p) => [p.id, p.online])),
-          );
+        if (stop) return;
+        const next = Object.fromEntries(
+          r.presence.map((p) => [p.id, p.online]),
+        );
+        setPresence((prev) =>
+          JSON.stringify(prev) === JSON.stringify(next) ? prev : next,
+        );
       } catch {
         /* ignore */
       }
@@ -594,6 +601,26 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     return () => window.removeEventListener("popstate", onPop);
   }, [orgId]);
 
+  // Files are stable identity-wise (id, path, doc, kind, mime); comparing the
+  // fetched list against the current one keeps the 5s Explorer poll from
+  // re-rendering the whole (potentially huge) file tree on idle.
+  const sameFiles = (a: FileRow[], b: FileRow[]) => {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      const x = a[i];
+      const y = b[i];
+      if (
+        x.id !== y.id ||
+        x.path !== y.path ||
+        x.doc_id !== y.doc_id ||
+        x.kind !== y.kind ||
+        (x.mime ?? "") !== (y.mime ?? "")
+      )
+        return false;
+    }
+    return true;
+  };
+
   const loadWs = useCallback(() => {
     if (activeWsId == null) {
       setWs(null);
@@ -602,11 +629,22 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     api
       .getWorkspace(activeWsId)
       .then((d) => {
-        setWs(d);
         // Drop tabs for files that no longer exist (paths update automatically
         // since tabs are resolved from ids at render time).
         const exist = new Set(d.files.map((f) => f.id));
-        setGroups((gs) => pruneGroups(gs, exist));
+        setWs((prev) => {
+          if (
+            prev &&
+            prev.workspace.id === d.workspace.id &&
+            sameFiles(prev.files, d.files)
+          )
+            return prev;
+          return d;
+        });
+        setGroups((gs) => {
+          const next = pruneGroups(gs, exist);
+          return JSON.stringify(next) === JSON.stringify(gs) ? gs : next;
+        });
       })
       .catch(() => setWs(null));
   }, [activeWsId]);
