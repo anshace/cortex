@@ -11,6 +11,18 @@ const MAX_ROWS_PER_SHEET = 5_000;
 const MAX_EXPANDED_BYTES = 128 * 1024 * 1024;
 const MAX_ZIP_ENTRIES = 10_000;
 
+// One edited cell, addressed in absolute 0-based sheet coordinates.
+type CellEdit = { row: number; col: number; value: string | number | boolean };
+
+type ParseRequest = { id: number; cmd?: "parse"; buf: ArrayBuffer };
+type SaveRequest = {
+  id: number;
+  cmd: "save";
+  buf: ArrayBuffer;
+  edits: Record<string, CellEdit[]>; // sheet name -> edits
+  bookType: "xlsx" | "xls" | "csv";
+};
+
 function checkZipExpansion(buffer: ArrayBuffer) {
   const view = new DataView(buffer);
   if (view.byteLength < 4 || view.getUint32(0, true) !== 0x04034b50) return;
@@ -27,12 +39,63 @@ function checkZipExpansion(buffer: ArrayBuffer) {
 }
 
 const ctx = self as unknown as {
-  postMessage(message: unknown): void;
+  postMessage(message: unknown, transfer?: Transferable[]): void;
 };
 
+// Parse a workbook fully (no row cap) and apply edited cells, keeping the
+// original typed values for everything the user didn't touch.
+function saveWorkbook(req: SaveRequest) {
+  checkZipExpansion(req.buf);
+  const workbook = XLSX.read(new Uint8Array(req.buf), {
+    type: "array",
+    cellDates: true,
+    cellNF: false,
+    cellStyles: false,
+  });
+  for (const [sheetName, edits] of Object.entries(req.edits)) {
+    if (!edits.length) continue;
+    let worksheet = workbook.Sheets[sheetName];
+    if (!worksheet) {
+      worksheet = XLSX.utils.aoa_to_sheet([]);
+      XLSX.utils.book_append_sheet(workbook, worksheet, sheetName);
+    }
+    const range = worksheet["!ref"]
+      ? XLSX.utils.decode_range(worksheet["!ref"])
+      : { s: { r: 0, c: 0 }, e: { r: 0, c: 0 } };
+    for (const edit of edits) {
+      const addr = XLSX.utils.encode_cell({ r: edit.row, c: edit.col });
+      const cell: XLSX.CellObject =
+        typeof edit.value === "number"
+          ? { t: "n", v: edit.value }
+          : typeof edit.value === "boolean"
+            ? { t: "b", v: edit.value }
+            : edit.value === ""
+              ? { t: "z" }
+              : { t: "s", v: edit.value };
+      if (cell.t === "z") delete worksheet[addr];
+      else worksheet[addr] = cell;
+      range.s.r = Math.min(range.s.r, edit.row);
+      range.s.c = Math.min(range.s.c, edit.col);
+      range.e.r = Math.max(range.e.r, edit.row);
+      range.e.c = Math.max(range.e.c, edit.col);
+    }
+    worksheet["!ref"] = XLSX.utils.encode_range(range);
+  }
+  const out = XLSX.write(workbook, {
+    type: "array",
+    bookType: req.bookType,
+  }) as ArrayBuffer;
+  ctx.postMessage({ id: req.id, ok: true, buf: out }, [out]);
+}
+
 self.addEventListener("message", (event: MessageEvent) => {
-  const { id, buf } = event.data as { id: number; buf: ArrayBuffer };
+  const req = event.data as ParseRequest | SaveRequest;
   try {
+    if (req.cmd === "save") {
+      saveWorkbook(req);
+      return;
+    }
+    const buf = req.buf;
     checkZipExpansion(buf);
     const workbook = XLSX.read(buf, {
       type: "array",
@@ -84,14 +147,14 @@ self.addEventListener("message", (event: MessageEvent) => {
       };
     });
     ctx.postMessage({
-      id,
+      id: req.id,
       ok: true,
       sheets,
       omittedSheets: Math.max(0, workbook.SheetNames.length - MAX_SHEETS),
     });
   } catch (error) {
     ctx.postMessage({
-      id,
+      id: req.id,
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     });

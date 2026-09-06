@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use anyhow::{bail, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::Serialize;
-use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, SqlitePool};
+use sqlx::{sqlite::SqliteConnectOptions, Column, ConnectOptions, SqlitePool};
 
 /// Represents a document persisted in database storage.
 #[derive(sqlx::FromRow, PartialEq, Eq, Clone, Debug)]
@@ -1623,6 +1624,139 @@ impl Database {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row)
+    }
+
+    // ----- Full export / import (root owner, whole-instance migration) -----
+
+    /// Every table carried by a full export, in insert (dependency) order.
+    /// Rows are exported as generic JSON with ids preserved so cross-table
+    /// references survive a round-trip into a fresh instance.
+    pub const MIGRATE_TABLES: &[&str] = &[
+        "users",
+        "org",
+        "groups",
+        "group_member",
+        "workspace",
+        "file",
+        "document",
+        "file_blob",
+        "message",
+        "dm",
+        "reaction",
+        "chat_image",
+    ];
+
+    /// Dump every row of a table as JSON objects; BLOB columns become base64
+    /// strings, everything else maps straight onto JSON types.
+    pub async fn export_table(&self, table: &str) -> Result<Vec<serde_json::Value>> {
+        use sqlx::Row;
+        let rows = sqlx::query(&format!("SELECT * FROM {}", table))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut obj = serde_json::Map::new();
+            for (i, col) in row.columns().iter().enumerate() {
+                let name = col.name();
+                if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
+                    obj.insert(name.into(), serde_json::to_value(v)?);
+                } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
+                    obj.insert(name.into(), serde_json::to_value(v)?);
+                } else if let Ok(v) = row.try_get::<Option<String>, _>(i) {
+                    obj.insert(name.into(), serde_json::to_value(v)?);
+                } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
+                    obj.insert(name.into(), serde_json::to_value(v.map(|b| B64.encode(b)))?);
+                }
+            }
+            out.push(serde_json::Value::Object(obj));
+        }
+        Ok(out)
+    }
+
+    /// Replace the entire dataset with the given export. Row ids are kept, so
+    /// references between tables stay valid; SQLite affinity restores column
+    /// types from the JSON round-trip. Everything runs in one transaction —
+    /// either the whole import lands or nothing changes. Sessions are cleared
+    /// (their tokens belong to the old instance) so everyone signs in again.
+    pub async fn import_replace_all(
+        &self,
+        tables: &[(String, Vec<serde_json::Value>)],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        // Wipe in reverse dependency order; sessions die with the old users.
+        for table in Self::MIGRATE_TABLES.iter().rev() {
+            sqlx::query(&format!("DELETE FROM {}", table))
+                .execute(&mut tx)
+                .await?;
+        }
+        sqlx::query("DELETE FROM session").execute(&mut tx).await?;
+        for (table, rows) in tables {
+            if rows.is_empty() {
+                continue;
+            }
+            let mut names: Vec<String> = match rows[0] {
+                serde_json::Value::Object(ref map) => map.keys().cloned().collect(),
+                _ => bail!("malformed export: {} rows are not objects", table),
+            };
+            names.retain(|n| {
+                n != "data" || *table == "file_blob" || *table == "chat_image"
+            });
+            // Only manifest columns that actually exist in the schema are
+            // interpolated into the INSERT; everything else is a corrupted
+            // export and is skipped rather than executed.
+            let real: Vec<(String,)> =
+                sqlx::query_as(&format!("PRAGMA table_info({})", table))
+                    .fetch_all(&mut *tx)
+                    .await?;
+            let real: std::collections::HashSet<String> =
+                real.into_iter().map(|(n,)| n).collect();
+            names.retain(|n| real.contains(n));
+            for row in rows {
+                let map = match row {
+                    serde_json::Value::Object(map) => map,
+                    _ => bail!("malformed export: {} rows are not objects", table),
+                };
+                let mut sql = format!("INSERT INTO {} (", table);
+                sql.push_str(&names.join(", "));
+                sql.push_str(") VALUES (");
+                sql.push_str(
+                    &(1..=names.len())
+                        .map(|i| format!("${}", i))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                sql.push_str(")");
+                let mut q = sqlx::query(&sql);
+                for name in &names {
+                    let v = map
+                        .get(name)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let is_blob_col = name == "data"
+                        && (*table == "file_blob" || *table == "chat_image");
+                    if is_blob_col {
+                        let bytes = match &v {
+                            serde_json::Value::String(s) => B64.decode(s)?,
+                            _ => Vec::new(),
+                        };
+                        q = q.bind(bytes);
+                    } else {
+                        // Non-blob values bind as text (or NULL); SQLite's
+                        // column affinity restores the stored type.
+                        q = q.bind(match v {
+                            serde_json::Value::Null => None::<String>,
+                            serde_json::Value::Number(n) => Some(n.to_string()),
+                            serde_json::Value::String(s) => Some(s),
+                            serde_json::Value::Bool(b) => Some(if b { "1".to_string() } else { "0".to_string() }),
+                            other => bail!("unsupported value in {}: {}", table, other),
+                        });
+                    }
+                }
+                q.execute(&mut tx).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
     }
 }
 

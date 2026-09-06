@@ -6,7 +6,9 @@ import {
   MouseEvent,
   ReactNode,
   forwardRef,
+  memo,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -221,8 +223,8 @@ const baseName = (path: string) => {
   return i < 0 ? path : path.slice(i + 1);
 };
 
-const FileTree = forwardRef<FileTreeHandle, Props>(
-  function FileTree(props, ref) {
+const FileTree = memo(
+  forwardRef<FileTreeHandle, Props>(function FileTree(props, ref) {
     const {
       files,
       rootName,
@@ -236,7 +238,10 @@ const FileTree = forwardRef<FileTreeHandle, Props>(
       onToggle,
       collapsed,
     } = props;
-    const root = buildTree(files);
+    // Building the tree is O(files) — only redo it when the file list itself
+    // changes, not on every render (selection clicks, menus, …).
+    const root = useMemo(() => buildTree(files), [files]);
+    const byId = useMemo(() => new Map(files.map((f) => [f.id, f])), [files]);
     const [menu, setMenu] = useState<MenuState>(null);
     const [editing, setEditing] = useState<EditState>(null);
     const [creating, setCreating] = useState<CreateState>(null);
@@ -259,7 +264,6 @@ const FileTree = forwardRef<FileTreeHandle, Props>(
       },
     }));
 
-    const byId = new Map(files.map((f) => [f.id, f]));
     const selectedFiles = () =>
       Array.from(selected)
         .map((id) => byId.get(id))
@@ -428,7 +432,11 @@ const FileTree = forwardRef<FileTreeHandle, Props>(
             },
           ]
         : [
-            { label: "Open", icon: VscGoToFile, onClick: () => props.onOpen(f) },
+            {
+              label: "Open",
+              icon: VscGoToFile,
+              onClick: () => props.onOpen(f),
+            },
             {
               label: "Cut",
               icon: FiScissors,
@@ -747,7 +755,16 @@ const FileTree = forwardRef<FileTreeHandle, Props>(
         <ContextMenu state={menu} onClose={() => setMenu(null)} />
       </>
     );
-  },
+  }),
+  // Re-render only when the data behind the tree changes; callbacks are
+  // closures re-created by the parent every render and always read the latest
+  // state at call time, so they're safe to skip here. This keeps dialogs,
+  // palettes and other shell state from re-rendering thousands of rows.
+  (prev, next) =>
+    prev.files === next.files &&
+    prev.rootName === next.rootName &&
+    prev.activeFileId === next.activeFileId &&
+    prev.collapsed === next.collapsed,
 );
 
 // Row wrapper that paints indent-guide lines for the ancestor levels.

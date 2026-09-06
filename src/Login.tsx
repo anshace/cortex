@@ -15,13 +15,14 @@ import {
 } from "@chakra-ui/react";
 import { motion, useReducedMotion } from "framer-motion";
 import { FormEvent, useState } from "react";
-import { FiArrowRight, FiMoon, FiSun } from "react-icons/fi";
+import { FiArrowLeft, FiArrowRight, FiMoon, FiSun } from "react-icons/fi";
 
-import { BRAND } from "./brand";
 import Logo from "./Logo";
+import { BRAND } from "./brand";
 
 type LoginProps = {
   onSuccess: () => void;
+  onBack?: () => void;
 };
 
 const MotionBox = motion(Box);
@@ -99,19 +100,24 @@ function BrandPanel({ animate }: { animate: boolean }) {
       </Box>
 
       <Box position="relative" maxW="340px">
-        <Heading size="lg" letterSpacing="-0.03em" lineHeight="1.15" fontWeight={700}>
+        <Heading
+          size="lg"
+          letterSpacing="-0.03em"
+          lineHeight="1.15"
+          fontWeight={700}
+        >
           Where your team thinks together.
         </Heading>
         <Text fontSize="sm" color="#9a9a9f" mt={3}>
-          One private {BRAND.tagline.toLowerCase()} for your org. Draft, edit, and
-          discuss in real time, all in one place.
+          One private {BRAND.tagline.toLowerCase()} for your org. Draft, edit,
+          and discuss in real time, all in one place.
         </Text>
       </Box>
     </Flex>
   );
 }
 
-function Login({ onSuccess }: LoginProps) {
+function Login({ onSuccess, onBack }: LoginProps) {
   const reduce = useReducedMotion();
   const animate = !reduce;
   const { colorMode, toggleColorMode } = useColorMode();
@@ -162,11 +168,38 @@ function Login({ onSuccess }: LoginProps) {
   }
 
   return (
-    <Grid minH="100vh" templateColumns={{ base: "1fr", md: "1.05fr 1fr" }} bg="surface.bg">
+    <Grid
+      minH="100vh"
+      templateColumns={{ base: "1fr", md: "1.05fr 1fr" }}
+      bg="surface.bg"
+    >
       <BrandPanel animate={animate} />
 
-      <Flex align="center" justify="center" px={{ base: 5, sm: 8 }} py={10} position="relative">
-        <Tooltip label={colorMode === "dark" ? "Light mode" : "Dark mode"} openDelay={300}>
+      <Flex
+        align="center"
+        justify="center"
+        px={{ base: 5, sm: 8 }}
+        py={10}
+        position="relative"
+      >
+        {onBack && (
+          <Tooltip label="Back">
+            <IconButton
+              aria-label="Back"
+              icon={<FiArrowLeft />}
+              variant="ghost"
+              color="ink.muted"
+              position="absolute"
+              top={4}
+              left={4}
+              onClick={onBack}
+            />
+          </Tooltip>
+        )}
+        <Tooltip
+          label={colorMode === "dark" ? "Light mode" : "Dark mode"}
+          openDelay={300}
+        >
           <IconButton
             aria-label="Toggle color mode"
             icon={colorMode === "dark" ? <FiSun /> : <FiMoon />}
@@ -220,7 +253,9 @@ function Login({ onSuccess }: LoginProps) {
                     letterSpacing="0.4em"
                     textAlign="center"
                     fontSize="lg"
-                    onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                    onChange={(e) =>
+                      setCode(e.target.value.replace(/\D/g, "").slice(0, 6))
+                    }
                   />
                 </FormControl>
               ) : (
@@ -272,15 +307,27 @@ function Login({ onSuccess }: LoginProps) {
               </Button>
 
               {mfa && (
-                <Button variant="link" size="sm" color="ink.muted" onClick={backToPassword} alignSelf="center">
+                <Button
+                  variant="link"
+                  size="sm"
+                  color="ink.muted"
+                  onClick={backToPassword}
+                  alignSelf="center"
+                >
                   Back to sign in
                 </Button>
               )}
             </VStack>
 
-            <Text fontSize="xs" color="ink.subtle" pt={5} borderTop="1px solid" borderColor="surface.border">
-              Access is restricted. Accounts are provisioned by an administrator.
-              There is no public sign-up.
+            <Text
+              fontSize="xs"
+              color="ink.subtle"
+              pt={5}
+              borderTop="1px solid"
+              borderColor="surface.border"
+            >
+              Access is restricted. Accounts are provisioned by an
+              administrator. There is no public sign-up.
             </Text>
           </VStack>
         </MotionBox>

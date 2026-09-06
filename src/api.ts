@@ -311,6 +311,8 @@ export async function loadBoard(
 }
 // Overwrite a board's scene (autosave). Server-side this is PUT /files/:id/blob,
 // which only accepts binary-kind files — .board uploads are always binary.
+// Overwrite a binary file's stored blob (whiteboard scene autosaves, edited
+// spreadsheets). Returns the blob revision to send with the next save.
 export async function saveBoard(
   fileId: number,
   scene: string,
@@ -325,6 +327,25 @@ export async function saveBoard(
         "X-Cortex-Revision": String(revision),
       },
       body: scene,
+    }),
+  );
+  return Number.isFinite(result.revision) ? result.revision : revision;
+}
+// Same route for arbitrary binary payloads (edited spreadsheets).
+export async function saveFileBlob(
+  fileId: number,
+  bytes: Uint8Array,
+  revision: number,
+): Promise<number> {
+  const result = await json<{ ok: true; revision: number }>(
+    await fetch(`/api/files/${fileId}/blob`, {
+      method: "PUT",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Cortex-Revision": String(revision),
+      },
+      body: bytes,
     }),
   );
   return Number.isFinite(result.revision) ? result.revision : revision;
@@ -516,6 +537,25 @@ export async function uploadChatImage(
   );
 }
 
+// Download a chat attachment (stored via /api/chat-image) as a file with its
+// original name, instead of navigating to it in a new tab.
+export async function downloadChatAttachment(
+  url: string,
+  name: string,
+): Promise<void> {
+  const res = await fetch(url, { credentials: "include" });
+  if (!res.ok) throw new Error("download failed");
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
 // ----- root owner: users -----
 export async function adminListUsers(): Promise<{ users: AdminUser[] }> {
   return json(await fetch("/api/admin/users", { credentials: "include" }));
@@ -562,4 +602,32 @@ export async function adminRenameOrg(id: number, name: string): Promise<void> {
 }
 export async function adminDeleteOrg(id: number): Promise<void> {
   await json(await fetch(`/api/admin/orgs/${id}`, opts("DELETE")));
+}
+
+// ----- root owner: whole-instance export / import -----
+// Download a zip of every table + blob; restore it into a fresh instance to
+// migrate everything at once. Importing wipes the target and signs everyone
+// out (sessions belong to the old instance).
+export async function adminExportAll(): Promise<void> {
+  const res = await fetch("/api/admin/export-all", { credentials: "include" });
+  if (!res.ok) throw new Error("export failed");
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const date = new Date().toISOString().slice(0, 10);
+  a.download = `cortex-export-${date}.zip`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+export async function adminImportAll(file: File): Promise<void> {
+  const res = await fetch("/api/admin/import-all", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/zip" },
+    body: file,
+  });
+  await json(res);
 }

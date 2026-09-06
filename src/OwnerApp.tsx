@@ -6,14 +6,15 @@ import {
   Code,
   Flex,
   HStack,
+  Icon,
   IconButton,
   Input,
   Select,
   Tab,
-  Table,
   TabList,
   TabPanel,
   TabPanels,
+  Table,
   Tabs,
   Tbody,
   Td,
@@ -22,28 +23,52 @@ import {
   Thead,
   Tooltip,
   Tr,
+  VStack,
   useColorMode,
   useToast,
-  VStack,
 } from "@chakra-ui/react";
-import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
-import { FiMoon, FiSun } from "react-icons/fi";
-import { VscChromeClose, VscKey, VscSettingsGear, VscShield, VscSignOut, VscTrash } from "react-icons/vsc";
+import {
+  FormEvent,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { FiDownload, FiMoon, FiSun, FiUpload } from "react-icons/fi";
+import {
+  VscChromeClose,
+  VscDatabase,
+  VscKey,
+  VscSettingsGear,
+  VscShield,
+  VscSignOut,
+  VscTrash,
+} from "react-icons/vsc";
 
-import * as api from "./api";
-import { AdminOrg, AdminUser, Me } from "./api";
 import Settings from "./Settings";
 import WorkspaceApp from "./WorkspaceApp";
+import * as api from "./api";
+import { AdminOrg, AdminUser, Me } from "./api";
 
 // The hidden owner console. Full control over orgs + accounts, plus "Open" to
 // enter any org as the workspace app (owner has full cross-org edit access).
-function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; onUpdated: () => void }) {
+function OwnerApp({
+  me,
+  onLogout,
+  onUpdated,
+}: {
+  me: Me;
+  onLogout: () => void;
+  onUpdated: () => void;
+}) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const toast = useToast();
   const { colorMode, toggleColorMode } = useColorMode();
   const [orgs, setOrgs] = useState<AdminOrg[]>([]);
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [browse, setBrowse] = useState<number | null>(null);
+  const importInput = useRef<HTMLInputElement>(null);
 
   // org form
   const [orgName, setOrgName] = useState("");
@@ -63,8 +88,14 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
     });
 
   const load = useCallback(() => {
-    api.adminListOrgs().then((r) => setOrgs(r.orgs)).catch(() => {});
-    api.adminListUsers().then((r) => setUsers(r.users)).catch(() => {});
+    api
+      .adminListOrgs()
+      .then((r) => setOrgs(r.orgs))
+      .catch(() => {});
+    api
+      .adminListUsers()
+      .then((r) => setUsers(r.users))
+      .catch(() => {});
   }, []);
   useEffect(load, [load]);
 
@@ -90,15 +121,48 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
     }
   }
 
+  // Importing replaces every user and clears sessions, so the signed-in owner
+  // is logged out too — route them to the login screen after it lands.
+  async function importAll(file: File) {
+    if (
+      !confirm(
+        `Replace ALL data in this instance with "${file.name}"? Everything currently here is wiped and everyone is signed out.`,
+      )
+    )
+      return;
+    toast({ title: "Importing — this can take a moment…", duration: 60000 });
+    try {
+      await api.adminImportAll(file);
+      alert("Import complete. You'll need to sign in again.");
+      onLogout();
+    } catch (e) {
+      fail(e);
+    }
+  }
+
   if (browse != null) {
-    return <WorkspaceApp me={me} orgId={browse} onExit={() => setBrowse(null)} onLogout={onLogout} />;
+    return (
+      <WorkspaceApp
+        me={me}
+        orgId={browse}
+        onExit={() => setBrowse(null)}
+        onLogout={onLogout}
+      />
+    );
   }
 
   const border = "surface.border";
 
   return (
     <Flex direction="column" h="100vh" bg="surface.bg" color="ink.base">
-      <Flex align="center" px={6} h={14} borderBottom="1px solid" borderColor={border} bg="surface.panel">
+      <Flex
+        align="center"
+        px={6}
+        h={14}
+        borderBottom="1px solid"
+        borderColor={border}
+        bg="surface.panel"
+      >
         <Box flex={1}>
           <Text fontWeight="bold">Owner console</Text>
           <Text fontSize="xs" color="ink.subtle" fontFamily="mono">
@@ -115,7 +179,9 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
               onClick={toggleColorMode}
             />
           </Tooltip>
-          <Tooltip label={settingsOpen ? "Close settings" : "Account & security"}>
+          <Tooltip
+            label={settingsOpen ? "Close settings" : "Account & security"}
+          >
             <IconButton
               aria-label="Account & security"
               icon={settingsOpen ? <VscChromeClose /> : <VscSettingsGear />}
@@ -125,7 +191,13 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
             />
           </Tooltip>
           <Tooltip label="Sign out">
-            <IconButton aria-label="Sign out" icon={<VscSignOut />} variant="ghost" color="ink.muted" onClick={onLogout} />
+            <IconButton
+              aria-label="Sign out"
+              icon={<VscSignOut />}
+              variant="ghost"
+              color="ink.muted"
+              onClick={onLogout}
+            />
           </Tooltip>
         </HStack>
       </Flex>
@@ -142,25 +214,39 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
         >
           <VscShield />
           <Text flex={1}>
-            <b>This is the owner account — the master key.</b> Protect it with an authenticator app before anything
-            else.
+            <b>This is the owner account — the master key.</b> Protect it with
+            an authenticator app before anything else.
           </Text>
-          <Button size="xs" colorScheme="blackAlpha" onClick={() => setSettingsOpen(true)}>
+          <Button
+            size="xs"
+            colorScheme="blackAlpha"
+            onClick={() => setSettingsOpen(true)}
+          >
             Enable two-factor
           </Button>
         </Flex>
       )}
 
       {settingsOpen && (
-        <Settings me={me} onClose={() => setSettingsOpen(false)} onUpdated={onUpdated} />
+        <Settings
+          me={me}
+          onClose={() => setSettingsOpen(false)}
+          onUpdated={onUpdated}
+        />
       )}
 
-      <Box flex={1} overflowY="auto" p={{ base: 5, md: 8 }} display={settingsOpen ? "none" : "block"}>
+      <Box
+        flex={1}
+        overflowY="auto"
+        p={{ base: 5, md: 8 }}
+        display={settingsOpen ? "none" : "block"}
+      >
         <Box maxW="880px" mx="auto">
           <Tabs colorScheme="brand" isLazy>
             <TabList mb={6} borderColor={border}>
               <Tab fontSize="sm">Orgs</Tab>
               <Tab fontSize="sm">Accounts</Tab>
+              <Tab fontSize="sm">Data</Tab>
             </TabList>
             <TabPanels>
               {/* Orgs */}
@@ -187,8 +273,20 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                   }}
                 >
                   <HStack spacing={3} flexWrap="wrap">
-                    <Input flex="1 1 200px" size="sm" placeholder="Org name (e.g. Dev Team)" value={orgName} onChange={(e) => setOrgName(e.target.value)} />
-                    <Input flex="0 0 160px" size="sm" placeholder="slug (e.g. dev)" value={orgSlug} onChange={(e) => setOrgSlug(e.target.value)} />
+                    <Input
+                      flex="1 1 200px"
+                      size="sm"
+                      placeholder="Org name (e.g. Dev Team)"
+                      value={orgName}
+                      onChange={(e) => setOrgName(e.target.value)}
+                    />
+                    <Input
+                      flex="0 0 160px"
+                      size="sm"
+                      placeholder="slug (e.g. dev)"
+                      value={orgSlug}
+                      onChange={(e) => setOrgSlug(e.target.value)}
+                    />
                     <Button size="sm" type="submit">
                       Create
                     </Button>
@@ -198,26 +296,54 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                 <Text fontSize="sm" fontWeight="semibold" mb={3}>
                   Orgs ({orgs.length})
                 </Text>
-                <TableCard border={border} empty={orgs.length === 0} emptyText="No orgs yet.">
+                <TableCard
+                  border={border}
+                  empty={orgs.length === 0}
+                  emptyText="No orgs yet."
+                >
                   <Thead>
                     <Tr>
-                      <Th borderColor={border} color="ink.subtle">Name</Th>
-                      <Th borderColor={border} color="ink.subtle">Slug</Th>
-                      <Th borderColor={border} color="ink.subtle" isNumeric>Members</Th>
-                      <Th borderColor={border} color="ink.subtle" isNumeric>Workspaces</Th>
+                      <Th borderColor={border} color="ink.subtle">
+                        Name
+                      </Th>
+                      <Th borderColor={border} color="ink.subtle">
+                        Slug
+                      </Th>
+                      <Th borderColor={border} color="ink.subtle" isNumeric>
+                        Members
+                      </Th>
+                      <Th borderColor={border} color="ink.subtle" isNumeric>
+                        Workspaces
+                      </Th>
                       <Th borderColor={border} />
                     </Tr>
                   </Thead>
                   <Tbody>
                     {orgs.map((o) => (
                       <Tr key={o.id} _hover={{ bg: "surface.hover" }}>
-                        <Td borderColor={border} fontWeight={500}>{o.name}</Td>
-                        <Td borderColor={border} fontFamily="mono" fontSize="xs">/{o.slug}</Td>
-                        <Td borderColor={border} isNumeric>{o.members}</Td>
-                        <Td borderColor={border} isNumeric>{o.workspaces}</Td>
+                        <Td borderColor={border} fontWeight={500}>
+                          {o.name}
+                        </Td>
+                        <Td
+                          borderColor={border}
+                          fontFamily="mono"
+                          fontSize="xs"
+                        >
+                          /{o.slug}
+                        </Td>
+                        <Td borderColor={border} isNumeric>
+                          {o.members}
+                        </Td>
+                        <Td borderColor={border} isNumeric>
+                          {o.workspaces}
+                        </Td>
                         <Td borderColor={border} textAlign="right">
                           <HStack spacing={1} justify="flex-end">
-                            <Button size="xs" colorScheme="brand" onClick={() => setBrowse(o.id)}>
+                            <Button
+                              size="xs"
+                              colorScheme="brand"
+                              onClick={() => setBrowse(o.id)}
+                            >
                               Open
                             </Button>
                             <Button
@@ -225,7 +351,11 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                               variant="ghost"
                               onClick={() => {
                                 const n = prompt("Rename org", o.name);
-                                if (n?.trim()) run(() => api.adminRenameOrg(o.id, n.trim()), "Renamed");
+                                if (n?.trim())
+                                  run(
+                                    () => api.adminRenameOrg(o.id, n.trim()),
+                                    "Renamed",
+                                  );
                               }}
                             >
                               Rename
@@ -235,8 +365,15 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                               variant="ghost"
                               colorScheme="red"
                               onClick={() => {
-                                if (confirm(`Delete org "${o.name}" and all its workspaces/chat? Users are unassigned.`))
-                                  run(() => api.adminDeleteOrg(o.id), "Org deleted");
+                                if (
+                                  confirm(
+                                    `Delete org "${o.name}" and all its workspaces/chat? Users are unassigned.`,
+                                  )
+                                )
+                                  run(
+                                    () => api.adminDeleteOrg(o.id),
+                                    "Org deleted",
+                                  );
                               }}
                             >
                               Delete
@@ -282,19 +419,56 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                 >
                   <VStack spacing={3} align="stretch">
                     <HStack spacing={3} flexWrap="wrap">
-                      <Input flex="1 1 200px" size="sm" placeholder="username" value={email} onChange={(e) => setEmail(e.target.value)} isRequired />
-                      <Input flex="1 1 140px" size="sm" placeholder="Display name" value={uname} onChange={(e) => setUname(e.target.value)} />
+                      <Input
+                        flex="1 1 200px"
+                        size="sm"
+                        placeholder="username"
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        isRequired
+                      />
+                      <Input
+                        flex="1 1 140px"
+                        size="sm"
+                        placeholder="Display name"
+                        value={uname}
+                        onChange={(e) => setUname(e.target.value)}
+                      />
                     </HStack>
                     <HStack spacing={3} flexWrap="wrap">
-                      <Input flex="1 1 200px" size="sm" type="password" placeholder="Password (min 8)" value={password} onChange={(e) => setPassword(e.target.value)} isRequired />
-                      <Select flex="0 0 110px" size="sm" value={role} onChange={(e) => setRole(e.target.value)} bg="surface.raised" borderColor={border}>
+                      <Input
+                        flex="1 1 200px"
+                        size="sm"
+                        type="password"
+                        placeholder="Password (min 8)"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        isRequired
+                      />
+                      <Select
+                        flex="0 0 110px"
+                        size="sm"
+                        value={role}
+                        onChange={(e) => setRole(e.target.value)}
+                        bg="surface.raised"
+                        borderColor={border}
+                      >
                         <option value="user">User</option>
                         <option value="admin">Admin</option>
                       </Select>
-                      <Select flex="0 0 150px" size="sm" value={uorg} onChange={(e) => setUorg(e.target.value)} bg="surface.raised" borderColor={border}>
+                      <Select
+                        flex="0 0 150px"
+                        size="sm"
+                        value={uorg}
+                        onChange={(e) => setUorg(e.target.value)}
+                        bg="surface.raised"
+                        borderColor={border}
+                      >
                         <option value="">No org</option>
                         {orgs.map((o) => (
-                          <option key={o.id} value={o.id}>{o.name}</option>
+                          <option key={o.id} value={o.id}>
+                            {o.name}
+                          </option>
                         ))}
                       </Select>
                       <Button size="sm" type="submit">
@@ -307,23 +481,55 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                 <Text fontSize="sm" fontWeight="semibold" mb={3}>
                   Accounts ({users.length})
                 </Text>
-                <TableCard border={border} empty={users.length === 0} emptyText="No accounts yet.">
+                <TableCard
+                  border={border}
+                  empty={users.length === 0}
+                  emptyText="No accounts yet."
+                >
                   <Thead>
                     <Tr>
-                      <Th borderColor={border} color="ink.subtle">Username</Th>
-                      <Th borderColor={border} color="ink.subtle">Name</Th>
-                      <Th borderColor={border} color="ink.subtle">Role</Th>
-                      <Th borderColor={border} color="ink.subtle">Org</Th>
+                      <Th borderColor={border} color="ink.subtle">
+                        Username
+                      </Th>
+                      <Th borderColor={border} color="ink.subtle">
+                        Name
+                      </Th>
+                      <Th borderColor={border} color="ink.subtle">
+                        Role
+                      </Th>
+                      <Th borderColor={border} color="ink.subtle">
+                        Org
+                      </Th>
                       <Th borderColor={border} />
                     </Tr>
                   </Thead>
                   <Tbody>
                     {users.map((u) => (
                       <Tr key={u.id} _hover={{ bg: "surface.hover" }}>
-                        <Td borderColor={border} fontFamily="mono" fontSize="xs">{u.email}</Td>
+                        <Td
+                          borderColor={border}
+                          fontFamily="mono"
+                          fontSize="xs"
+                        >
+                          {u.email}
+                        </Td>
                         <Td borderColor={border}>{u.name || "—"}</Td>
                         <Td borderColor={border}>
-                          <Select size="xs" w="90px" variant="filled" value={u.role} onChange={(e) => run(() => api.adminUpdateUser(u.id, { role: e.target.value }), "Role updated")}>
+                          <Select
+                            size="xs"
+                            w="90px"
+                            variant="filled"
+                            value={u.role}
+                            onChange={(e) =>
+                              run(
+                                () =>
+                                  api.adminUpdateUser(u.id, {
+                                    role: e.target.value,
+                                  }),
+                                "Role updated",
+                              )
+                            }
+                          >
                             <option value="user">user</option>
                             <option value="admin">admin</option>
                           </Select>
@@ -335,14 +541,22 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                             variant="filled"
                             value={u.org_id ?? ""}
                             onChange={(e) =>
-                              run(() => api.adminUpdateUser(u.id, { org_id: Number(e.target.value) }), "Org updated")
+                              run(
+                                () =>
+                                  api.adminUpdateUser(u.id, {
+                                    org_id: Number(e.target.value),
+                                  }),
+                                "Org updated",
+                              )
                             }
                           >
                             <option value="" disabled>
                               {u.org_name ?? "— none —"}
                             </option>
                             {orgs.map((o) => (
-                              <option key={o.id} value={o.id}>{o.name}</option>
+                              <option key={o.id} value={o.id}>
+                                {o.name}
+                              </option>
                             ))}
                           </Select>
                         </Td>
@@ -356,8 +570,14 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                                 variant="ghost"
                                 color="ink.muted"
                                 onClick={() => {
-                                  const pw = prompt(`New password for ${u.email} (min 8):`);
-                                  if (pw) run(() => api.adminResetPassword(u.id, pw), "Password reset");
+                                  const pw = prompt(
+                                    `New password for ${u.email} (min 8):`,
+                                  );
+                                  if (pw)
+                                    run(
+                                      () => api.adminResetPassword(u.id, pw),
+                                      "Password reset",
+                                    );
                                 }}
                               />
                             </Tooltip>
@@ -369,8 +589,15 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                                 variant="ghost"
                                 color="ink.muted"
                                 onClick={() => {
-                                  if (confirm(`Reset two-factor for ${u.email}? They'll set it up again on next login.`))
-                                    run(() => api.adminReset2fa(u.id), "Two-factor reset");
+                                  if (
+                                    confirm(
+                                      `Reset two-factor for ${u.email}? They'll set it up again on next login.`,
+                                    )
+                                  )
+                                    run(
+                                      () => api.adminReset2fa(u.id),
+                                      "Two-factor reset",
+                                    );
                                 }}
                               />
                             </Tooltip>
@@ -382,7 +609,11 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                                 variant="ghost"
                                 color="red.400"
                                 onClick={() => {
-                                  if (confirm(`Delete ${u.email}?`)) run(() => api.adminDeleteUser(u.id), "Account deleted");
+                                  if (confirm(`Delete ${u.email}?`))
+                                    run(
+                                      () => api.adminDeleteUser(u.id),
+                                      "Account deleted",
+                                    );
                                 }}
                               />
                             </Tooltip>
@@ -394,11 +625,84 @@ function OwnerApp({ me, onLogout, onUpdated }: { me: Me; onLogout: () => void; o
                 </TableCard>
               </TabPanel>
 
+              {/* Data: whole-instance export / import */}
+              <TabPanel p={0}>
+                <HStack spacing={3} mb={4} align="flex-start">
+                  <Icon as={VscDatabase} mt={1} color="brand.400" />
+                  <Text fontSize="sm" color="ink.muted">
+                    Move everything to another Cortex instance. Export packs
+                    every org, account (password hashes included), workspace,
+                    file, and chat message into one archive. Importing restores
+                    that archive on a fresh install — replacing whatever is
+                    there and signing everyone out.
+                  </Text>
+                </HStack>
+                <Box
+                  bg="surface.panel"
+                  border="1px solid"
+                  borderColor={border}
+                  borderRadius="lg"
+                  p={4}
+                >
+                  <VStack spacing={4} align="stretch">
+                    <Box>
+                      <Text fontSize="sm" fontWeight={600} mb={1}>
+                        Export
+                      </Text>
+                      <Text fontSize="xs" color="ink.subtle" mb={3}>
+                        Downloads{" "}
+                        <Code fontSize="xs">cortex-export-YYYY-MM-DD.zip</Code>.
+                        Keep it somewhere safe — it contains every password hash
+                        and secret.
+                      </Text>
+                      <Button
+                        size="sm"
+                        leftIcon={<FiDownload />}
+                        onClick={() =>
+                          run(() => api.adminExportAll(), "Export downloaded")
+                        }
+                      >
+                        Export everything (.zip)
+                      </Button>
+                    </Box>
+                    <Box borderTop="1px solid" borderColor={border} pt={4}>
+                      <Text fontSize="sm" fontWeight={600} mb={1}>
+                        Import
+                      </Text>
+                      <Text fontSize="xs" color="ink.subtle" mb={3}>
+                        Runs on a fresh Cortex install: replace all data with an
+                        export archive. This is destructive on the target —
+                        current orgs, files and chats are wiped first — and all
+                        users must sign in again afterwards.
+                      </Text>
+                      <input
+                        ref={importInput}
+                        type="file"
+                        accept=".zip"
+                        hidden
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          e.target.value = "";
+                          if (f) void importAll(f);
+                        }}
+                      />
+                      <Button
+                        size="sm"
+                        leftIcon={<FiUpload />}
+                        colorScheme="red"
+                        variant="outline"
+                        onClick={() => importInput.current?.click()}
+                      >
+                        Import archive…
+                      </Button>
+                    </Box>
+                  </VStack>
+                </Box>
+              </TabPanel>
             </TabPanels>
           </Tabs>
         </Box>
       </Box>
-
     </Flex>
   );
 }
@@ -415,7 +719,13 @@ function TableCard({
   emptyText: string;
 }) {
   return (
-    <Box bg="surface.panel" border="1px solid" borderColor={border} borderRadius="lg" overflow="hidden">
+    <Box
+      bg="surface.panel"
+      border="1px solid"
+      borderColor={border}
+      borderRadius="lg"
+      overflow="hidden"
+    >
       {empty ? (
         <Center py={12}>
           <Text fontSize="sm" color="ink.subtle">
