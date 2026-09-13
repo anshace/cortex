@@ -1,8 +1,8 @@
 // Spreadsheet viewer/editor. Parses in a worker (excelWorker.ts), renders a
 // spreadsheet-style grid: click/arrow-key cell selection, type-to-edit,
-// Ctrl+C copy (TSV), Ctrl+V paste, and save back to the server for binary
-// workbooks via the blob route (text-kind CSVs stay read-only — they're
-// plain OT documents editable in the code editor).
+// Ctrl+C copy (TSV), Ctrl+V paste, whole-row/column selection, a formula
+// bar, and insert/delete of rows & columns. Saves go back through the blob
+// route for binary workbooks and through the text route for CSVs.
 import {
   Alert,
   AlertIcon,
@@ -23,6 +23,7 @@ import {
 } from "@chakra-ui/react";
 import {
   KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -38,13 +39,14 @@ import {
   VscDiscard,
   VscEdit,
   VscFileBinary,
+  VscRemove,
   VscSave,
 } from "react-icons/vsc";
 
 import ContextMenu, { MenuState } from "./ContextMenu";
-
 import * as api from "./api";
 import { FileRow, rawUrl } from "./api";
+import { SheetOp } from "./excelWorker";
 
 type SheetRow = (string | number | boolean | null)[];
 export type SheetData = {
@@ -104,11 +106,94 @@ function normSel(sel: Sel) {
   };
 }
 
+// Clipboard write with a textarea fallback for browsers that refuse the async
+// clipboard API outside of trusted-gesture contexts.
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function escapeCsv(v: string) {
+  return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
+
+// Remap edited-cell keys through a structural op.
+function remapEdits(
+  edits: Record<string, string>,
+  op: SheetOp,
+): Record<string, string> {
+  const next: Record<string, string> = {};
+  for (const [k, v] of Object.entries(edits)) {
+    let [r, c] = k.split(":").map(Number);
+    if (op.type === "insertRow" && r >= op.index) r += 1;
+    else if (op.type === "deleteRow") {
+      if (r === op.index) continue;
+      if (r > op.index) r -= 1;
+    } else if (op.type === "insertCol" && c >= op.index) c += 1;
+    else if (op.type === "deleteCol") {
+      if (c === op.index) continue;
+      if (c > op.index) c -= 1;
+    }
+    next[`${r}:${c}`] = v;
+  }
+  return next;
+}
+
+// Remap a selection through a structural op (deleted coordinates clamp).
+function remapSel(sel: Sel, op: SheetOp): Sel {
+  const shift = (v: number, del: boolean) =>
+    del ? Math.min(v, op.index) : v >= op.index ? v + 1 : v;
+  if (op.type === "insertRow")
+    return {
+      ar: shift(sel.ar, false),
+      ac: sel.ac,
+      fr: shift(sel.fr, false),
+      fc: sel.fc,
+    };
+  if (op.type === "deleteRow")
+    return {
+      ar: shift(sel.ar, true),
+      ac: sel.ac,
+      fr: shift(sel.fr, true),
+      fc: sel.fc,
+    };
+  if (op.type === "insertCol")
+    return {
+      ar: sel.ar,
+      ac: shift(sel.ac, false),
+      fr: sel.fr,
+      fc: shift(sel.fc, false),
+    };
+  return {
+    ar: sel.ar,
+    ac: shift(sel.ac, true),
+    fr: sel.fr,
+    fc: shift(sel.fc, true),
+  };
+}
+
 type GridProps = {
   sheet: SheetData;
   edits: Record<string, string>;
   onEdit: (row: number, col: number, value: string) => void;
   onEditsClear: () => void;
+  onStructural: (op: SheetOp) => void;
   editable: boolean;
   search: string;
   firstRowHeader: boolean;
@@ -122,6 +207,7 @@ function SheetGrid({
   edits,
   onEdit,
   onEditsClear,
+  onStructural,
   editable,
   search,
   firstRowHeader,
@@ -186,7 +272,7 @@ function SheetGrid({
     [edits, sheet.data, sheet.startRow, sheet.startColumn],
   );
 
-  const copySelection = useCallback(() => {
+  const selectionTsv = useCallback(() => {
     const { r0, r1, c0, c1 } = normSel(sel);
     const lines: string[] = [];
     for (let r = r0; r <= r1; r++) {
@@ -197,8 +283,12 @@ function SheetGrid({
       }
       lines.push(cells.join("\t"));
     }
-    navigator.clipboard?.writeText(lines.join("\n")).catch(() => {});
+    return lines.join("\n");
   }, [sel, valueAt]);
+
+  const copySelection = useCallback(() => {
+    void copyText(selectionTsv());
+  }, [selectionTsv]);
 
   const pasteText = useCallback(
     (text: string) => {
@@ -243,9 +333,30 @@ function SheetGrid({
     else setSel({ ar: r, ac: c, fr: r, fc: c });
   };
 
+  const selectRow = (r: number, extend: boolean) =>
+    setSel((s) => ({
+      ar: extend ? s.ar : r,
+      ac: sheet.startColumn,
+      fr: r,
+      fc: sheet.startColumn + columns - 1,
+    }));
+  const selectColumn = (c: number, extend: boolean) =>
+    setSel((s) => ({
+      ar: sheet.startRow,
+      ac: extend ? s.ac : c,
+      fr: sheet.startRow + sheet.data.length - 1,
+      fc: c,
+    }));
+
+  const clearRange = () => {
+    if (!editable) return;
+    const { r0, r1, c0, c1 } = normSel(sel);
+    for (let r = r0; r <= r1; r++)
+      for (let c = c0; c <= c1; c++) onEdit(r, c, "");
+  };
+
   const onKeyDown = (e: ReactKeyboardEvent) => {
     if (editing) return; // the input handles its own keys
-    const { r0, r1, c0, c1 } = normSel(sel);
     const move = (dr: number, dc: number) => {
       e.preventDefault();
       const r = Math.max(sheet.startRow, sel.fr + dr);
@@ -272,19 +383,39 @@ function SheetGrid({
         fr: lastRow,
         fc: sheet.startColumn + columns - 1,
       });
+    } else if (e.shiftKey && e.key === " ") {
+      // Shift+Space: select the whole focused row (Excel muscle memory).
+      e.preventDefault();
+      selectRow(sel.fr, false);
+    } else if ((e.ctrlKey || e.metaKey) && e.key === " ") {
+      // Ctrl+Space: select the whole focused column.
+      e.preventDefault();
+      selectColumn(sel.fc, false);
     } else if (e.key === "ArrowUp") move(-1, 0);
     else if (e.key === "ArrowDown") move(1, 0);
     else if (e.key === "ArrowLeft") move(0, -1);
     else if (e.key === "ArrowRight") move(0, 1);
     else if (e.key === "Tab") move(0, e.shiftKey ? -1 : 1);
-    else if (e.key === "Enter" || e.key === "F2") {
+    else if (e.key === "Home" || e.key === "End") {
+      e.preventDefault();
+      const last = sheet.startColumn + columns - 1;
+      const target = e.key === "Home" ? sheet.startColumn : last;
+      setSel(
+        e.ctrlKey
+          ? { ar: sheet.startRow, ac: target, fr: sheet.startRow, fc: target }
+          : { ...sel, ac: target, fc: target },
+      );
+    } else if (e.key === "PageUp" || e.key === "PageDown") {
+      e.preventDefault();
+      setPage((v) =>
+        Math.min(pages - 1, Math.max(0, v + (e.key === "PageDown" ? 1 : -1))),
+      );
+    } else if (e.key === "Enter" || e.key === "F2") {
       e.preventDefault();
       startEdit(sel.fr, sel.fc);
     } else if (e.key === "Delete" || e.key === "Backspace") {
-      if (!editable) return;
       e.preventDefault();
-      for (let r = r0; r <= r1; r++)
-        for (let c = c0; c <= c1; c++) onEdit(r, c, "");
+      clearRange();
     } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
       if (!editable) return;
       e.preventDefault();
@@ -297,6 +428,89 @@ function SheetGrid({
     return r >= r0 && r <= r1 && c >= c0 && c <= c1;
   };
 
+  const structuralMenu = (
+    e: ReactMouseEvent,
+    r: number,
+    c: number,
+  ): NonNullable<MenuState> => ({
+    x: e.clientX,
+    y: e.clientY,
+    actions: [
+      {
+        label: "Insert row above",
+        divider: true,
+        icon: VscEdit,
+        onClick: () => {
+          onStructural({ type: "insertRow", index: r });
+          setSel((s) => remapSel(s, { type: "insertRow", index: r }));
+        },
+      },
+      {
+        label: "Insert column left",
+        icon: VscEdit,
+        onClick: () => {
+          onStructural({ type: "insertCol", index: c });
+          setSel((s) => remapSel(s, { type: "insertCol", index: c }));
+        },
+      },
+      {
+        label: "Delete row",
+        danger: true,
+        icon: VscRemove,
+        onClick: () => {
+          onStructural({ type: "deleteRow", index: r });
+          setSel((s) => remapSel(s, { type: "deleteRow", index: r }));
+        },
+      },
+      {
+        label: "Delete column",
+        danger: true,
+        icon: VscRemove,
+        onClick: () => {
+          onStructural({ type: "deleteCol", index: c });
+          setSel((s) => remapSel(s, { type: "deleteCol", index: c }));
+        },
+      },
+    ],
+  });
+
+  const cellMenu = (r: number, c: number, e: ReactMouseEvent) => {
+    e.preventDefault();
+    if (!isSel(r, c)) setSel({ ar: r, ac: c, fr: r, fc: c });
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      actions: [
+        {
+          label: "Copy",
+          icon: VscCopy,
+          onClick: () => void copyText(selectionTsv()),
+        },
+        ...(editable
+          ? [
+              {
+                label: "Paste",
+                icon: VscEdit,
+                onClick: () => {
+                  navigator.clipboard
+                    ?.readText()
+                    .then((t) => pasteText(t))
+                    .catch(() => {});
+                },
+              },
+              {
+                label: "Edit cell",
+                icon: VscEdit,
+                onClick: () => startEdit(r, c),
+              },
+              { label: "Clear cells", icon: VscClearAll, onClick: clearRange },
+            ]
+          : []),
+        ...(editable ? structuralMenu(e, r, c).actions : []),
+      ],
+    });
+  };
+
   const headerCells = Array.from({ length: columns }, (_, k) => {
     const c = sheet.startColumn + k;
     const name =
@@ -307,14 +521,23 @@ function SheetGrid({
     return (
       <chakra.th
         key={c}
-        onClick={(e) =>
-          setSel({
-            ar: sheet.startRow,
-            ac: c,
-            fr: e.shiftKey ? sel.fr : sheet.startRow + sheet.data.length - 1,
-            fc: c,
-          })
-        }
+        onClick={(e) => selectColumn(c, e.shiftKey)}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          selectColumn(c, false);
+          setMenu({
+            x: e.clientX,
+            y: e.clientY,
+            actions: [
+              {
+                label: `Copy column ${columnName(c)}`,
+                icon: VscCopy,
+                onClick: () => void copyText(selectionTsv()),
+              },
+              ...(editable ? structuralMenu(e, sheet.startRow, c).actions : []),
+            ],
+          });
+        }}
         sx={{
           position: "sticky",
           top: 0,
@@ -341,6 +564,8 @@ function SheetGrid({
     );
   });
 
+  const focusRef = `${columnName(sel.fc)}${sel.fr + 1}`;
+
   return (
     <Flex
       direction="column"
@@ -353,6 +578,54 @@ function SheetGrid({
       onMouseDown={() => gridRef.current?.focus()}
       _focusVisible={{ boxShadow: "none" }}
     >
+      {/* Formula bar: shows the focused cell and edits it directly. */}
+      <Flex
+        align="center"
+        gap={2}
+        px={3}
+        py={1}
+        bg="surface.panel"
+        borderBottom="1px solid"
+        borderColor="surface.border"
+        flexShrink={0}
+      >
+        <Text
+          fontSize="11px"
+          fontFamily="mono"
+          color="ink.subtle"
+          minW="52px"
+          fontWeight={600}
+        >
+          {focusRef}
+        </Text>
+        <Box h="16px" w="1px" bg="surface.border" />
+        <Input
+          aria-label="Formula bar"
+          variant="unstyled"
+          size="xs"
+          fontSize="12px"
+          fontFamily="mono"
+          placeholder={
+            editable
+              ? "Enter a value for the selected cell…"
+              : "Selected cell value"
+          }
+          isReadOnly={!editable}
+          value={editing ? editing.value : valueAt(sel.fr, sel.fc)}
+          onChange={(e) => {
+            if (editing) setEditing({ ...editing, value: e.target.value });
+            else onEdit(sel.fr, sel.fc, e.target.value);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              if (editing) commitEdit("down");
+              gridRef.current?.focus();
+            }
+          }}
+        />
+      </Flex>
+
       <Box flex={1} minH={0} overflow="auto" bg="surface.bg">
         <chakra.table
           sx={{
@@ -372,19 +645,33 @@ function SheetGrid({
               return (
                 <chakra.tr key={r}>
                   <chakra.th
-                    onClick={(e) =>
-                      setSel({
-                        ar: r,
-                        ac: sheet.startColumn,
-                        fr: e.shiftKey ? sel.fr : r,
-                        fc: sheet.startColumn + columns - 1,
-                      })
-                    }
+                    onClick={(e) => selectRow(r, e.shiftKey)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      selectRow(r, false);
+                      setMenu({
+                        x: e.clientX,
+                        y: e.clientY,
+                        actions: [
+                          {
+                            label: `Copy row ${r + 1}`,
+                            icon: VscCopy,
+                            onClick: () => void copyText(selectionTsv()),
+                          },
+                          ...(editable
+                            ? structuralMenu(e, r, sheet.startColumn).actions
+                            : []),
+                        ],
+                      });
+                    }}
                     sx={{
                       position: "sticky",
                       left: 0,
                       zIndex: 1,
-                      bg: "surface.hover",
+                      bg:
+                        sel.ar <= r && r <= sel.fr
+                          ? "rgba(107,91,255,0.16)"
+                          : "surface.hover",
                       color: "ink.subtle",
                       fontWeight: 400,
                       fontSize: "10.5px",
@@ -429,56 +716,7 @@ function SheetGrid({
                         }}
                         onMouseUp={() => (dragging.current = false)}
                         onDoubleClick={() => startEdit(r, c)}
-                        onContextMenu={(e) => {
-                          e.preventDefault();
-                          if (!isSel(r, c))
-                            setSel({ ar: r, ac: c, fr: r, fc: c });
-                          setMenu({
-                            x: e.clientX,
-                            y: e.clientY,
-                            actions: [
-                              { label: "Copy", icon: VscCopy, onClick: copySelection },
-                              ...(editable
-                                ? [
-                                    {
-                                      label: "Paste",
-                                      icon: VscEdit,
-                                      onClick: () => {
-                                        navigator.clipboard
-                                          ?.readText()
-                                          .then((t) => pasteText(t))
-                                          .catch(() => {});
-                                      },
-                                    },
-                                    {
-                                      label: "Edit cell",
-                                      icon: VscEdit,
-                                      onClick: () => startEdit(r, c),
-                                    },
-                                    {
-                                      label: "Clear cells",
-                                      icon: VscClearAll,
-                                      danger: true,
-                                      onClick: () => {
-                                        const box = normSel(sel);
-                                        for (
-                                          let rr = box.r0;
-                                          rr <= box.r1;
-                                          rr++
-                                        )
-                                          for (
-                                            let cc = box.c0;
-                                            cc <= box.c1;
-                                            cc++
-                                          )
-                                            onEdit(rr, cc, "");
-                                      },
-                                    },
-                                  ]
-                                : []),
-                            ],
-                          });
-                        }}
+                        onContextMenu={(e) => cellMenu(r, c, e)}
                         sx={{
                           px: 2,
                           py: "3px",
@@ -558,10 +796,10 @@ function SheetGrid({
 
       <ContextMenu state={menu} onClose={() => setMenu(null)} />
 
-      {/* Bottom bar: pagination + selection summary + clipboard actions. */}
+      {/* Bottom bar: pagination + selection summary + clipboard + structure. */}
       <Flex
         align="center"
-        gap={3}
+        gap={2}
         px={3}
         py={1}
         borderTop="1px solid"
@@ -603,6 +841,68 @@ function SheetGrid({
             return `${columnName(c0)}${r0 + 1}:${columnName(c1)}${r1 + 1} · ${n.toLocaleString()} cells`;
           })()}
         </Text>
+        {editable && (
+          <HStack spacing={1}>
+            <Tooltip label="Insert row above selection" openDelay={400}>
+              <Button
+                size="xs"
+                variant="ghost"
+                px={2}
+                onClick={() => {
+                  onStructural({ type: "insertRow", index: sel.fr });
+                  setSel((s) =>
+                    remapSel(s, { type: "insertRow", index: sel.fr }),
+                  );
+                }}
+              >
+                + Row
+              </Button>
+            </Tooltip>
+            <Tooltip label="Delete selected rows" openDelay={400}>
+              <IconButton
+                aria-label="Delete selected rows"
+                icon={<Icon as={VscRemove} />}
+                size="xs"
+                variant="ghost"
+                onClick={() => {
+                  const { r0, r1 } = normSel(sel);
+                  const op = { type: "deleteRow" as const, index: r0 };
+                  for (let k = r0; k <= r1; k++) onStructural(op);
+                  setSel((s) => remapSel(s, op));
+                }}
+              />
+            </Tooltip>
+            <Tooltip label="Insert column left of selection" openDelay={400}>
+              <Button
+                size="xs"
+                variant="ghost"
+                px={2}
+                onClick={() => {
+                  onStructural({ type: "insertCol", index: sel.ac });
+                  setSel((s) =>
+                    remapSel(s, { type: "insertCol", index: sel.ac }),
+                  );
+                }}
+              >
+                + Col
+              </Button>
+            </Tooltip>
+            <Tooltip label="Delete selected columns" openDelay={400}>
+              <IconButton
+                aria-label="Delete selected columns"
+                icon={<Icon as={VscClearAll} />}
+                size="xs"
+                variant="ghost"
+                onClick={() => {
+                  const { c0, c1 } = normSel(sel);
+                  const op = { type: "deleteCol" as const, index: c0 };
+                  for (let k = c0; k <= c1; k++) onStructural(op);
+                  setSel((s) => remapSel(s, op));
+                }}
+              />
+            </Tooltip>
+          </HStack>
+        )}
         <Button
           size="xs"
           variant="ghost"
@@ -631,13 +931,16 @@ function SpreadsheetView({ file }: { file: FileRow }) {
   const toast = useToast();
   const name = file.path.split("/").pop() ?? file.path;
   const ext = extension(name);
-  const editable = file.kind === "binary";
+  // Binary workbooks save through the blob route; CSVs are text-kind
+  // documents and save through the text route.
+  const binary = file.kind === "binary";
   const [sheets, setSheets] = useState<SheetData[]>([]);
   const [omittedSheets, setOmittedSheets] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [active, setActive] = useState(0);
   const [edits, setEdits] = useState<SheetEdits>({});
+  const [ops, setOps] = useState<Record<string, SheetOp[]>>({});
   const [saving, setSaving] = useState(false);
   const [search, setSearch] = useState("");
   const [firstRowHeader, setFirstRowHeader] = useState(true);
@@ -663,6 +966,7 @@ function SpreadsheetView({ file }: { file: FileRow }) {
         setOmittedSheets(result.omittedSheets);
         setActive(0);
         setEdits({});
+        setOps({});
       } else setError(result.error || "Failed to load spreadsheet");
       setLoading(false);
       worker.terminate();
@@ -712,6 +1016,8 @@ function SpreadsheetView({ file }: { file: FileRow }) {
     (n, m) => n + Object.keys(m).length,
     0,
   );
+  const opCount = Object.values(ops).reduce((n, m) => n + m.length, 0);
+  const dirty = editCount > 0 || opCount > 0;
 
   const onEdit = (row: number, col: number, value: string) => {
     if (!sheet) return;
@@ -724,6 +1030,56 @@ function SpreadsheetView({ file }: { file: FileRow }) {
     }));
   };
 
+  // Apply one structural change: record it for the save payload, shift this
+  // sheet's pending edits, and update the previewed data in place so the grid
+  // reflects the change immediately.
+  const onStructural = (op: SheetOp) => {
+    if (!sheet) return;
+    const nm = sheet.name;
+    setOps((prev) => ({ ...prev, [nm]: [...(prev[nm] ?? []), op] }));
+    setEdits((prev) =>
+      prev[nm] ? { ...prev, [nm]: remapEdits(prev[nm], op) } : prev,
+    );
+    setSheets((prev) =>
+      prev.map((s) => {
+        if (s.name !== nm) return s;
+        const insert = op.type.startsWith("insert");
+        const isRow = op.type.endsWith("Row");
+        const pos = isRow ? op.index - s.startRow : op.index - s.startColumn;
+        let data = s.data;
+        if (isRow) {
+          if (pos >= 0 && pos <= data.length) {
+            data = [...data];
+            if (insert)
+              data.splice(
+                pos,
+                0,
+                new Array(Math.max(1, data[0]?.length ?? 1)).fill(null),
+              );
+            else data.splice(pos, 1);
+          }
+        } else {
+          data = data.map((row) => {
+            const r = [...(row ?? [])];
+            if (pos >= 0 && pos <= r.length) {
+              if (insert) r.splice(pos, 0, null);
+              else r.splice(pos, 1);
+            }
+            return r;
+          });
+        }
+        return {
+          ...s,
+          data,
+          totalRows: isRow ? s.totalRows + (insert ? 1 : -1) : s.totalRows,
+          totalColumns: !isRow
+            ? s.totalColumns + (insert ? 1 : -1)
+            : s.totalColumns,
+        };
+      }),
+    );
+  };
+
   const revert = () =>
     setEdits((prev) => {
       if (!sheet) return prev;
@@ -732,13 +1088,33 @@ function SpreadsheetView({ file }: { file: FileRow }) {
       return next;
     });
 
+  const exportCsv = () => {
+    if (!sheet) return;
+    const csv = sheet.data
+      .map((row) =>
+        (row ?? [])
+          .map((cell) => escapeCsv(cell == null ? "" : String(cell)))
+          .join(","),
+      )
+      .join("\r\n");
+    const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${sheet.name.replace(/[^\w.-]+/g, "_") || "sheet"}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
   const save = async () => {
     if (!sheet || saving) return;
     const buf = original.current;
     if (!buf) return;
     setSaving(true);
     try {
-      const payload: Record<
+      const editPayload: Record<
         string,
         { row: number; col: number; value: string | number | boolean }[]
       > = {};
@@ -747,7 +1123,7 @@ function SpreadsheetView({ file }: { file: FileRow }) {
           const [r, c] = key.split(":").map(Number);
           return { row: r, col: c, value: coerce(value) };
         });
-        if (list.length) payload[sheetName] = list;
+        if (list.length) editPayload[sheetName] = list;
       }
       const worker = new Worker(new URL("./excelWorker", import.meta.url), {
         type: "module",
@@ -769,19 +1145,27 @@ function SpreadsheetView({ file }: { file: FileRow }) {
             id: 2,
             cmd: "save",
             buf: transferable,
-            edits: payload,
+            edits: editPayload,
+            ops,
             bookType: ext === "xls" ? "xls" : ext === "csv" ? "csv" : "xlsx",
           },
           [transferable],
         );
       }).finally(() => worker.terminate());
-      revision.current = await api.saveFileBlob(
-        file.id,
-        new Uint8Array(out),
-        revision.current,
-      );
-      original.current = out;
+      if (binary) {
+        revision.current = await api.saveFileBlob(
+          file.id,
+          new Uint8Array(out),
+          revision.current,
+        );
+        original.current = out;
+      } else {
+        // CSVs are text documents: write the serialized CSV back through the
+        // text route.
+        await api.saveFileText(file.id, new TextDecoder().decode(out));
+      }
       setEdits({});
+      setOps({});
       toast({ title: "Spreadsheet saved", status: "success", duration: 2000 });
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Save failed";
@@ -797,7 +1181,7 @@ function SpreadsheetView({ file }: { file: FileRow }) {
         setLoading(true);
         setSheets([]);
         setEdits({});
-        // Reload: bumping state below re-triggers the load effect.
+        setOps({});
         setReloadKey((k) => k + 1);
       }
     } finally {
@@ -867,26 +1251,34 @@ function SpreadsheetView({ file }: { file: FileRow }) {
             {sheet.truncated ? " · preview limited for performance" : ""}
           </Text>
         )}
-        {editable && editCount > 0 && (
+        {dirty && (
           <Text fontSize="11px" color="orange.400" fontWeight={600}>
-            {editCount} unsaved change{editCount === 1 ? "" : "s"}
+            {editCount + opCount} unsaved change
+            {editCount + opCount === 1 ? "" : "s"}
           </Text>
         )}
-        {editable && (
-          <Button
+        <Button
+          size="xs"
+          leftIcon={<Icon as={VscSave} />}
+          isLoading={saving}
+          isDisabled={!dirty}
+          onClick={() => void save()}
+        >
+          Save
+        </Button>
+        <Tooltip label="Download this sheet as CSV" openDelay={300}>
+          <IconButton
+            aria-label="Export sheet as CSV"
+            icon={<Icon as={VscDesktopDownload} />}
             size="xs"
-            leftIcon={<Icon as={VscSave} />}
-            isLoading={saving}
-            isDisabled={editCount === 0}
-            onClick={() => void save()}
-          >
-            Save
-          </Button>
-        )}
-        <Tooltip label="Download" openDelay={300}>
+            variant="ghost"
+            onClick={exportCsv}
+          />
+        </Tooltip>
+        <Tooltip label="Download original file" openDelay={300}>
           <IconButton
             aria-label="Download spreadsheet"
-            icon={<Icon as={VscDesktopDownload} />}
+            icon={<Icon as={VscFileBinary} />}
             size="xs"
             variant="ghost"
             onClick={() =>
@@ -902,13 +1294,6 @@ function SpreadsheetView({ file }: { file: FileRow }) {
         </Tooltip>
       </Flex>
 
-      {!editable && (
-        <Alert status="info" py={1} fontSize="xs" flexShrink={0}>
-          <AlertIcon boxSize="14px" />
-          This CSV opens read-only here — edit it as a text file, or convert to
-          .xlsx for spreadsheet editing.
-        </Alert>
-      )}
       {omittedSheets > 0 && (
         <Alert status="warning" py={1} fontSize="xs" flexShrink={0}>
           <AlertIcon boxSize="14px" />
@@ -925,7 +1310,8 @@ function SpreadsheetView({ file }: { file: FileRow }) {
           edits={sheetEdits}
           onEdit={onEdit}
           onEditsClear={revert}
-          editable={editable}
+          onStructural={onStructural}
+          editable
           search={search}
           firstRowHeader={firstRowHeader}
         />
@@ -947,7 +1333,9 @@ function SpreadsheetView({ file }: { file: FileRow }) {
         >
           {sheets.map((s, i) => {
             const isActive = i === active;
-            const dirty = Object.keys(edits[s.name] ?? {}).length > 0;
+            const dirtySheet =
+              Object.keys(edits[s.name] ?? {}).length > 0 ||
+              (ops[s.name]?.length ?? 0) > 0;
             return (
               <Flex
                 key={s.name}
@@ -969,7 +1357,7 @@ function SpreadsheetView({ file }: { file: FileRow }) {
                 onClick={() => setActive(i)}
               >
                 {s.name}
-                {dirty && (
+                {dirtySheet && (
                   <Box boxSize="6px" borderRadius="full" bg="orange.400" />
                 )}
               </Flex>

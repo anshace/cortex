@@ -1,24 +1,24 @@
 import { ChakraProvider, ColorModeScript } from "@chakra-ui/react";
-import { loader } from "@monaco-editor/react";
-import * as monaco from "monaco-editor";
-import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
-import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
-import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
-import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
-import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
-import { StrictMode } from "react";
-import { createRoot } from "react-dom/client";
-import "rustpad-wasm";
-
-import AuthGate from "./AuthGate";
-import theme from "./theme";
 // Self-hosted variable fonts (CSP is font-src 'self'; no CDN) — the design
 // system's Inter/JetBrains Mono stack now actually renders as designed.
 import "@fontsource-variable/inter";
 import "@fontsource-variable/inter/wght-italic.css";
 import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/500.css";
+import { loader } from "@monaco-editor/react";
+import * as monaco from "monaco-editor";
+import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
+import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
+import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
+import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
+import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import "rustpad-wasm";
+
+import AuthGate from "./AuthGate";
 import "./index.css";
+import theme from "./theme";
 
 // Serve Monaco from our own bundle, not the jsdelivr CDN that @monaco-editor/react
 // loads by default — the CDN is blocked by our CSP and would break offline / on a
@@ -27,8 +27,10 @@ import "./index.css";
 self.MonacoEnvironment = {
   getWorker(_workerId, label) {
     if (label === "json") return new jsonWorker();
-    if (label === "css" || label === "scss" || label === "less") return new cssWorker();
-    if (label === "html" || label === "handlebars" || label === "razor") return new htmlWorker();
+    if (label === "css" || label === "scss" || label === "less")
+      return new cssWorker();
+    if (label === "html" || label === "handlebars" || label === "razor")
+      return new htmlWorker();
     if (label === "typescript" || label === "javascript") return new tsWorker();
     return new editorWorker();
   },

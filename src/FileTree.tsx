@@ -1008,7 +1008,12 @@ function TreeItem(
               onCancel={onCancelCreate}
             />
           )}
-          <ChunkedChildren props={props} node={node} folderPath={folderPath} depth={depth} />
+          <ChunkedChildren
+            props={props}
+            node={node}
+            folderPath={folderPath}
+            depth={depth}
+          />
         </>
       )}
     </Box>
