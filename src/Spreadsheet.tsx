@@ -32,12 +32,16 @@ import {
 import {
   VscChevronLeft,
   VscChevronRight,
+  VscClearAll,
   VscCopy,
   VscDesktopDownload,
   VscDiscard,
+  VscEdit,
   VscFileBinary,
   VscSave,
 } from "react-icons/vsc";
+
+import ContextMenu, { MenuState } from "./ContextMenu";
 
 import * as api from "./api";
 import { FileRow, rawUrl } from "./api";
@@ -124,6 +128,7 @@ function SheetGrid({
 }: GridProps) {
   const gridRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
+  const [menu, setMenu] = useState<MenuState>(null);
   const [sel, setSel] = useState<Sel>({
     ar: sheet.startRow,
     ac: sheet.startColumn,
@@ -345,6 +350,7 @@ function SheetGrid({
       tabIndex={0}
       ref={gridRef}
       onKeyDown={onKeyDown}
+      onMouseDown={() => gridRef.current?.focus()}
       _focusVisible={{ boxShadow: "none" }}
     >
       <Box flex={1} minH={0} overflow="auto" bg="surface.bg">
@@ -423,6 +429,56 @@ function SheetGrid({
                         }}
                         onMouseUp={() => (dragging.current = false)}
                         onDoubleClick={() => startEdit(r, c)}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          if (!isSel(r, c))
+                            setSel({ ar: r, ac: c, fr: r, fc: c });
+                          setMenu({
+                            x: e.clientX,
+                            y: e.clientY,
+                            actions: [
+                              { label: "Copy", icon: VscCopy, onClick: copySelection },
+                              ...(editable
+                                ? [
+                                    {
+                                      label: "Paste",
+                                      icon: VscEdit,
+                                      onClick: () => {
+                                        navigator.clipboard
+                                          ?.readText()
+                                          .then((t) => pasteText(t))
+                                          .catch(() => {});
+                                      },
+                                    },
+                                    {
+                                      label: "Edit cell",
+                                      icon: VscEdit,
+                                      onClick: () => startEdit(r, c),
+                                    },
+                                    {
+                                      label: "Clear cells",
+                                      icon: VscClearAll,
+                                      danger: true,
+                                      onClick: () => {
+                                        const box = normSel(sel);
+                                        for (
+                                          let rr = box.r0;
+                                          rr <= box.r1;
+                                          rr++
+                                        )
+                                          for (
+                                            let cc = box.c0;
+                                            cc <= box.c1;
+                                            cc++
+                                          )
+                                            onEdit(rr, cc, "");
+                                      },
+                                    },
+                                  ]
+                                : []),
+                            ],
+                          });
+                        }}
                         sx={{
                           px: 2,
                           py: "3px",
@@ -499,6 +555,8 @@ function SheetGrid({
           </Center>
         )}
       </Box>
+
+      <ContextMenu state={menu} onClose={() => setMenu(null)} />
 
       {/* Bottom bar: pagination + selection summary + clipboard actions. */}
       <Flex

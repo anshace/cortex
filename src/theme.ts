@@ -8,7 +8,7 @@ const config: ThemeConfig = {
   useSystemColorMode: false,
 };
 
-const fontStack = `"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif`;
+const fontStack = `"Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif`;
 
 const theme = extendTheme({
   config,
@@ -80,12 +80,29 @@ const theme = extendTheme({
         bg: "surface.bg",
         color: "ink.base",
         WebkitFontSmoothing: "antialiased",
+        MozOsxFontSmoothing: "grayscale",
+        fontFeatureSettings: "'cv02', 'cv03', 'cv04', 'ss01'",
+        textRendering: "optimizeLegibility",
+      },
+      // Headings get display-style tracking everywhere at once.
+      "h1, h2, h3, h4, h5, h6": {
+        letterSpacing: "-0.02em",
+        textWrap: "balance",
       },
       "::selection": { background: "rgba(109,94,252,0.35)" },
+      "*:focus-visible": {
+        outline: "2px solid rgba(139,123,255,0.7)",
+        outlineOffset: "1px",
+      },
       "*::-webkit-scrollbar": { width: "10px", height: "10px" },
       "*::-webkit-scrollbar-thumb": {
         background: "var(--chakra-colors-surface-borderStrong)",
         borderRadius: "8px",
+        border: "2px solid transparent",
+        backgroundClip: "content-box",
+      },
+      "*::-webkit-scrollbar-thumb:hover": {
+        background: "var(--chakra-colors-ink-subtle)",
         border: "2px solid transparent",
         backgroundClip: "content-box",
       },
@@ -99,7 +116,7 @@ const theme = extendTheme({
         fontWeight: 600,
         borderRadius: "lg",
         letterSpacing: "-0.01em",
-        transition: "background 0.12s ease, transform 0.06s ease",
+        transition: "background 0.12s ease, transform 0.06s ease, box-shadow 0.12s ease",
         _focusVisible: { boxShadow: "outline" },
         _active: { transform: "translateY(0.5px)" },
       },
@@ -112,6 +129,8 @@ const theme = extendTheme({
         },
       },
     },
+    // Panels, dialogs and menus: layered hairline surfaces with a shared
+    // elevation so popovers read as physically stacked.
     Input: {
       defaultProps: { focusBorderColor: "brand.500" },
       variants: {
