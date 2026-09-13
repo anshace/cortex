@@ -51,6 +51,7 @@ import BinaryView from "./BinaryView";
 import HtmlPreview from "./HtmlPreview";
 import Logo from "./Logo";
 import MarkdownPreview from "./MarkdownPreview";
+import SoloEditor from "./SoloEditor";
 import Whiteboard from "./Whiteboard";
 import * as api from "./api";
 import { FileRow } from "./api";
@@ -64,6 +65,10 @@ import { fileIcon } from "./fileIcon";
 import Rustpad, { UserInfo } from "./rustpad";
 
 type Connection = "connected" | "disconnected" | "desynchronized";
+
+// Text files above this size open in the solo autosaving editor instead of
+// the live OT session, which degrades at this scale.
+const SOLO_SIZE_LIMIT = 512 * 1024;
 
 export type EditorGroupData = { files: FileRow[]; activeFileId: number | null };
 
@@ -690,7 +695,12 @@ function EditorGroup({
   // Whiteboard files (.board) open in the Excalidraw canvas, not Monaco.
   const isBoard = /\.board$/i.test(activeFile?.path ?? "");
   const isBinary = activeFile?.kind === "binary" && !isBoard;
-  const docId = isBinary || isBoard ? undefined : activeFile?.doc_id;
+  // Oversized text files skip the live OT session (it degrades / disconnects
+  // at this scale) and open in a private, autosaving editor instead.
+  const isOversized =
+    !isBinary && !isBoard && (activeFile?.size ?? 0) > SOLO_SIZE_LIMIT;
+  const docId =
+    isBinary || isBoard || isOversized ? undefined : activeFile?.doc_id;
   const autoLang = activeFile ? extToLang(activeFile.path) : "plaintext";
   const language = langOverride ?? autoLang;
   const isMarkdown = /\.(md|markdown)$/i.test(activeFile?.path ?? "");
@@ -755,7 +765,7 @@ function EditorGroup({
   // binary files / the Settings tab).
   useEffect(() => {
     // Boards / binary files / Settings carry their own chrome, no text status bar.
-    if (isBinary || isBoard || settingsHere) {
+    if (isBinary || isBoard || isOversized || settingsHere) {
       onStatus(index, null);
       return;
     }
@@ -787,6 +797,7 @@ function EditorGroup({
   }, [
     index,
     isBinary,
+    isOversized,
     settingsHere,
     pos,
     counts,
@@ -1169,7 +1180,7 @@ function EditorGroup({
         minH={0}
         minW={0}
         display={
-          isBinary || isBoard || settingsHere || previewActive
+          isBinary || isBoard || isOversized || settingsHere || previewActive
             ? "none"
             : "block"
         }

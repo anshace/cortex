@@ -154,6 +154,9 @@ pub struct FileRow {
     pub kind: String,
     /// MIME type for binary files.
     pub mime: Option<String>,
+    /// Content size in bytes: blob length for binaries, document text length
+    /// for text files. Lets clients pick viewer/editor modes without fetching.
+    pub size: i64,
 }
 
 /// A chat message with its author's name/email.
@@ -264,6 +267,21 @@ impl Database {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| e.into())
+    }
+
+    /// Write a document's text directly, bypassing OT. Backs the single-user
+    /// editor for oversized files; callers must ensure no live OT session is
+    /// mutating the same document.
+    pub async fn store_document_text(&self, document_id: &str, text: &str) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO document (id, text, language) VALUES ($1, $2, NULL)
+               ON CONFLICT(id) DO UPDATE SET text = excluded.text"#,
+        )
+        .bind(document_id)
+        .bind(text)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Store the text of a document in the database.
@@ -1050,14 +1068,18 @@ impl Database {
             doc_id: doc_id.to_string(),
             kind: kind.to_string(),
             mime: mime.map(str::to_string),
+            size: 0,
         })
     }
 
     /// List files in a workspace, ordered by path.
     pub async fn list_files(&self, workspace_id: i64) -> Result<Vec<FileRow>> {
         sqlx::query_as(
-            r#"SELECT id, workspace_id, path, doc_id, kind, mime FROM file
-               WHERE workspace_id = $1 ORDER BY path"#,
+            r#"SELECT f.id, f.workspace_id, f.path, f.doc_id, f.kind, f.mime,
+                      COALESCE((SELECT LENGTH(fb.data) FROM file_blob fb WHERE fb.file_id = f.id),
+                               (SELECT LENGTH(d.text) FROM document d WHERE d.id = f.doc_id), 0) AS size
+               FROM file f
+               WHERE f.workspace_id = $1 ORDER BY f.path"#,
         )
         .bind(workspace_id)
         .fetch_all(&self.pool)
@@ -1068,7 +1090,10 @@ impl Database {
     /// Fetch a file by id.
     pub async fn get_file(&self, id: i64) -> Result<Option<FileRow>> {
         sqlx::query_as(
-            r#"SELECT id, workspace_id, path, doc_id, kind, mime FROM file WHERE id = $1"#,
+            r#"SELECT f.id, f.workspace_id, f.path, f.doc_id, f.kind, f.mime,
+                      COALESCE((SELECT LENGTH(fb.data) FROM file_blob fb WHERE fb.file_id = f.id),
+                               (SELECT LENGTH(d.text) FROM document d WHERE d.id = f.doc_id), 0) AS size
+               FROM file f WHERE f.id = $1"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)

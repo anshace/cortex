@@ -402,6 +402,14 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(with_db(db.clone()))
         .and_then(export_workspace);
 
+    // Solo-editor saves for oversized text files (no live OT session).
+    let put_text = warp::path!("files" / i64 / "text")
+        .and(warp::put())
+        .and(with_auth(db.clone()))
+        .and(warp::body::json())
+        .and(with_db(db.clone()))
+        .and_then(put_file_text);
+
     // Whiteboard scene saves: overwrite a binary file's stored blob.
     let put_blob = warp::path!("files" / i64 / "blob")
         .and(warp::put())
@@ -617,6 +625,7 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .or(delete_ws)
         .or(create_file)
         .or(move_file)
+        .or(put_text)
         .or(delete_file)
         .or(audit_r)
         .or(storage_r)
@@ -1242,6 +1251,36 @@ async fn delete_file(file_id: i64, user: User, db: Database) -> Result<impl Repl
         )
         .await;
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+}
+
+/// Overwrite a text file's collaborative document wholesale. This backs the
+/// single-user editor the client falls back to for oversized files, where the
+/// live OT session is disabled; the client only calls it when no other editor
+/// is expected to be active on the file.
+async fn put_file_text(
+    file_id: i64,
+    user: User,
+    body: serde_json::Value,
+    db: Database,
+) -> Result<impl Reply, Rejection> {
+    if !file_allowed(&db, &user, file_id).await {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    let file = match db.get_file(file_id).await.ok().flatten() {
+        Some(f) => f,
+        None => return Ok(err(StatusCode::NOT_FOUND, "no such file")),
+    };
+    if file.kind != "text" {
+        return Ok(err(StatusCode::BAD_REQUEST, "not a text file"));
+    }
+    let text = match body["text"].as_str() {
+        Some(t) => t.to_string(),
+        None => return Ok(err(StatusCode::BAD_REQUEST, "missing text")),
+    };
+    match db.store_document_text(&file.doc_id, &text).await {
+        Ok(()) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
+        Err(_) => Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not save text")),
+    }
 }
 
 async fn move_file(

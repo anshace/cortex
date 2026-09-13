@@ -12,6 +12,12 @@ import "rustpad-wasm";
 
 import AuthGate from "./AuthGate";
 import theme from "./theme";
+// Self-hosted variable fonts (CSP is font-src 'self'; no CDN) — the design
+// system's Inter/JetBrains Mono stack now actually renders as designed.
+import "@fontsource-variable/inter";
+import "@fontsource-variable/inter/wght-italic.css";
+import "@fontsource/jetbrains-mono/400.css";
+import "@fontsource/jetbrains-mono/500.css";
 import "./index.css";
 
 // Serve Monaco from our own bundle, not the jsdelivr CDN that @monaco-editor/react

@@ -39,6 +39,7 @@ import { fileIcon, folderIcon } from "./fileIcon";
 const BASE = 8; // left padding of the root level
 const INDENT = 12; // per-depth indentation
 const CHEV = 16; // width of the twisty/chevron column (files reserve it too)
+const CHUNK = 300; // children rendered per level before a "show more" row
 
 type TreeNode = {
   name: string;
@@ -242,6 +243,10 @@ const FileTree = memo(
     // changes, not on every render (selection clicks, menus, …).
     const root = useMemo(() => buildTree(files), [files]);
     const byId = useMemo(() => new Map(files.map((f) => [f.id, f])), [files]);
+    const rootChildren = useMemo(() => sorted(root), [root]);
+    // Very large levels render in chunks: a flat 5k-file workspace would
+    // otherwise mount thousands of rows at once and lock the sidebar.
+    const [rootShown, setRootShown] = useState(CHUNK);
     const [menu, setMenu] = useState<MenuState>(null);
     const [editing, setEditing] = useState<EditState>(null);
     const [creating, setCreating] = useState<CreateState>(null);
@@ -740,7 +745,7 @@ const FileTree = memo(
                   onCancel={() => setCreating(null)}
                 />
               )}
-              {sorted(root).map((n) => (
+              {rootChildren.slice(0, rootShown).map((n) => (
                 <TreeItem
                   key={n.name}
                   node={n}
@@ -749,6 +754,13 @@ const FileTree = memo(
                   {...shared}
                 />
               ))}
+              {rootChildren.length > rootShown && (
+                <ShowMoreRow
+                  depth={1}
+                  hidden={rootChildren.length - rootShown}
+                  onShow={() => setRootShown((s) => s + CHUNK)}
+                />
+              )}
             </>
           )}
         </Box>
@@ -996,17 +1008,93 @@ function TreeItem(
               onCancel={onCancelCreate}
             />
           )}
-          {sorted(node).map((c) => (
-            <TreeItem
-              key={c.name}
-              {...props}
-              node={c}
-              parentPath={folderPath}
-              depth={depth + 1}
-            />
-          ))}
+          <ChunkedChildren props={props} node={node} folderPath={folderPath} depth={depth} />
         </>
       )}
+    </Box>
+  );
+}
+
+// Renders a folder's children in bounded chunks so an expanded folder with
+// thousands of entries can't lock the sidebar; "Show N more" loads the rest.
+function ChunkedChildren({
+  props,
+  node,
+  folderPath,
+  depth,
+}: {
+  props: ItemShared & { node: TreeNode; parentPath: string; depth: number };
+  node: TreeNode;
+  folderPath: string;
+  depth: number;
+}) {
+  const children = useMemo(() => sorted(node), [node]);
+  const [shown, setShown] = useState(CHUNK);
+  const visible = children.slice(0, shown);
+  return (
+    <>
+      {visible.map((c) => (
+        <TreeItem
+          key={c.name}
+          {...props}
+          node={c}
+          parentPath={folderPath}
+          depth={depth + 1}
+        />
+      ))}
+      {children.length > shown && (
+        <ShowMoreRow
+          depth={depth + 1}
+          hidden={children.length - shown}
+          onShow={() => setShown((s) => s + CHUNK)}
+        />
+      )}
+    </>
+  );
+}
+
+function ShowMoreRow({
+  depth,
+  hidden,
+  onShow,
+}: {
+  depth: number;
+  hidden: number;
+  onShow: () => void;
+}) {
+  return (
+    <Box position="relative">
+      {Array.from({ length: Math.max(0, depth - 1) }).map((_, k) => (
+        <Box
+          key={k}
+          position="absolute"
+          top={0}
+          bottom={0}
+          left={`${BASE + k * INDENT + CHEV / 2}px`}
+          w="1px"
+          bg="surface.border"
+          pointerEvents="none"
+        />
+      ))}
+      <HStack
+        as="button"
+        pl={`${BASE + depth * INDENT}px`}
+        pr={2}
+        py={0.5}
+        minH="22px"
+        spacing={1.5}
+        borderRadius="sm"
+        cursor="pointer"
+        color="brand.400"
+        fontSize="12px"
+        w="full"
+        _hover={{ bg: "surface.hover", color: "brand.300" }}
+        onClick={onShow}
+      >
+        <Box w={`${CHEV}px`} flexShrink={0} />
+        <Icon as={VscChevronDown} boxSize="13px" flexShrink={0} />
+        <Text>Show {hidden.toLocaleString()} more</Text>
+      </HStack>
     </Box>
   );
 }

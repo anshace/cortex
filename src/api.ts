@@ -31,6 +31,9 @@ export type FileRow = {
   doc_id: string;
   kind: "text" | "binary";
   mime: string | null;
+  // Content size in bytes (server-computed). Oversized text files open in a
+  // single-user editor with autosave instead of the live OT session.
+  size: number;
 };
 export type Member = { id: number; email: string; name: string; role: string };
 export type Reaction = { emoji: string; count: number; mine: boolean };
@@ -356,6 +359,24 @@ export async function deleteFile(id: number): Promise<void> {
 
 export async function moveFile(id: number, path: string): Promise<void> {
   await json(await fetch(`/api/files/${id}`, opts("PUT", { path })));
+}
+
+// Fetch a text file's current content (OT document or seeded text).
+export async function fetchFileText(file: FileRow): Promise<string> {
+  const res = await fetch(rawUrl(file), { credentials: "include" });
+  if (!res.ok) throw new Error("could not load file");
+  return res.text();
+}
+
+// Overwrite a text file's content wholesale. Used by the single-user editor
+// for oversized files, where the live collaborative session is disabled.
+export async function saveFileText(
+  fileId: number,
+  text: string,
+): Promise<void> {
+  await json(
+    await fetch(`/api/files/${fileId}/text`, opts("PUT", { text })),
+  );
 }
 
 // ----- group chat (payloads encrypted end-to-end with the server) -----
