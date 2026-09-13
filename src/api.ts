@@ -374,9 +374,7 @@ export async function saveFileText(
   fileId: number,
   text: string,
 ): Promise<void> {
-  await json(
-    await fetch(`/api/files/${fileId}/text`, opts("PUT", { text })),
-  );
+  await json(await fetch(`/api/files/${fileId}/text`, opts("PUT", { text })));
 }
 
 // ----- group chat (payloads encrypted end-to-end with the server) -----

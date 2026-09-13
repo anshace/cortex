@@ -2,16 +2,38 @@
 // disabled above a size threshold (it degrades and can drop the connection),
 // so these files get a private Monaco editor with debounced autosave instead.
 // Copy/paste and every other editing command work normally here.
-import { Alert, AlertIcon, Box, Flex, HStack, Icon, Spinner, Text } from "@chakra-ui/react";
-import Editor from "@monaco-editor/react";
-import { KeyCode, KeyMod, editor } from "monaco-editor/esm/vs/editor/editor.api";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { VscCheck, VscCircleFilled, VscCloudDownload, VscError } from "react-icons/vsc";
+import {
+  Alert,
+  AlertIcon,
+  Box,
+  Flex,
+  HStack,
+  Icon,
+  Spinner,
+  Text,
+} from "@chakra-ui/react";
 import { useColorMode } from "@chakra-ui/react";
+import Editor from "@monaco-editor/react";
+import {
+  KeyCode,
+  KeyMod,
+  editor,
+} from "monaco-editor/esm/vs/editor/editor.api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  VscCheck,
+  VscCircleFilled,
+  VscCloudDownload,
+  VscError,
+} from "react-icons/vsc";
 
 import * as api from "./api";
 import { FileRow } from "./api";
-import { registerThemes, resolveMonacoTheme, useEditorThemeId } from "./editorThemes";
+import {
+  registerThemes,
+  resolveMonacoTheme,
+  useEditorThemeId,
+} from "./editorThemes";
 
 export type SaveStatus = "idle" | "dirty" | "saving" | "saved" | "error";
 
@@ -45,8 +67,10 @@ export default function SoloEditor({ file, language, fontSize }: Props) {
     api
       .fetchFileText(file)
       .then((t) => !cancelled && setText(t))
-      .catch((e) =>
-        !cancelled && setLoadError(e instanceof Error ? e.message : "Load failed"),
+      .catch(
+        (e) =>
+          !cancelled &&
+          setLoadError(e instanceof Error ? e.message : "Load failed"),
       );
     return () => {
       cancelled = true;

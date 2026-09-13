@@ -14,12 +14,22 @@ const MAX_ZIP_ENTRIES = 10_000;
 // One edited cell, addressed in absolute 0-based sheet coordinates.
 type CellEdit = { row: number; col: number; value: string | number | boolean };
 
+// Structural change to a sheet. Applied to the FULL workbook at save time
+// (before cell edits), so rows/columns beyond the on-screen preview shift
+// correctly too. Index is an absolute 0-based row/column.
+export type SheetOp =
+  | { type: "insertRow"; index: number }
+  | { type: "deleteRow"; index: number }
+  | { type: "insertCol"; index: number }
+  | { type: "deleteCol"; index: number };
+
 type ParseRequest = { id: number; cmd?: "parse"; buf: ArrayBuffer };
 type SaveRequest = {
   id: number;
   cmd: "save";
   buf: ArrayBuffer;
   edits: Record<string, CellEdit[]>; // sheet name -> edits
+  ops: Record<string, SheetOp[]>; // sheet name -> structural changes
   bookType: "xlsx" | "xls" | "csv";
 };
 
@@ -42,6 +52,49 @@ const ctx = self as unknown as {
   postMessage(message: unknown, transfer?: Transferable[]): void;
 };
 
+// Shift a worksheet's cells by one structural row/column insertion or
+// deletion, returning a fresh worksheet (SheetJS has no native support).
+function shiftWorksheet(ws: XLSX.WorkSheet, op: SheetOp): XLSX.WorkSheet {
+  const isRow = op.type === "insertRow" || op.type === "deleteRow";
+  const isInsert = op.type === "insertRow" || op.type === "insertCol";
+  const range = ws["!ref"]
+    ? XLSX.utils.decode_range(ws["!ref"])
+    : { s: { r: 0, c: 0 }, e: { r: 0, c: 0 } };
+  const out: XLSX.WorkSheet = {};
+  for (const [addr, cell] of Object.entries(ws)) {
+    if (addr.charAt(0) === "!") continue;
+    const pos = XLSX.utils.decode_cell(addr);
+    let r = pos.r;
+    let c = pos.c;
+    if (isRow) {
+      if (isInsert) {
+        if (r >= op.index) r += 1;
+      } else {
+        if (r === op.index) continue;
+        if (r > op.index) r -= 1;
+      }
+    } else {
+      if (isInsert) {
+        if (c >= op.index) c += 1;
+      } else {
+        if (c === op.index) continue;
+        if (c > op.index) c -= 1;
+      }
+    }
+    out[XLSX.utils.encode_cell({ r, c })] = cell;
+  }
+  const rows = range.e.r - range.s.r + 1 + (isRow ? (isInsert ? 1 : -1) : 0);
+  const cols = range.e.c - range.s.c + 1 + (!isRow ? (isInsert ? 1 : -1) : 0);
+  out["!ref"] = XLSX.utils.encode_range({
+    s: range.s,
+    e: {
+      r: Math.max(range.s.r, range.s.r + Math.max(0, rows - 1)),
+      c: Math.max(range.s.c, range.s.c + Math.max(0, cols - 1)),
+    },
+  });
+  return out;
+}
+
 // Parse a workbook fully (no row cap) and apply edited cells, keeping the
 // original typed values for everything the user didn't touch.
 function saveWorkbook(req: SaveRequest) {
@@ -52,6 +105,13 @@ function saveWorkbook(req: SaveRequest) {
     cellNF: false,
     cellStyles: false,
   });
+  for (const [sheetName, ops] of Object.entries(req.ops ?? {})) {
+    for (const op of ops) {
+      const worksheet = workbook.Sheets[sheetName];
+      if (!worksheet) continue;
+      workbook.Sheets[sheetName] = shiftWorksheet(worksheet, op);
+    }
+  }
   for (const [sheetName, edits] of Object.entries(req.edits)) {
     if (!edits.length) continue;
     let worksheet = workbook.Sheets[sheetName];

@@ -1,4 +1,4 @@
-import { extendTheme, type ThemeConfig } from "@chakra-ui/react";
+import { type ThemeConfig, extendTheme } from "@chakra-ui/react";
 
 // Cortex design system — a cool graphite neutral base with a thin violet/indigo
 // accent. Light + dark are both first-class via semantic tokens; components
@@ -116,7 +116,8 @@ const theme = extendTheme({
         fontWeight: 600,
         borderRadius: "lg",
         letterSpacing: "-0.01em",
-        transition: "background 0.12s ease, transform 0.06s ease, box-shadow 0.12s ease",
+        transition:
+          "background 0.12s ease, transform 0.06s ease, box-shadow 0.12s ease",
         _focusVisible: { boxShadow: "outline" },
         _active: { transform: "translateY(0.5px)" },
       },
@@ -267,7 +268,11 @@ const theme = extendTheme({
     },
     Tabs: { defaultProps: { colorScheme: "brand" } },
     Badge: {
-      baseStyle: { borderRadius: "full", textTransform: "none", fontWeight: 600 },
+      baseStyle: {
+        borderRadius: "full",
+        textTransform: "none",
+        fontWeight: 600,
+      },
     },
   },
 });
