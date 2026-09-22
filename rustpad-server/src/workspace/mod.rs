@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Buf;
 use futures::TryStreamExt;
+use log::warn;
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::json;
@@ -147,6 +148,12 @@ async fn ensure_ws(db: &Database, user: &User, ws_id: i64) -> Result<Workspace, 
             let group = db.get_group(ws.group_id).await.ok().flatten();
             match group {
                 Some(g) if user.org_id == Some(g.org_id) => {
+                    // Org admins manage everything in their org (they can already
+                    // manage the group itself, clear its chat and delete it);
+                    // other members are bound by the group's scope.
+                    if user.role == "admin" {
+                        return Ok(ws);
+                    }
                     let member = g.scope == "group"
                         && db.is_group_member(g.id, user.id).await.unwrap_or(false);
                     if scope_ok(&g.scope, g.created_by, user.id, member) {
@@ -167,6 +174,11 @@ async fn ensure_group(db: &Database, user: &User, group_id: i64) -> Result<Group
     match db.get_group(group_id).await.ok().flatten() {
         Some(g) if user.role == "root" => Ok(g),
         Some(g) if user.org_id == Some(g.org_id) => {
+            // Same rule as workspaces: org admins manage every group in
+            // their org; other members are bound by the group's scope.
+            if user.role == "admin" {
+                return Ok(g);
+            }
             let member = g.scope == "group"
                 && db.is_group_member(g.id, user.id).await.unwrap_or(false);
             if scope_ok(&g.scope, g.created_by, user.id, member) {
@@ -1240,7 +1252,13 @@ async fn delete_file(file_id: i64, user: User, db: Database) -> Result<impl Repl
         return Err(warp::reject::custom(Forbidden));
     }
     let path = db.get_file(file_id).await.ok().flatten().map(|f| f.path);
-    let _ = db.delete_file(file_id).await;
+    if let Err(e) = db.delete_file(file_id).await {
+        warn!("delete_file {file_id}: {e}");
+        return Ok(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not delete file",
+        ));
+    }
     let _ = db
         .audit(
             user.org_id,
