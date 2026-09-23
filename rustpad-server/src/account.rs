@@ -11,9 +11,14 @@ use crate::auth::{
     hash_password, provision_totp, verify_password, verify_totp, with_auth, Forbidden,
 };
 use crate::database::{Database, User};
+use crate::{evict_documents, LiveDocs};
 
 fn with_db(db: Database) -> impl Filter<Extract = (Database,), Error = Infallible> + Clone {
     warp::any().map(move || db.clone())
+}
+
+fn with_docs(live: LiveDocs) -> impl Filter<Extract = (LiveDocs,), Error = Infallible> + Clone {
+    warp::any().map(move || live.clone())
 }
 
 fn err(status: StatusCode, msg: &str) -> warp::reply::Response {
@@ -91,7 +96,7 @@ struct RenameReq {
     name: String,
 }
 
-pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+pub fn routes(db: Database, live: LiveDocs) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
     let update_name = warp::path!("profile")
         .and(warp::post())
         .and(with_auth(db.clone()))
@@ -170,6 +175,7 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(warp::delete())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
         .and_then(admin_delete);
 
     let org_list = warp::path!("admin" / "orgs")
@@ -196,6 +202,7 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(warp::delete())
         .and(with_auth(db.clone()))
         .and(with_db(db))
+        .and(with_docs(live.clone()))
         .and_then(org_delete);
 
     update_name
@@ -479,20 +486,24 @@ async fn admin_update_user(
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
-async fn admin_delete(target: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+async fn admin_delete(
+    target: i64,
+    user: User,
+    db: Database,
+    live: LiveDocs,
+) -> Result<impl Reply, Rejection> {
     require_root(&user)?;
-    let _ = db.admin_delete_user(target).await;
+    let ids = match db.admin_delete_user(target).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            log::warn!("admin_delete_user {target}: {e}");
+            return Ok(err(StatusCode::CONFLICT, "could not delete account"));
+        }
+    };
+    evict_documents(&live, &ids);
     let d = target.to_string();
-    let _ = db
-        .audit(
-            user.org_id,
-            Some(user.id),
-            "admin_delete_user",
-            Some(&d),
-            now_secs(),
-        )
-        .await;
-    Ok(warp::reply::json(&json!({ "ok": true })))
+    let _ = db.audit(user.org_id, Some(user.id), "admin_delete_user", Some(&d), now_secs()).await;
+    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
 fn now_secs() -> i64 {
@@ -537,8 +548,21 @@ async fn org_rename(
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
-async fn org_delete(target: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+async fn org_delete(
+    target: i64,
+    user: User,
+    db: Database,
+    live: LiveDocs,
+) -> Result<impl Reply, Rejection> {
     require_root(&user)?;
-    let _ = db.delete_org(target).await;
-    Ok(warp::reply::json(&json!({ "ok": true })))
+    match db.delete_org(target).await {
+        Ok(ids) => {
+            evict_documents(&live, &ids);
+            Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+        }
+        Err(e) => {
+            log::warn!("delete_org {target}: {e}");
+            Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not delete org"))
+        }
+    }
 }

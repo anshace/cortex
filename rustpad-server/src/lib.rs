@@ -29,9 +29,36 @@ pub mod workspace;
 /// Each entry corresponds to a single document. This is garbage collected by a
 /// background task after one day of inactivity, to avoid server memory usage
 /// growing without bound.
-struct Document {
+pub(crate) struct Document {
     last_accessed: Instant,
     rustpad: Arc<Rustpad>,
+}
+
+/// Shared live editor registry. Dropping a cached document closes its sockets.
+pub(crate) type LiveDocs = Arc<DashMap<String, Document>>;
+
+pub(crate) fn evict_documents(live: &LiveDocs, ids: &[String]) {
+    for id in ids {
+        live.remove(id);
+    }
+}
+
+pub(crate) fn evict_all_documents(live: &LiveDocs) {
+    let ids: Vec<String> = live.iter().map(|item| item.key().clone()).collect();
+    evict_documents(live, &ids);
+}
+
+/// Prefer the current OT snapshot over the last periodic DB flush for
+/// downloads, exports and copies while another user is editing the file.
+pub(crate) async fn current_document(
+    live: &LiveDocs,
+    db: &Database,
+    id: &str,
+) -> anyhow::Result<database::PersistedDocument> {
+    if let Some(entry) = live.get(id) {
+        return Ok(entry.rustpad.snapshot());
+    }
+    db.load(id).await
 }
 
 impl Document {
@@ -167,15 +194,16 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         database: config.database,
     };
     tokio::spawn(cleaner(state.clone(), config.expiry_days));
+    tokio::spawn(scheduled_maintenance(db.clone()));
 
     let state_filter = warp::any().map(move || state.clone());
 
     // Public auth endpoints (login / logout / me).
     let auth_routes = auth::routes(db.clone());
-    // Workspace / file management endpoints (session-gated inside).
-    let workspace_routes = workspace::routes(db.clone());
-    // Profile + hidden root admin console.
-    let account_routes = account::routes(db.clone());
+    // Handlers share the live editor registry so hard deletes can disconnect
+    // editors and downloads/copies can read unsaved OT snapshots.
+    let workspace_routes = workspace::routes(db.clone(), state.documents.clone());
+    let account_routes = account::routes(db.clone(), state.documents.clone());
 
     // A plain db filter used by the document access checks below.
     let db_for_docs = db.clone();
@@ -259,13 +287,16 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
 }
 
 async fn file_allowed(db: &Database, user: &database::User, file_id: i64) -> bool {
-    if user.role == "root" {
-        return true;
-    }
     match db.file_ws_info(file_id).await.ok().flatten() {
         Some((group_id, org, scope, created_by)) => {
+            if user.role == "root" {
+                return true;
+            }
             if Some(org) != user.org_id {
                 return false;
+            }
+            if user.role == "admin" {
+                return true;
             }
             match scope.as_str() {
                 "org" => true,
@@ -298,13 +329,16 @@ async fn board_socket_handler(
 /// Whether a user may access the document `doc_id` (root bypasses; otherwise
 /// the same layered org / group / personal check as the REST workspace routes).
 async fn doc_allowed(db: &Database, user: &database::User, doc_id: &str) -> bool {
-    if user.role == "root" {
-        return true;
-    }
     match db.doc_ws_info(doc_id).await.ok().flatten() {
         Some((group_id, org, scope, created_by)) => {
+            if user.role == "root" {
+                return true;
+            }
             if Some(org) != user.org_id {
                 return false;
+            }
+            if user.role == "admin" {
+                return true;
             }
             match scope.as_str() {
                 "org" => true,
@@ -379,6 +413,35 @@ async fn stats_handler(start_time: u64, state: ServerState) -> Result<impl Reply
 }
 
 const HOUR: Duration = Duration::from_secs(3600);
+
+/// Runs on the server, not from a separate Docker cron/sidecar, so the same
+/// housekeeping applies to the one-container image and bare-metal installs.
+/// First run is delayed to let migrations/bootstrap finish and serve traffic.
+async fn scheduled_maintenance(db: Database) {
+    time::sleep(Duration::from_secs(5 * 60)).await;
+    let retention = std::env::var("CORTEX_AUDIT_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&n| (1..=3650).contains(&n))
+        .unwrap_or(180);
+    loop {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default();
+        match db.maintain(now, retention, false).await {
+            Ok(result) => info!(
+                "maintenance: vacuumed={}, freed={} bytes, removed {} orphan docs, {} sessions",
+                result.vacuumed,
+                result.db_bytes_before - result.db_bytes_after,
+                result.orphan_documents,
+                result.expired_sessions
+            ),
+            Err(e) => error!("scheduled maintenance failed: {e}"),
+        }
+        time::sleep(HOUR * 24).await;
+    }
+}
 
 /// Reclaims memory for documents.
 async fn cleaner(state: ServerState, expiry_days: u32) {

@@ -4,13 +4,18 @@
 //! assigned to at most one org (by the root owner). Access to a workspace is by
 //! org membership; the root owner bypasses org checks (full cross-org access).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::Serialize;
-use sqlx::{sqlite::SqliteConnectOptions, Column, ConnectOptions, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    Column, ConnectOptions, Sqlite, SqlitePool, Transaction,
+};
 
 /// Represents a document persisted in database storage.
 #[derive(sqlx::FromRow, PartialEq, Eq, Clone, Debug)]
@@ -237,24 +242,148 @@ pub struct Member {
     pub role: String,
 }
 
+/// A path cannot be both a file and a directory in the virtual tree.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
+/// Choose a non-conflicting name without overwriting existing files/folders.
+fn available_path(existing: &HashSet<String>, requested: &str) -> Result<String> {
+    if existing.iter().any(|p| requested.starts_with(&format!("{p}/"))) {
+        bail!("destination folder is a file");
+    }
+    if !existing.iter().any(|p| paths_overlap(p, requested)) {
+        return Ok(requested.to_string());
+    }
+    let (dir, name) = requested.rsplit_once('/').unwrap_or(("", requested));
+    let dot = name.rfind('.').filter(|&i| i > 0);
+    let (stem, ext) = dot.map(|i| name.split_at(i)).unwrap_or((name, ""));
+    for n in 1.. {
+        let candidate = if dir.is_empty() {
+            format!("{stem} ({n}){ext}")
+        } else {
+            format!("{dir}/{stem} ({n}){ext}")
+        };
+        if !existing.iter().any(|p| paths_overlap(p, &candidate)) {
+            return Ok(candidate);
+        }
+    }
+    unreachable!()
+}
+
+/// Result of one scheduled or owner-requested maintenance run.
+#[derive(Serialize)]
+pub struct MaintenanceReport {
+    /// SQLite main DB file size at the start (WAL is separate).
+    pub db_bytes_before: i64,
+    /// SQLite main DB file size after maintenance (WAL is separate).
+    pub db_bytes_after: i64,
+    /// Reusable pages before compaction.
+    pub free_bytes_before: i64,
+    /// Whether the DB file was compacted.
+    pub vacuumed: bool,
+    /// Nonzero if a reader prevented a checkpoint / compaction.
+    pub checkpoint_busy: i64,
+    /// Expired login sessions removed.
+    pub expired_sessions: u64,
+    /// Documents no longer attached to any file.
+    pub orphan_documents: u64,
+    /// Binary blobs no longer attached to any file.
+    pub orphan_blobs: u64,
+    /// Reactions to missing messages or by missing users.
+    pub orphan_reactions: u64,
+    /// Unreferenced old pasted chat images.
+    pub orphan_chat_images: u64,
+    /// Audit entries older than the configured retention period.
+    pub pruned_audit: u64,
+}
+
 /// A driver for database operations wrapping a pool connection.
 #[derive(Clone, Debug)]
 pub struct Database {
     pool: SqlitePool,
+    maintenance_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+// These helpers share the caller's transaction. File content, chats, reactions
+// and membership must disappear together or not at all (including on old DBs).
+async fn delete_workspace_tx(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<Vec<String>> {
+    let docs: Vec<(String,)> = sqlx::query_as("SELECT doc_id FROM file WHERE workspace_id = $1")
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM file_blob WHERE file_id IN (SELECT id FROM file WHERE workspace_id = $1)")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM document WHERE id IN (SELECT doc_id FROM file WHERE workspace_id = $1)")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM file WHERE workspace_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE message SET workspace_id = NULL WHERE workspace_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM workspace WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    Ok(docs.into_iter().map(|(id,)| id).collect())
+}
+
+async fn delete_group_tx(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<Vec<String>> {
+    let workspaces: Vec<(i64,)> =
+        sqlx::query_as("SELECT id FROM workspace WHERE group_id = $1")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let mut docs = Vec::new();
+    for (ws_id,) in workspaces {
+        docs.extend(delete_workspace_tx(tx, ws_id).await?);
+    }
+    sqlx::query("DELETE FROM reaction WHERE kind = 'ws' AND msg_id IN (SELECT id FROM message WHERE group_id = $1)")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM message WHERE group_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM group_member WHERE group_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM groups WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    Ok(docs)
 }
 
 impl Database {
     /// Construct a new database, creating the file and running migrations.
     pub async fn new(uri: &str) -> Result<Self> {
+        // The migrator and *every* pooled connection need the same pragmas.
+        // WAL allows readers to continue during edits; foreign keys stay ON
+        // (SQLx's default). Only use WAL on a local disk, not a network share.
+        let options = SqliteConnectOptions::from_str(uri)?
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(10));
         {
-            let mut conn = SqliteConnectOptions::from_str(uri)?
-                .create_if_missing(true)
-                .connect()
-                .await?;
+            let mut conn = options.clone().connect().await?;
             sqlx::migrate!().run(&mut conn).await?;
         }
         Ok(Database {
-            pool: SqlitePool::connect(uri).await?,
+            pool: SqlitePoolOptions::new()
+                .max_connections(5)
+                .connect_with(options)
+                .await?,
+            maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -269,26 +398,29 @@ impl Database {
             .map_err(|e| e.into())
     }
 
-    /// Write a document's text directly, bypassing OT. Backs the single-user
-    /// editor for oversized files; callers must ensure no live OT session is
-    /// mutating the same document.
+    /// Write text directly, bypassing OT. Never recreate a deleted document:
+    /// the file must still exist, and creation seeds the row in the same tx.
     pub async fn store_document_text(&self, document_id: &str, text: &str) -> Result<()> {
-        sqlx::query(
-            r#"INSERT INTO document (id, text, language) VALUES ($1, $2, NULL)
-               ON CONFLICT(id) DO UPDATE SET text = excluded.text"#,
+        let result = sqlx::query(
+            r#"UPDATE document SET text = $2 WHERE id = $1
+               AND EXISTS (SELECT 1 FROM file WHERE doc_id = $1 AND kind = 'text')"#,
         )
         .bind(document_id)
         .bind(text)
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() != 1 {
+            bail!("text document no longer exists");
+        }
         Ok(())
     }
 
-    /// Store the text of a document in the database.
+    /// Persist a live OT snapshot. An UPDATE (not an upsert) prevents a stale
+    /// persister from resurrecting a file after a concurrent hard delete.
     pub async fn store(&self, document_id: &str, document: &PersistedDocument) -> Result<()> {
         let result = sqlx::query(
-            r#"INSERT INTO document (id, text, language) VALUES ($1, $2, $3)
-               ON CONFLICT(id) DO UPDATE SET text = excluded.text, language = excluded.language"#,
+            r#"UPDATE document SET text = $2, language = $3 WHERE id = $1
+               AND EXISTS (SELECT 1 FROM file WHERE doc_id = $1 AND kind = 'text')"#,
         )
         .bind(document_id)
         .bind(&document.text)
@@ -296,10 +428,7 @@ impl Database {
         .execute(&self.pool)
         .await?;
         if result.rows_affected() != 1 {
-            bail!(
-                "expected store() to affect 1 row, but affected {}",
-                result.rows_affected()
-            );
+            bail!("text document no longer exists");
         }
         Ok(())
     }
@@ -511,19 +640,77 @@ impl Database {
         Ok(())
     }
 
-    /// Delete a user and their sessions. Never deletes root.
-    pub async fn admin_delete_user(&self, id: i64) -> Result<()> {
+    /// Delete a non-owner account without leaving FK references or unreachable
+    /// personal files. Shared groups/workspaces keep their data and get the
+    /// root owner as their custodian; their chat/DM history by this user is
+    /// erased. Return deleted personal document IDs for live eviction.
+    pub async fn admin_delete_user(&self, id: i64) -> Result<Vec<String>> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(r#"DELETE FROM session WHERE user_id = $1"#)
+        let target: Option<(String,)> =
+            sqlx::query_as("SELECT role FROM users WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut tx)
+                .await?;
+        match target.as_ref().map(|(role,)| role.as_str()) {
+            Some("root") => bail!("owner accounts cannot be deleted"),
+            None => bail!("user not found"),
+            _ => {}
+        }
+        let (root,): (i64,) = sqlx::query_as(
+            "SELECT id FROM users WHERE role = 'root' ORDER BY id LIMIT 1",
+        )
+        .fetch_one(&mut tx)
+        .await?;
+        let personal: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM groups WHERE created_by = $1 AND scope = 'personal'",
+        )
+        .bind(id)
+        .fetch_all(&mut tx)
+        .await?;
+        let mut docs = Vec::new();
+        for (group_id,) in personal {
+            docs.extend(delete_group_tx(&mut tx, group_id).await?);
+        }
+        sqlx::query("UPDATE groups SET created_by = $1 WHERE created_by = $2")
+            .bind(root)
             .bind(id)
             .execute(&mut tx)
             .await?;
-        sqlx::query(r#"DELETE FROM users WHERE id = $1 AND role != 'root'"#)
+        sqlx::query("UPDATE workspace SET created_by = $1 WHERE created_by = $2")
+            .bind(root)
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query("DELETE FROM group_member WHERE user_id = $1")
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query("DELETE FROM reaction WHERE user_id = $1 OR (kind = 'ws' AND msg_id IN (SELECT id FROM message WHERE user_id = $1)) OR (kind = 'dm' AND msg_id IN (SELECT id FROM dm WHERE sender_id = $1 OR recipient_id = $1))")
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query("DELETE FROM message WHERE user_id = $1")
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query("DELETE FROM dm WHERE sender_id = $1 OR recipient_id = $1")
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query("DELETE FROM audit WHERE user_id = $1")
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query("DELETE FROM session WHERE user_id = $1")
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(id)
             .execute(&mut tx)
             .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(docs)
     }
 
     // ----- Orgs -----
@@ -577,63 +764,56 @@ impl Database {
         Ok(())
     }
 
-    /// Delete an org and everything in it (groups, workspaces, files, chat),
-    /// and unassign its users.
-    pub async fn delete_org(&self, id: i64) -> Result<()> {
+    /// Remove all org data and unassign its users in one transaction. Returns
+    /// document IDs so no WebSocket can keep writing after the deletion.
+    pub async fn delete_org(&self, id: i64) -> Result<Vec<String>> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            r#"DELETE FROM file_blob WHERE file_id IN
-               (SELECT f.id FROM file f
-                  JOIN workspace w ON w.id = f.workspace_id
-                  JOIN groups g ON g.id = w.group_id WHERE g.org_id = $1)"#,
-        )
-        .bind(id)
-        .execute(&mut tx)
-        .await?;
-        sqlx::query(
-            r#"DELETE FROM document WHERE id IN
-               (SELECT f.doc_id FROM file f
-                  JOIN workspace w ON w.id = f.workspace_id
-                  JOIN groups g ON g.id = w.group_id WHERE g.org_id = $1)"#,
-        )
-        .bind(id)
-        .execute(&mut tx)
-        .await?;
-        sqlx::query(
-            r#"DELETE FROM file WHERE workspace_id IN
-               (SELECT w.id FROM workspace w JOIN groups g ON g.id = w.group_id WHERE g.org_id = $1)"#,
-        )
-        .bind(id)
-        .execute(&mut tx)
-        .await?;
-        sqlx::query(
-            r#"DELETE FROM workspace WHERE group_id IN (SELECT id FROM groups WHERE org_id = $1)"#,
-        )
-        .bind(id)
-        .execute(&mut tx)
-        .await?;
-        sqlx::query(r#"DELETE FROM group_member WHERE group_id IN (SELECT id FROM groups WHERE org_id = $1)"#)
+        let groups: Vec<(i64,)> = sqlx::query_as("SELECT id FROM groups WHERE org_id = $1")
+            .bind(id)
+            .fetch_all(&mut tx)
+            .await?;
+        let mut docs = Vec::new();
+        for (group_id,) in groups {
+            docs.extend(delete_group_tx(&mut tx, group_id).await?);
+        }
+        // Old org-wide chat rows (group_id IS NULL) still exist on upgraded DBs.
+        sqlx::query("DELETE FROM reaction WHERE kind = 'ws' AND msg_id IN (SELECT id FROM message WHERE org_id = $1)")
             .bind(id)
             .execute(&mut tx)
             .await?;
-        sqlx::query(r#"DELETE FROM groups WHERE org_id = $1"#)
+        sqlx::query("DELETE FROM message WHERE org_id = $1")
             .bind(id)
             .execute(&mut tx)
             .await?;
-        sqlx::query(r#"DELETE FROM message WHERE org_id = $1"#)
+        sqlx::query("DELETE FROM reaction WHERE kind = 'dm' AND msg_id IN (SELECT id FROM dm WHERE org_id = $1)")
             .bind(id)
             .execute(&mut tx)
             .await?;
-        sqlx::query(r#"UPDATE users SET org_id = NULL WHERE org_id = $1"#)
+        sqlx::query("DELETE FROM dm WHERE org_id = $1")
             .bind(id)
             .execute(&mut tx)
             .await?;
-        sqlx::query(r#"DELETE FROM org WHERE id = $1"#)
+        sqlx::query("DELETE FROM chat_image WHERE org_id = $1")
             .bind(id)
             .execute(&mut tx)
             .await?;
+        sqlx::query("DELETE FROM audit WHERE org_id = $1")
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query("UPDATE users SET org_id = NULL WHERE org_id = $1")
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        let r = sqlx::query("DELETE FROM org WHERE id = $1")
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        if r.rows_affected() != 1 {
+            bail!("org not found");
+        }
         tx.commit().await?;
-        Ok(())
+        Ok(docs)
     }
 
     /// List the members (non-root users) of an org.
@@ -790,48 +970,12 @@ impl Database {
         Ok(())
     }
 
-    /// Delete a group: its chat, memberships, workspaces and all their
-    /// files/blobs/documents.
-    pub async fn delete_group(&self, id: i64) -> Result<()> {
+    /// Hard-delete a group and its contents. Return doc IDs for live eviction.
+    pub async fn delete_group(&self, id: i64) -> Result<Vec<String>> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(r#"DELETE FROM group_member WHERE group_id = $1"#)
-            .bind(id)
-            .execute(&mut tx)
-            .await?;
-        sqlx::query(r#"DELETE FROM message WHERE group_id = $1"#)
-            .bind(id)
-            .execute(&mut tx)
-            .await?;
-        sqlx::query(
-            r#"DELETE FROM file_blob WHERE file_id IN (
-                SELECT f.id FROM file f JOIN workspace w ON w.id = f.workspace_id WHERE w.group_id = $1)"#,
-        )
-        .bind(id)
-        .execute(&mut tx)
-        .await?;
-        sqlx::query(
-            r#"DELETE FROM document WHERE id IN (
-                SELECT f.doc_id FROM file f JOIN workspace w ON w.id = f.workspace_id WHERE w.group_id = $1)"#,
-        )
-        .bind(id)
-        .execute(&mut tx)
-        .await?;
-        sqlx::query(
-            r#"DELETE FROM file WHERE workspace_id IN (SELECT id FROM workspace WHERE group_id = $1)"#,
-        )
-        .bind(id)
-        .execute(&mut tx)
-        .await?;
-        sqlx::query(r#"DELETE FROM workspace WHERE group_id = $1"#)
-            .bind(id)
-            .execute(&mut tx)
-            .await?;
-        sqlx::query(r#"DELETE FROM groups WHERE id = $1"#)
-            .bind(id)
-            .execute(&mut tx)
-            .await?;
+        let docs = delete_group_tx(&mut tx, id).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(docs)
     }
 
     /// The org that owns a group, if it exists.
@@ -922,31 +1066,12 @@ impl Database {
         Ok(())
     }
 
-    /// Delete a workspace and all its files/blobs/documents.
-    pub async fn delete_workspace(&self, id: i64) -> Result<()> {
+    /// Hard-delete a workspace and return doc IDs for live eviction.
+    pub async fn delete_workspace(&self, id: i64) -> Result<Vec<String>> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            r#"DELETE FROM file_blob WHERE file_id IN (SELECT id FROM file WHERE workspace_id = $1)"#,
-        )
-        .bind(id)
-        .execute(&mut tx)
-        .await?;
-        sqlx::query(
-            r#"DELETE FROM document WHERE id IN (SELECT doc_id FROM file WHERE workspace_id = $1)"#,
-        )
-        .bind(id)
-        .execute(&mut tx)
-        .await?;
-        sqlx::query(r#"DELETE FROM file WHERE workspace_id = $1"#)
-            .bind(id)
-            .execute(&mut tx)
-            .await?;
-        sqlx::query(r#"DELETE FROM workspace WHERE id = $1"#)
-            .bind(id)
-            .execute(&mut tx)
-            .await?;
+        let docs = delete_workspace_tx(&mut tx, id).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(docs)
     }
 
     /// The org that owns the group containing a workspace, if it exists.
@@ -1010,7 +1135,7 @@ impl Database {
                FROM file f
                JOIN workspace w ON w.id = f.workspace_id
                JOIN groups g ON g.id = w.group_id
-               WHERE f.doc_id = $1"#,
+               WHERE f.doc_id = $1 AND f.kind = 'text'"#,
         )
         .bind(doc_id)
         .fetch_optional(&self.pool)
@@ -1039,7 +1164,8 @@ impl Database {
 
     // ----- Files -----
 
-    /// Create a file row in a workspace.
+    /// Create an empty collaborative text file. Document and file are inserted
+    /// atomically so no editor can observe an unseeded document.
     pub async fn create_file(
         &self,
         workspace_id: i64,
@@ -1049,7 +1175,49 @@ impl Database {
         mime: Option<&str>,
         now: i64,
     ) -> Result<FileRow> {
-        let row: (i64,) = sqlx::query_as(
+        self.insert_file(workspace_id, path, doc_id, kind, mime, None, None, now)
+            .await
+    }
+
+    /// Create an upload in one transaction. A failed blob/document write must
+    /// not leave a file row blocking the next upload of the same name.
+    pub async fn create_uploaded_file(
+        &self,
+        workspace_id: i64,
+        path: &str,
+        doc_id: &str,
+        mime: Option<&str>,
+        text: Option<&str>,
+        bytes: &[u8],
+        now: i64,
+    ) -> Result<FileRow> {
+        let kind = if text.is_some() { "text" } else { "binary" };
+        self.insert_file(workspace_id, path, doc_id, kind, mime, text, Some(bytes), now)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_file(
+        &self,
+        workspace_id: i64,
+        path: &str,
+        doc_id: &str,
+        kind: &str,
+        mime: Option<&str>,
+        text: Option<&str>,
+        bytes: Option<&[u8]>,
+        now: i64,
+    ) -> Result<FileRow> {
+        let mut tx = self.pool.begin().await?;
+        let existing: Vec<(String,)> =
+            sqlx::query_as("SELECT path FROM file WHERE workspace_id = $1")
+                .bind(workspace_id)
+                .fetch_all(&mut tx)
+                .await?;
+        if existing.iter().any(|(p,)| paths_overlap(p, path)) {
+            bail!("a file or folder already exists at that path");
+        }
+        let (id,): (i64,) = sqlx::query_as(
             r#"INSERT INTO file (workspace_id, path, doc_id, kind, mime, created_at)
                VALUES ($1, $2, $3, $4, $5, $6) RETURNING id"#,
         )
@@ -1059,16 +1227,30 @@ impl Database {
         .bind(kind)
         .bind(mime)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut tx)
         .await?;
+        if kind == "text" {
+            sqlx::query("INSERT INTO document (id, text, language) VALUES ($1, $2, NULL)")
+                .bind(doc_id)
+                .bind(text.unwrap_or(""))
+                .execute(&mut tx)
+                .await?;
+        } else if let Some(bytes) = bytes {
+            sqlx::query("INSERT INTO file_blob (file_id, data) VALUES ($1, $2)")
+                .bind(id)
+                .bind(bytes)
+                .execute(&mut tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(FileRow {
-            id: row.0,
+            id,
             workspace_id,
             path: path.to_string(),
             doc_id: doc_id.to_string(),
             kind: kind.to_string(),
             mime: mime.map(str::to_string),
-            size: 0,
+            size: bytes.map(|b| b.len() as i64).unwrap_or(0),
         })
     }
 
@@ -1101,13 +1283,29 @@ impl Database {
         .map_err(|e| e.into())
     }
 
-    /// Move/rename a file (change its path within the workspace).
+    /// Rename a file without silently creating a file/directory collision.
     pub async fn rename_file(&self, id: i64, path: &str) -> Result<()> {
-        sqlx::query(r#"UPDATE file SET path = $1 WHERE id = $2"#)
+        let mut tx = self.pool.begin().await?;
+        let row: (i64,) = sqlx::query_as("SELECT workspace_id FROM file WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut tx)
+            .await?;
+        let existing: Vec<(String,)> = sqlx::query_as(
+            "SELECT path FROM file WHERE workspace_id = $1 AND id != $2",
+        )
+        .bind(row.0)
+        .bind(id)
+        .fetch_all(&mut tx)
+        .await?;
+        if existing.iter().any(|(p,)| paths_overlap(p, path)) {
+            bail!("a file or folder already exists at that path");
+        }
+        sqlx::query("UPDATE file SET path = $1 WHERE id = $2")
             .bind(path)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1167,31 +1365,45 @@ impl Database {
         )
     }
 
-    /// Delete a file row and its underlying content (OT document or blob).
-    pub async fn delete_file(&self, id: i64) -> Result<()> {
+    /// Hard-delete files and their content atomically. Returns their document
+    /// IDs so the caller can close any live collaborative sessions immediately.
+    /// Unknown IDs fail the entire batch instead of reporting false success.
+    pub async fn delete_files(&self, ids: &[i64]) -> Result<Vec<String>> {
         let mut tx = self.pool.begin().await?;
-        let file: Option<FileRow> = sqlx::query_as(
-            r#"SELECT id, workspace_id, path, doc_id, kind, mime FROM file WHERE id = $1"#,
-        )
-        .bind(id)
-        .fetch_optional(&mut tx)
-        .await?;
-        if let Some(f) = file {
-            sqlx::query(r#"DELETE FROM file_blob WHERE file_id = $1"#)
+        let mut docs = Vec::with_capacity(ids.len());
+        let mut seen = HashSet::new();
+        for &id in ids {
+            if !seen.insert(id) {
+                bail!("duplicate file id");
+            }
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT doc_id FROM file WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&mut tx)
+                    .await?;
+            let (doc_id,) = row.ok_or_else(|| anyhow::anyhow!("file not found"))?;
+            sqlx::query("DELETE FROM file_blob WHERE file_id = $1")
                 .bind(id)
                 .execute(&mut tx)
                 .await?;
-            sqlx::query(r#"DELETE FROM file WHERE id = $1"#)
+            sqlx::query("DELETE FROM file WHERE id = $1")
                 .bind(id)
                 .execute(&mut tx)
                 .await?;
-            sqlx::query(r#"DELETE FROM document WHERE id = $1"#)
-                .bind(&f.doc_id)
+            sqlx::query("DELETE FROM document WHERE id = $1")
+                .bind(&doc_id)
                 .execute(&mut tx)
                 .await?;
+            docs.push(doc_id);
         }
         tx.commit().await?;
-        Ok(())
+        Ok(docs)
+    }
+
+    /// Delete a single file, with the same all-or-nothing semantics as a batch.
+    pub async fn delete_file(&self, id: i64) -> Result<String> {
+        let docs = self.delete_files(&[id]).await?;
+        Ok(docs.into_iter().next().expect("one requested file"))
     }
 
     /// Current SQLite database file size in bytes.
@@ -1221,6 +1433,101 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
         Ok(a + b)
+    }
+
+    /// Bytes in pages SQLite may reuse but the OS cannot reclaim until VACUUM.
+    pub async fn free_bytes(&self) -> Result<i64> {
+        let (pages,): (i64,) = sqlx::query_as("PRAGMA freelist_count")
+            .fetch_one(&self.pool)
+            .await?;
+        let (size,): (i64,) = sqlx::query_as("PRAGMA page_size")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(pages * size)
+    }
+
+    /// Daily in-app housekeeping. VACUUM is deliberately outside the tx: it
+    /// temporarily needs additional disk space and an exclusive write lock.
+    /// Avoid doing it for tiny files/short-lived free pages. Explicit owner
+    /// requests force compaction regardless of the free-page threshold.
+    pub async fn maintain(&self, now: i64, retention_days: i64, force: bool) -> Result<MaintenanceReport> {
+        let _guard = self.maintenance_lock.lock().await;
+        let db_bytes_before = self.db_size_bytes().await?;
+        let mut tx = self.pool.begin().await?;
+        let expired_sessions = sqlx::query("DELETE FROM session WHERE expires_at <= $1")
+            .bind(now)
+            .execute(&mut tx)
+            .await?
+            .rows_affected();
+        let orphan_documents = sqlx::query(
+            "DELETE FROM document WHERE NOT EXISTS (SELECT 1 FROM file WHERE file.doc_id = document.id AND file.kind = 'text')",
+        )
+        .execute(&mut tx)
+        .await?
+        .rows_affected();
+        let orphan_blobs = sqlx::query(
+            "DELETE FROM file_blob WHERE NOT EXISTS (SELECT 1 FROM file WHERE file.id = file_blob.file_id)",
+        )
+        .execute(&mut tx)
+        .await?
+        .rows_affected();
+        let orphan_reactions = sqlx::query(
+            "DELETE FROM reaction WHERE (kind = 'ws' AND NOT EXISTS (SELECT 1 FROM message WHERE message.id = reaction.msg_id)) OR (kind = 'dm' AND NOT EXISTS (SELECT 1 FROM dm WHERE dm.id = reaction.msg_id)) OR kind NOT IN ('ws', 'dm') OR NOT EXISTS (SELECT 1 FROM users WHERE users.id = reaction.user_id)",
+        )
+        .execute(&mut tx)
+        .await?
+        .rows_affected();
+        // Give in-flight pasted images a week to be referenced by a message.
+        // `instr` may keep a false-positive numeric prefix, never delete a
+        // referenced image. Images for a deleted org are already removed there.
+        let orphan_chat_images = sqlx::query(
+            "DELETE FROM chat_image WHERE created_at < $1 AND NOT EXISTS (SELECT 1 FROM message WHERE message.org_id = chat_image.org_id AND instr(message.body, '/api/chat-image/' || chat_image.id) > 0) AND NOT EXISTS (SELECT 1 FROM dm WHERE dm.org_id = chat_image.org_id AND instr(dm.body, '/api/chat-image/' || chat_image.id) > 0)",
+        )
+        .bind(now - 7 * 86400)
+        .execute(&mut tx)
+        .await?
+        .rows_affected();
+        let pruned_audit = sqlx::query("DELETE FROM audit WHERE created_at < $1")
+            .bind(now - retention_days.max(1) * 86400)
+            .execute(&mut tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+
+        let free_bytes_before = self.free_bytes().await?;
+        let vacuum_needed = force
+            || free_bytes_before >= 16 * 1024 * 1024
+                && free_bytes_before * 5 >= db_bytes_before;
+        // PASSIVE checkpoint does not wait for readers; a full VACUUM only
+        // starts if a TRUNCATE checkpoint obtains the lock. Neither can run in
+        // the cleanup transaction above.
+        let mode = if vacuum_needed { "TRUNCATE" } else { "PASSIVE" };
+        let (checkpoint_busy, _, _): (i64, i64, i64) =
+            sqlx::query_as(&format!("PRAGMA wal_checkpoint({mode})"))
+                .fetch_one(&self.pool)
+                .await?;
+        let vacuumed = vacuum_needed && checkpoint_busy == 0;
+        if vacuumed {
+            sqlx::query("VACUUM").execute(&self.pool).await?;
+            // VACUUM itself writes WAL pages; truncate those too when possible.
+            let _: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_one(&self.pool)
+                .await?;
+        }
+        sqlx::query("PRAGMA optimize").execute(&self.pool).await?;
+        Ok(MaintenanceReport {
+            db_bytes_before,
+            db_bytes_after: self.db_size_bytes().await?,
+            free_bytes_before,
+            vacuumed,
+            checkpoint_busy,
+            expired_sessions,
+            orphan_documents,
+            orphan_blobs,
+            orphan_reactions,
+            orphan_chat_images,
+            pruned_audit,
+        })
     }
 
     // ----- Group chat -----
@@ -1351,22 +1658,48 @@ impl Database {
         Ok(r.rows_affected() > 0)
     }
 
-    /// Delete a group-chat message — only the author. Returns true if removed.
-    pub async fn delete_message(&self, id: i64, user_id: i64) -> Result<bool> {
-        let r = sqlx::query(r#"DELETE FROM message WHERE id = $1 AND user_id = $2"#)
+    /// Delete a group-chat message (author or an authorized moderator).
+    /// Reactions are removed in the same transaction.
+    pub async fn delete_message(&self, id: i64, user_id: i64, moderator: bool) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let r = sqlx::query("DELETE FROM message WHERE id = $1 AND (user_id = $2 OR $3)")
             .bind(id)
             .bind(user_id)
-            .execute(&self.pool)
+            .bind(moderator)
+            .execute(&mut tx)
             .await?;
+        if r.rows_affected() > 0 {
+            sqlx::query("DELETE FROM reaction WHERE kind = 'ws' AND msg_id = $1")
+                .bind(id)
+                .execute(&mut tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(r.rows_affected() > 0)
     }
 
-    /// Clear a group's chat (admin/root only — enforced at the route).
+    /// The group a chat message belongs to, for authorization before moderation.
+    pub async fn message_group(&self, id: i64) -> Result<Option<i64>> {
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT group_id FROM message WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|(group_id,)| group_id))
+    }
+
+    /// Clear a group's chat and all reactions to its messages.
     pub async fn clear_messages(&self, group_id: i64) -> Result<()> {
-        sqlx::query(r#"DELETE FROM message WHERE group_id = $1"#)
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM reaction WHERE kind = 'ws' AND msg_id IN (SELECT id FROM message WHERE group_id = $1)")
             .bind(group_id)
-            .execute(&self.pool)
+            .execute(&mut tx)
             .await?;
+        sqlx::query("DELETE FROM message WHERE group_id = $1")
+            .bind(group_id)
+            .execute(&mut tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1445,29 +1778,61 @@ impl Database {
         Ok(r.rows_affected() > 0)
     }
 
-    /// Delete a direct message — only the sender. Returns true if removed.
+    /// Delete a direct message — only its sender; remove reactions as well.
     pub async fn delete_dm_message(&self, id: i64, sender_id: i64) -> Result<bool> {
-        let r = sqlx::query(r#"DELETE FROM dm WHERE id = $1 AND sender_id = $2"#)
+        let mut tx = self.pool.begin().await?;
+        let r = sqlx::query("DELETE FROM dm WHERE id = $1 AND sender_id = $2")
             .bind(id)
             .bind(sender_id)
-            .execute(&self.pool)
+            .execute(&mut tx)
             .await?;
+        if r.rows_affected() > 0 {
+            sqlx::query("DELETE FROM reaction WHERE kind = 'dm' AND msg_id = $1")
+                .bind(id)
+                .execute(&mut tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(r.rows_affected() > 0)
     }
 
-    /// Clear the whole conversation between two users (either party may do this).
+    /// Clear a 1:1 conversation for both parties (and remove its reactions).
     pub async fn clear_dm(&self, org_id: i64, a: i64, b: i64) -> Result<()> {
-        sqlx::query(
-            r#"DELETE FROM dm WHERE org_id = $1
-               AND ((sender_id = $2 AND recipient_id = $3)
-                 OR (sender_id = $3 AND recipient_id = $2))"#,
-        )
-        .bind(org_id)
-        .bind(a)
-        .bind(b)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        let where_pair = "org_id = $1 AND ((sender_id = $2 AND recipient_id = $3) OR (sender_id = $3 AND recipient_id = $2))";
+        sqlx::query(&format!("DELETE FROM reaction WHERE kind = 'dm' AND msg_id IN (SELECT id FROM dm WHERE {where_pair})"))
+            .bind(org_id)
+            .bind(a)
+            .bind(b)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query(&format!("DELETE FROM dm WHERE {where_pair}"))
+            .bind(org_id)
+            .bind(a)
+            .bind(b)
+            .execute(&mut tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    /// Message context for checking reaction permissions.
+    pub async fn reaction_context(&self, kind: &str, msg_id: i64) -> Result<Option<(i64, i64, i64)>> {
+        if kind == "ws" {
+            // (group_id, org_id, author_id)
+            sqlx::query_as("SELECT group_id, org_id, user_id FROM message WHERE id = $1 AND group_id IS NOT NULL")
+                .bind(msg_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(Into::into)
+        } else {
+            // (sender_id, org_id, recipient_id)
+            sqlx::query_as("SELECT sender_id, org_id, recipient_id FROM dm WHERE id = $1")
+                .bind(msg_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(Into::into)
+        }
     }
 
     // ----- Presence (heartbeat) -----
@@ -1707,14 +2072,24 @@ impl Database {
         &self,
         tables: &[(String, Vec<serde_json::Value>)],
     ) -> Result<()> {
+        use sqlx::Row;
+        let supplied: HashSet<&str> = tables.iter().map(|(name, _)| name.as_str()).collect();
+        if tables.len() != Self::MIGRATE_TABLES.len()
+            || !Self::MIGRATE_TABLES.iter().all(|name| supplied.contains(name))
+        {
+            bail!("incomplete or invalid export tables");
+        }
         let mut tx = self.pool.begin().await?;
-        // Wipe in reverse dependency order; sessions die with the old users.
+        // Sessions reference users (the first export table). Clear them BEFORE
+        // deleting users; leaving this until afterward made every import fail
+        // under SQLx's default foreign-key enforcement.
+        sqlx::query("DELETE FROM session").execute(&mut tx).await?;
+        sqlx::query("DELETE FROM audit").execute(&mut tx).await?;
         for table in Self::MIGRATE_TABLES.iter().rev() {
             sqlx::query(&format!("DELETE FROM {}", table))
                 .execute(&mut tx)
                 .await?;
         }
-        sqlx::query("DELETE FROM session").execute(&mut tx).await?;
         for (table, rows) in tables {
             if rows.is_empty() {
                 continue;
@@ -1729,12 +2104,13 @@ impl Database {
             // Only manifest columns that actually exist in the schema are
             // interpolated into the INSERT; everything else is a corrupted
             // export and is skipped rather than executed.
-            let real: Vec<(String,)> =
-                sqlx::query_as(&format!("PRAGMA table_info({})", table))
-                    .fetch_all(&mut *tx)
-                    .await?;
-            let real: std::collections::HashSet<String> =
-                real.into_iter().map(|(n,)| n).collect();
+            let real = sqlx::query(&format!("PRAGMA table_info({})", table))
+                .fetch_all(&mut *tx)
+                .await?;
+            let real: HashSet<String> = real
+                .iter()
+                .map(|row| row.try_get::<String, _>("name"))
+                .collect::<std::result::Result<_, _>>()?;
             names.retain(|n| real.contains(n));
             for row in rows {
                 let map = match row {
@@ -1780,6 +2156,19 @@ impl Database {
                 q.execute(&mut tx).await?;
             }
         }
+        let (owners,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM users WHERE role = 'root'")
+                .fetch_one(&mut tx)
+                .await?;
+        if owners == 0 {
+            bail!("export has no owner account");
+        }
+        let (violations,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&mut tx)
+            .await?;
+        if violations > 0 {
+            bail!("export has {violations} broken foreign keys");
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -1788,6 +2177,94 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::Database;
+
+    async fn test_database() -> (tempfile::NamedTempFile, Database) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let uri = format!("sqlite://{}", file.path().to_str().unwrap());
+        let db = Database::new(&uri).await.unwrap();
+        (file, db)
+    }
+
+    async fn assert_no_bad_foreign_keys(db: &Database) {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn hard_delete_never_resurrects_document() {
+        let (_tmp, db) = test_database().await;
+        let hash = "test";
+        db.create_user_if_absent("owner", "Owner", hash, "root", None)
+            .await.unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let org = db.create_org("Org", "org", 1).await.unwrap();
+        let group = db.create_group(org.id, "Team", owner.id, 1, "group").await.unwrap();
+        let ws = db.create_workspace(group.id, "Project", owner.id, 1).await.unwrap();
+        let file = db.create_file(ws.id, "hello.txt", "test-doc", "text", None, 1)
+            .await.unwrap();
+        assert_eq!(db.load(&file.doc_id).await.unwrap().text, "");
+        db.store(&file.doc_id, &super::PersistedDocument {
+            text: "saved".into(), language: None
+        }).await.unwrap();
+        assert_eq!(db.delete_file(file.id).await.unwrap(), file.doc_id);
+        assert!(db.store(&file.doc_id, &super::PersistedDocument {
+            text: "ghost".into(), language: None
+        }).await.is_err());
+        assert!(db.load(&file.doc_id).await.is_err());
+        assert_no_bad_foreign_keys(&db).await;
+    }
+
+    #[tokio::test]
+    async fn user_and_org_deletes_clean_dependents() {
+        let (_tmp, db) = test_database().await;
+        db.create_user_if_absent("owner", "Owner", "hash", "root", None).await.unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let org = db.create_org("Org", "org", 1).await.unwrap();
+        db.create_user_if_absent("alice", "Alice", "hash", "user", Some(org.id)).await.unwrap();
+        db.create_user_if_absent("bob", "Bob", "hash", "user", Some(org.id)).await.unwrap();
+        let alice = db.get_user_by_email("alice").await.unwrap().unwrap();
+        let bob = db.get_user_by_email("bob").await.unwrap().unwrap();
+        let personal = db.create_group(org.id, "Personal", alice.id, 1, "personal").await.unwrap();
+        let private_ws = db.create_workspace(personal.id, "Secrets", alice.id, 1).await.unwrap();
+        let private_file = db.create_file(private_ws.id, "secret.txt", "private-doc", "text", None, 1).await.unwrap();
+        let shared = db.create_group(org.id, "Shared", alice.id, 1, "group").await.unwrap();
+        db.add_group_member(shared.id, bob.id, "member").await.unwrap();
+        let shared_ws = db.create_workspace(shared.id, "Project", alice.id, 1).await.unwrap();
+        db.create_file(shared_ws.id, "keep.txt", "shared-doc", "text", None, 1).await.unwrap();
+        db.create_message(shared.id, alice.id, "hello", 1).await.unwrap();
+        db.create_dm(org.id, alice.id, bob.id, "hi", 1).await.unwrap();
+        db.create_chat_image(org.id, Some("image/png"), b"img", 1).await.unwrap();
+        let docs = db.admin_delete_user(alice.id).await.unwrap();
+        assert!(docs.contains(&private_file.doc_id));
+        assert!(db.get_group(personal.id).await.unwrap().is_none());
+        assert_eq!(db.get_group(shared.id).await.unwrap().unwrap().created_by, owner.id);
+        assert_eq!(db.get_workspace(shared_ws.id).await.unwrap().unwrap().created_by, owner.id);
+        assert_eq!(db.load("shared-doc").await.unwrap().text, "");
+        assert_eq!(db.table_rows("message").await.unwrap(), 0);
+        assert_eq!(db.table_rows("dm").await.unwrap(), 0);
+        assert_no_bad_foreign_keys(&db).await;
+        assert_eq!(db.delete_org(org.id).await.unwrap(), vec!["shared-doc"]);
+        assert_eq!(db.table_rows("chat_image").await.unwrap(), 0);
+        assert_eq!(db.user_org(bob.id).await.unwrap(), None);
+        assert_no_bad_foreign_keys(&db).await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_prunes_and_compacts() {
+        let (_tmp, db) = test_database().await;
+        sqlx::query("INSERT INTO document (id, text) VALUES ('orphan', 'unused')")
+            .execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO audit (action, created_at) VALUES ('old', 1)")
+            .execute(&db.pool).await.unwrap();
+        let report = db.maintain(200 * 86400, 180, true).await.unwrap();
+        assert_eq!(report.orphan_documents, 1);
+        assert_eq!(report.pruned_audit, 1);
+        assert!(report.vacuumed);
+        assert_eq!(db.table_rows("document").await.unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn migrations_remove_ai_schema() {
