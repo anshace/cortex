@@ -1233,7 +1233,7 @@ function OrgMembersPanel({ me }: { me: Me }) {
 }
 
 // ----- Storage (owner only) -----
-function humanBytes(n: number): string {
+export function humanBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   const units = ["KB", "MB", "GB", "TB"];
   let v = n / 1024;

@@ -2472,6 +2472,41 @@ impl Database {
 
     // ----- Audit log -----
 
+    /// Read an instance-level switch. `None` means never set, so callers pick
+    /// their own default.
+    pub async fn setting(&self, key: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM app_setting WHERE key = $1")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Create or replace an instance-level switch.
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO app_setting (key, value) VALUES ($1, $2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Whether security events are being recorded. Off is only ever an explicit
+    /// choice, so an absent row means on.
+    pub async fn audit_enabled(&self) -> bool {
+        self.setting("audit_enabled")
+            .await
+            .ok()
+            .flatten()
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    }
+
     /// Append an audit entry. Best-effort — callers ignore the result.
     pub async fn audit(
         &self,
@@ -2481,6 +2516,9 @@ impl Database {
         detail: Option<&str>,
         now: i64,
     ) -> Result<()> {
+        if !self.audit_enabled().await {
+            return Ok(());
+        }
         sqlx::query(
             r#"INSERT INTO audit (org_id, user_id, action, detail, created_at) VALUES ($1, $2, $3, $4, $5)"#,
         )
@@ -2492,6 +2530,20 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Drop recorded events — every org's for root, otherwise one org's.
+    /// Returns how many rows went away.
+    pub async fn clear_audit(&self, org_id: Option<i64>, all: bool) -> Result<u64> {
+        let n = if all {
+            sqlx::query("DELETE FROM audit").execute(&self.pool).await?
+        } else {
+            sqlx::query("DELETE FROM audit WHERE org_id = $1")
+                .bind(org_id)
+                .execute(&self.pool)
+                .await?
+        };
+        Ok(n.rows_affected())
     }
 
     /// Recent audit entries: an org's when `all` is false, otherwise every org's

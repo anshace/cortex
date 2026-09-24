@@ -746,6 +746,31 @@ pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl F
         .and(with_db(db.clone()))
         .and_then(admin_compact);
 
+    // Audit logging controls (root only). The log writes a row on every login
+    // and nothing else ever removes those rows but the retention sweep, so on a
+    // small single-file deployment stopping it is a capacity decision — the
+    // owner has to be able to make one.
+    let audit_get_r = warp::path!("admin" / "audit")
+        .and(warp::get())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(admin_audit_get);
+
+    let audit_set_r = warp::path!("admin" / "audit")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::body::json())
+        .and_then(admin_audit_set);
+
+    let audit_clear_r = warp::path!("admin" / "audit")
+        .and(warp::delete())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(admin_audit_clear);
+
+    let audit_admin_r = audit_get_r.or(audit_set_r).or(audit_clear_r).boxed();
+
     // Whole-instance migration (root only): export every table + blobs as one
     // zip, or restore such a zip into this instance.
     let admin_export_all_r = warp::path!("admin" / "export-all")
@@ -811,6 +836,7 @@ pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl F
         .or(audit_r)
         .or(storage_r)
         .or(compact_r)
+        .or(audit_admin_r)
         .or(admin_all_r)
         .or(file_ops)
         .or(ws_ops)
@@ -2476,6 +2502,72 @@ async fn admin_compact(user: User, db: Database) -> Result<impl Reply, Rejection
         Err(e) => {
             warn!("owner compact: {e}");
             Ok(err(StatusCode::SERVICE_UNAVAILABLE, "compaction failed; see server log"))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AuditToggle {
+    enabled: bool,
+}
+
+/// Root-only: is the audit log recording, and how many rows is it holding?
+async fn admin_audit_get(user: User, db: Database) -> Result<impl Reply, Rejection> {
+    if user.role != "root" {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    let enabled = db.audit_enabled().await;
+    let rows = db.table_rows("audit").await.unwrap_or(0);
+    Ok(warp::reply::json(&json!({ "enabled": enabled, "rows": rows })).into_response())
+}
+
+async fn admin_audit_set(
+    user: User,
+    db: Database,
+    body: AuditToggle,
+) -> Result<impl Reply, Rejection> {
+    if user.role != "root" {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    // Recorded before the switch flips: once recording is off there is nothing
+    // left to write the fact that it was turned off with.
+    let _ = db
+        .audit(
+            None,
+            Some(user.id),
+            if body.enabled { "audit_on" } else { "audit_off" },
+            None,
+            now_secs(),
+        )
+        .await;
+    if let Err(e) = db
+        .set_setting("audit_enabled", if body.enabled { "1" } else { "0" })
+        .await
+    {
+        warn!("audit toggle: {e}");
+        return Ok(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "could not update the audit setting",
+        ));
+    }
+    let rows = db.table_rows("audit").await.unwrap_or(0);
+    Ok(warp::reply::json(&json!({ "enabled": body.enabled, "rows": rows })).into_response())
+}
+
+async fn admin_audit_clear(user: User, db: Database) -> Result<impl Reply, Rejection> {
+    if user.role != "root" {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    match db.clear_audit(None, true).await {
+        Ok(removed) => {
+            let _ = db
+                .audit(None, Some(user.id), "audit_cleared", None, now_secs())
+                .await;
+            Ok(warp::reply::json(&json!({ "removed": removed })).into_response())
+        }
+        Err(e) => {
+            warn!("audit clear: {e}");
+            Ok(err(StatusCode::SERVICE_UNAVAILABLE, "could not clear the audit log"))
         }
     }
 }

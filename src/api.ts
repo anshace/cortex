@@ -624,6 +624,21 @@ export async function getAudit(): Promise<{ entries: AuditEntry[] }> {
   return json(await fetch("/api/audit", { credentials: "include" }));
 }
 
+// Root-only controls over the log itself: it writes a row on every login, so
+// being able to stop it and clear it is a capacity decision for the owner.
+export type AuditSettings = { enabled: boolean; rows: number };
+export async function getAuditSettings(): Promise<AuditSettings> {
+  return json(await fetch("/api/admin/audit", { credentials: "include" }));
+}
+export async function setAuditSettings(
+  enabled: boolean,
+): Promise<AuditSettings> {
+  return json(await fetch("/api/admin/audit", opts("POST", { enabled })));
+}
+export async function clearAuditLog(): Promise<{ removed: number }> {
+  return json(await fetch("/api/admin/audit", opts("DELETE")));
+}
+
 // The conversation a pasted image is being uploaded into. The server records it
 // alongside the blob and only serves the image back inside that conversation.
 export type ChatConversation = { groupId?: number; dmWith?: number };
