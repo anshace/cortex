@@ -32,10 +32,12 @@ import {
   VscColorMode,
   VscDatabase,
   VscHistory,
+  VscOrganization,
   VscShield,
 } from "react-icons/vsc";
 import useLocalStorageState from "use-local-storage-state";
 
+import PasswordResetDialog from "./PasswordResetDialog";
 import * as api from "./api";
 import { Me } from "./api";
 import { EditorPrefs, useEditorPrefs } from "./editorPrefs";
@@ -49,6 +51,7 @@ type Section =
   | "security"
   | "notifications"
   | "activity"
+  | "members"
   | "storage";
 
 type Props = {
@@ -62,6 +65,8 @@ const NAV: {
   label: string;
   icon: typeof VscAccount;
   adminOnly?: boolean;
+  ownerOnly?: boolean;
+  orgAdminOnly?: boolean;
 }[] = [
   { id: "profile", label: "Profile", icon: VscAccount },
   { id: "appearance", label: "Appearance", icon: VscColorMode },
@@ -70,7 +75,8 @@ const NAV: {
   { id: "security", label: "Security", icon: VscShield },
   { id: "notifications", label: "Notifications", icon: VscBell },
   { id: "activity", label: "Activity", icon: VscHistory, adminOnly: true },
-  { id: "storage", label: "Storage", icon: VscDatabase, adminOnly: true },
+  { id: "members", label: "Org members", icon: VscOrganization, orgAdminOnly: true },
+  { id: "storage", label: "Storage", icon: VscDatabase, ownerOnly: true },
 ];
 
 function Settings({ me, onClose, onUpdated }: Props) {
@@ -103,7 +109,11 @@ function Settings({ me, onClose, onUpdated }: Props) {
           borderColor="surface.border"
           flexShrink={0}
         >
-          {NAV.filter((n) => !n.adminOnly || isAdmin).map((n) => {
+          {NAV.filter((n) =>
+            (!n.adminOnly || isAdmin) &&
+            (!n.ownerOnly || me?.role === "root") &&
+            (!n.orgAdminOnly || me?.role === "admin"),
+          ).map((n) => {
             const active = section === n.id;
             return (
               <Flex
@@ -141,7 +151,8 @@ function Settings({ me, onClose, onUpdated }: Props) {
             )}
             {section === "notifications" && <NotificationsPanel />}
             {section === "activity" && isAdmin && <ActivityPanel />}
-            {section === "storage" && isAdmin && <StoragePanel />}
+            {section === "members" && me?.role === "admin" && <OrgMembersPanel me={me} />}
+            {section === "storage" && me?.role === "root" && <StoragePanel />}
           </Box>
         </Box>
       </Flex>
@@ -1105,7 +1116,121 @@ function ActivityPanel() {
   );
 }
 
-// ----- Storage (owner / admin) -----
+// ----- Org-scoped account management (org admins only) -----
+function OrgMembersPanel({ me }: { me: Me }) {
+  const toast = useToast();
+  const [members, setMembers] = useState<api.AdminUser[]>([]);
+  const [resetTarget, setResetTarget] = useState<api.AdminUser | null>(null);
+  const [email, setEmail] = useState("");
+  const [name, setName] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState("user");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(() => {
+    api.adminListUsers().then((r) => setMembers(r.users)).catch((e) => fail(toast, e));
+  }, [toast]);
+  useEffect(refresh, [refresh]);
+
+  async function run(task: () => Promise<unknown>, message: string) {
+    setBusy(true);
+    try {
+      await task();
+      refresh();
+      toast({ title: message, status: "success", duration: 2500 });
+    } catch (e) {
+      fail(toast, e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <PanelHead title="Org members" sub="Create accounts and manage people in your org only. The owner manages org assignment and cross-org access." />
+      <Card>
+        <Text fontWeight={600} fontSize="sm" mb={3}>Add a member</Text>
+        <Box as="form" onSubmit={(e: FormEvent) => {
+          e.preventDefault();
+          void run(async () => {
+            await api.adminCreateUser({ email, name, password, role, org_id: null });
+            setEmail(""); setName(""); setPassword(""); setRole("user");
+          }, "Member created");
+        }}>
+          <VStack spacing={2.5} align="stretch">
+            <HStack flexWrap="wrap">
+              <Input size="sm" minW="160px" flex={1} placeholder="Login username" value={email} onChange={(e) => setEmail(e.target.value)} isRequired />
+              <Input size="sm" minW="160px" flex={1} placeholder="Display name" value={name} onChange={(e) => setName(e.target.value)} />
+            </HStack>
+            <HStack flexWrap="wrap">
+              <Input size="sm" minW="160px" flex={1} type="password" autoComplete="new-password" placeholder="Password (8+ characters)" value={password} onChange={(e) => setPassword(e.target.value)} isRequired />
+              <Select size="sm" maxW="130px" bg="surface.raised" value={role} onChange={(e) => setRole(e.target.value)}>
+                <option value="user">Member</option>
+                <option value="admin">Org admin</option>
+              </Select>
+              <Button size="sm" type="submit" isDisabled={busy || !email.trim() || password.length < 8}>Create</Button>
+            </HStack>
+          </VStack>
+        </Box>
+      </Card>
+      <Card>
+        <Text fontWeight={600} fontSize="sm" mb={3}>People ({members.length})</Text>
+        <VStack align="stretch" spacing={0}>
+          {members.map((member, index) => {
+            const self = member.email === me.email;
+            return (
+              <Flex key={member.id} py={2.5} gap={2} align="center" flexWrap="wrap"
+                borderTop={index ? "1px solid" : undefined} borderColor="surface.border">
+                <Box minW="145px" flex={1}>
+                  <Text fontSize="sm" fontWeight={600} noOfLines={1}>{member.name || member.email}{self ? " (you)" : ""}</Text>
+                  <Text fontSize="xs" color="ink.subtle" noOfLines={1}>{member.email}</Text>
+                </Box>
+                {self ? (
+                  <Text fontSize="xs" color="ink.muted">Org admin</Text>
+                ) : (
+                  <>
+                    <Select aria-label={`Role for ${member.email}`} size="xs" w="105px" bg="surface.raised" value={member.role}
+                      isDisabled={busy}
+                      onChange={(e) => void run(() => api.adminUpdateUser(member.id, { role: e.target.value }), "Role updated; member signed out")}>
+                      <option value="user">Member</option><option value="admin">Org admin</option>
+                    </Select>
+                    <Button size="xs" variant="ghost" isDisabled={busy} onClick={() => {
+                      const value = window.prompt(`Login username for ${member.email}:`, member.email);
+                      if (value !== null) void run(() => api.adminUpdateUser(member.id, { email: value }), "Username updated; member signed out");
+                    }}>Username</Button>
+                    <Button size="xs" variant="ghost" isDisabled={busy} onClick={() => {
+                      const value = window.prompt(`Display name for ${member.email}:`, member.name);
+                      if (value !== null) void run(() => api.adminUpdateUser(member.id, { name: value }), "Name updated");
+                    }}>Name</Button>
+                    <Button size="xs" variant="ghost" isDisabled={busy}
+                      onClick={() => setResetTarget(member)}>Reset password</Button>
+                    <Button size="xs" variant="ghost" isDisabled={busy} onClick={() => {
+                      if (window.confirm(`Reset two-factor for ${member.email}? All their sessions will be revoked.`))
+                        void run(() => api.adminReset2fa(member.id), "Two-factor reset; member signed out");
+                    }}>Reset 2FA</Button>
+                    <Button size="xs" colorScheme="red" variant="ghost" isDisabled={busy} onClick={() => {
+                      if (window.confirm(`Permanently delete ${member.email} and their personal files? This cannot be undone.`))
+                        void run(() => api.adminDeleteUser(member.id), "Member and personal data deleted");
+                    }}>Delete</Button>
+                  </>
+                )}
+              </Flex>
+            );
+          })}
+          {members.length === 0 && <Text fontSize="sm" color="ink.muted">No members yet.</Text>}
+        </VStack>
+      </Card>
+      <PasswordResetDialog target={resetTarget} onClose={() => setResetTarget(null)}
+        onReset={async (id, password) => {
+          await api.adminResetPassword(id, password);
+          refresh();
+          toast({ title: "Password reset; member signed out", status: "success" });
+        }} />
+    </>
+  );
+}
+
+// ----- Storage (owner only) -----
 function humanBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   const units = ["KB", "MB", "GB", "TB"];
@@ -1122,6 +1247,8 @@ function StoragePanel() {
   const toast = useToast();
   const [data, setData] = useState<api.StorageStats | null>(null);
   const [loading, setLoading] = useState(true);
+  const [compacting, setCompacting] = useState(false);
+  const [report, setReport] = useState<api.MaintenanceReport | null>(null);
 
   useEffect(() => {
     api
@@ -1130,6 +1257,24 @@ function StoragePanel() {
       .catch((e) => fail(toast, e))
       .finally(() => setLoading(false));
   }, [toast]);
+
+  async function compact() {
+    if (!window.confirm("Compact the SQLite database now? This may briefly pause writes and needs free disk space. Back up important data first.")) return;
+    setCompacting(true);
+    try {
+      const result = await api.compactNow();
+      setReport(result);
+      setData(await api.getStorage());
+      toast({
+        title: result.vacuumed ? "Database compacted" : "Cleanup complete; readers blocked compaction",
+        status: result.vacuumed ? "success" : "warning",
+      });
+    } catch (e) {
+      fail(toast, e);
+    } finally {
+      setCompacting(false);
+    }
+  }
 
   const rows = [...(data?.tables ?? [])].sort((a, b) => b.rows - a.rows);
 
@@ -1171,6 +1316,26 @@ function StoragePanel() {
               </Text>
             </Card>
           </SimpleGrid>
+          <Card>
+            <Flex justify="space-between" align="center" gap={4} flexWrap="wrap">
+              <Box>
+                <Text fontSize="sm" fontWeight={600}>SQLite maintenance</Text>
+                <Text fontSize="xs" color="ink.muted" mt={1}>
+                  {humanBytes(data.free_bytes)} in reusable pages. Cleanup runs daily inside the app, whether in Docker or not.
+                  Manual compaction checkpoints the WAL and reclaims file space.
+                </Text>
+              </Box>
+              <Button size="sm" onClick={compact} isLoading={compacting} loadingText="Compacting…" flexShrink={0}>
+                Compact now
+              </Button>
+            </Flex>
+            {report && (
+              <Text fontSize="xs" color="ink.muted" mt={3}>
+                {report.vacuumed ? `Database file: ${humanBytes(report.db_bytes_before)} → ${humanBytes(report.db_bytes_after)}.` : "Reader activity prevented vacuum; try again later."}
+                {` Removed ${report.orphan_documents} orphan documents, ${report.expired_sessions} expired sessions and ${report.pruned_audit} old audit entries.`}
+              </Text>
+            )}
+          </Card>
           <Card>
             <Text fontSize="sm" fontWeight={600} mb={2}>
               Rows by table

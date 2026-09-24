@@ -14,6 +14,7 @@ services:
       - SQLITE_URI=sqlite:///data/authpad.db
       - COOKIE_SECURE=1
       - RUST_LOG=info
+      - CORTEX_AUDIT_RETENTION_DAYS=${CORTEX_AUDIT_RETENTION_DAYS:-180}
       # First-run owner login (admin/admin by default). Override to set your own on
       # a fresh database; ignored once any user exists. Change it on first login.
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}

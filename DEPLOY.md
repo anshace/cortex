@@ -60,13 +60,33 @@ DOMAIN=your-domain.example docker compose -f docker-compose.prod.yml up -d --bui
 Caddy issues the cert on the first request, so DNS must already resolve to the
 box and ports 80+443 must be open. DNS propagation can take a while (up to a day).
 
-## 5. Backups (the whole DB is one file)
+## 5. Backups and in-app maintenance
+
+**Do not copy a live `authpad.db` directly.** SQLite uses WAL: recent writes may
+still be in `authpad.db-wal`, so `cp` of only the main file can silently omit
+data. The owner can download a portable **Data → Export everything (.zip)**
+from the console. It includes account password hashes and 2FA secrets; encrypt
+and protect it, and test restoring it on a separate installation.
+
+For a scheduled *database* backup, use SQLite's online backup API instead of
+copying the live file. With the compose stack, run this from the project dir
+(the volume name normally includes the compose project prefix; check `docker
+volume ls` and replace `cortex_cortex-data` below if yours differs):
 
 ```sh
-crontab -e
-# daily 03:00 snapshot of the SQLite volume:
-0 3 * * * docker run --rm -v cortex_cortex-data:/data -v $HOME/backups:/out alpine cp /data/authpad.db /out/authpad-$(date +\%F).db
+mkdir -p "$HOME/backups" && chmod 700 "$HOME/backups"
+docker run --rm -v cortex_cortex-data:/data:ro -v "$HOME/backups:/out" \
+  alpine sh -c 'apk add --no-cache -q sqlite >/dev/null && \
+    sqlite3 "file:/data/authpad.db?mode=ro" ".backup /out/authpad-$(date +%F).db" && \
+    chmod 600 /out/authpad-$(date +%F).db'
 ```
+
+A backup schedule is optional and **not** needed for database cleanup. The Rust
+server runs maintenance itself (five minutes after startup, then every 24 hours):
+prunes expired sessions/orphans/old audit entries, checkpoints WAL and VACUUMs
+when enough space is reusable. Set `CORTEX_AUDIT_RETENTION_DAYS` (default 180)
+to tune audit history. The owner can force a run from **Settings → Storage →
+Compact now**; no cron, sidecar, or Docker-specific script is required.
 
 ## Updating
 
@@ -189,8 +209,8 @@ DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.prod.yml up -d
 
 The current image runs **one container** (app + Caddy + auto-HTTPS). No
 docker-compose needed on the box. Everything below is copy-paste, tested against a
-real deploy. Volume: `cortex-data`; the whole DB is one file, `/data/authpad.db`;
-the app runs as **uid 1000**.
+real deploy. Volume: `cortex-data`; SQLite uses `/data/authpad.db` plus its temporary WAL/SHM
+companions while running; the app runs as **uid 1000**.
 
 ## Golden rules (read once, save yourself hours)
 
@@ -236,20 +256,33 @@ sudo docker run -d --name cortex -p 80:80 -p 443:443 \
 sudo docker image prune -f
 ```
 
-## Backup & restore (the DB is one file)
+## Backup & restore (WAL-safe)
+
+**Never `cp` a running `authpad.db` by itself:** WAL may contain uncheckpointed
+transactions. Use the owner console's **Data → Export everything** to download
+an importable ZIP, or take an online SQLite backup while the app keeps running:
 
 ```sh
-# daily backup (crontab -e):
-0 3 * * * docker run --rm -v cortex-data:/d -v $HOME/backups:/out alpine cp /d/authpad.db /out/authpad-$(date +\%F).db
+mkdir -p "$HOME/backups" && chmod 700 "$HOME/backups"
+sudo docker run --rm -v cortex-data:/data:ro -v "$HOME/backups:/out" alpine sh -c \
+  'apk add --no-cache -q sqlite >/dev/null && \
+   sqlite3 "file:/data/authpad.db?mode=ro" ".backup /out/authpad-$(date +%F).db" && \
+   chmod 600 /out/authpad-$(date +%F).db'
 
-# manual export (to move boxes):
-sudo docker run --rm -v cortex-data:/d -v /var/tmp/alpha:/out alpine cp /d/authpad.db /out/authpad.db
-
-# restore onto a (new) box — seed BEFORE first start, then chown:
-sudo docker run --rm -v cortex-data:/d -v /var/tmp/alpha:/in alpine cp /in/authpad.db /d/authpad.db
-sudo docker run --rm -v cortex-data:/d alpine chown -R 1000:1000 /d   # <-- never skip
-# then the `docker run ...` above
+# Restore an offline .db backup on a NEW box BEFORE first start:
+sudo docker run --rm -v cortex-data:/data -v "$HOME/backups:/in:ro" \
+  alpine cp /in/authpad-YYYY-MM-DD.db /data/authpad.db
+sudo docker run --rm -v cortex-data:/data alpine chown -R 1000:1000 /data
+# Start the app only after the database is in place.
 ```
+
+Alternatively, restore an owner ZIP from **Data → Import archive** on a test or
+fresh instance: it replaces application data transactionally and signs everyone
+out. The ZIP contains credentials (password hashes, 2FA secrets); store it
+encrypted. Test a restore periodically. This online backup command is separate
+from maintenance: scheduled pruning, WAL checkpointing and conditional VACUUM
+run **inside Rust** every 24 hours, with **Settings → Storage → Compact now**
+(owner only). A backup cron is optional; no maintenance cron or sidecar is used.
 
 ## Inspect / edit the DB directly
 

@@ -7,6 +7,7 @@ import {
   ReactNode,
   forwardRef,
   memo,
+  useEffect,
   useImperativeHandle,
   useMemo,
   useRef,
@@ -40,6 +41,31 @@ const BASE = 8; // left padding of the root level
 const INDENT = 12; // per-depth indentation
 const CHEV = 16; // width of the twisty/chevron column (files reserve it too)
 const CHUNK = 300; // children rendered per level before a "show more" row
+export const CORTEX_DRAG_MIME = "application/x-cortex-files";
+export type ExplorerDrag = {
+  kind: "cortex-files";
+  sourceWsId: number;
+  entries: { id: number; rel: string }[];
+};
+export function parseExplorerDrag(raw: string): ExplorerDrag | null {
+  try {
+    const v = JSON.parse(raw) as ExplorerDrag;
+    if (
+      v.kind !== "cortex-files" ||
+      !Number.isSafeInteger(v.sourceWsId) ||
+      !Array.isArray(v.entries) ||
+      !v.entries.length ||
+      v.entries.length > 1000 ||
+      !v.entries.every(
+        (e) => Number.isSafeInteger(e.id) && typeof e.rel === "string",
+      )
+    )
+      return null;
+    return v;
+  } catch {
+    return null;
+  }
+}
 
 type TreeNode = {
   name: string;
@@ -116,19 +142,27 @@ export type FileTreeHandle = {
 
 type Props = {
   files: FileRow[];
+  workspaceId: number;
   rootName: string;
   activeFileId: number | null;
   collapsed: Set<string>;
   onToggle: (path: string) => void;
   onOpen: (f: FileRow) => void;
   onDownload: (f: FileRow) => void;
+  onDownloadMany: (files: FileRow[], name: string) => void;
   onDelete: (files: FileRow[], label: string) => void;
   onMove: (fileId: number, newPath: string) => void;
+  onTransfer: (
+    mode: "copy" | "move",
+    items: { id: number; path: string }[],
+    onConflict: "rename" | "error",
+  ) => Promise<void>;
+  clipboard: ClipboardState;
+  onClipboardChange: (clipboard: ClipboardState) => void;
   onCreate: (path: string) => void;
   onUpload: (dir: string) => void;
   onUploadFolder: (dir: string) => void;
   onUploadFiles: (dir: string, items: UploadItem[]) => void;
-  onCopyItems: (dir: string, items: { file: FileRow; rel: string }[]) => void;
 };
 
 // True when the drag carries OS files (external upload) vs an internal move.
@@ -210,7 +244,7 @@ async function collectDrops(
 
 type EditState = { path: string; initial: string } | null;
 type CreateState = { parent: string; kind: "file" | "folder" | "board" } | null;
-type ClipboardState = {
+export type ClipboardState = {
   mode: "cut" | "copy";
   items: { file: FileRow; rel: string }[];
 } | null;
@@ -235,7 +269,9 @@ const FileTree = memo(
       onUpload,
       onUploadFolder,
       onUploadFiles,
-      onCopyItems,
+      onTransfer,
+      clipboard,
+      onClipboardChange,
       onToggle,
       collapsed,
     } = props;
@@ -253,8 +289,23 @@ const FileTree = memo(
     const [rootOpen, setRootOpen] = useState(true);
     const [selected, setSelected] = useState<Set<number>>(new Set());
     const [externalOver, setExternalOver] = useState(false);
-    const [clipboard, setClipboard] = useState<ClipboardState>(null);
     const lastClick = useRef<number | null>(null);
+
+    useEffect(() => {
+      setSelected(new Set());
+      lastClick.current = null;
+    }, [props.workspaceId]);
+
+    // A hard delete, move or merge can remove selected IDs in the current
+    // workspace. Don't leave a phantom selection in the context menu.
+    useEffect(() => {
+      setSelected((prev) => {
+        const remaining = Array.from(prev).filter((id) => byId.has(id));
+        if (remaining.length === prev.size) return prev;
+        if (lastClick.current != null && !byId.has(lastClick.current)) lastClick.current = null;
+        return new Set(remaining);
+      });
+    }, [byId]);
 
     useImperativeHandle(ref, () => ({
       startCreate: (kind: "file" | "folder" | "board") => {
@@ -264,7 +315,8 @@ const FileTree = memo(
       },
       downloadSelected: () => {
         const files = selectedFiles();
-        for (const f of files) props.onDownload(f);
+        if (files.length === 1) props.onDownload(files[0]);
+        if (files.length > 1) props.onDownloadMany(files, "selected-files");
         return files.length;
       },
     }));
@@ -305,9 +357,13 @@ const FileTree = memo(
         return;
       }
       if (node.file) onMove(node.file.id, newPath);
-      else
-        for (const f of descendantsOf(oldPath))
-          onMove(f.id, newPath + f.path.slice(oldPath.length));
+      else {
+        const moves = descendantsOf(oldPath).map((f) => ({
+          id: f.id,
+          path: newPath + f.path.slice(oldPath.length),
+        }));
+        if (moves.length) void onTransfer("move", moves, "error").catch(() => {});
+      }
       setEditing(null);
     }
 
@@ -341,28 +397,52 @@ const FileTree = memo(
       mode: "cut" | "copy",
       items: { file: FileRow; rel: string }[],
     ) {
-      setClipboard({ mode, items });
+      onClipboardChange({ mode, items });
     }
 
     function folderClip(folderPath: string) {
       return descendantsOf(folderPath).map((f) => ({
         file: f,
-        rel: f.path.slice(folderPath.length + 1),
+        // Keep the folder itself, not just its children, on paste/drop.
+        rel: `${baseName(folderPath)}/${f.path.slice(folderPath.length + 1)}`,
       }));
     }
 
-    function pasteInto(targetDir: string) {
+    // Preserve the hierarchy when multi-selecting files in different folders;
+    // flattening to basename loses context and creates needless collisions.
+    function relativeSelection(items: FileRow[]) {
+      if (!items.length) return [];
+      const dirs = items.map((f) => parentDir(f.path).split("/").filter(Boolean));
+      const common: string[] = [];
+      for (let i = 0; dirs.every((parts) => parts.length > i && parts[i] === dirs[0][i]); i++) {
+        common.push(dirs[0][i]);
+      }
+      const prefix = common.length ? `${common.join("/")}/` : "";
+      return items.map((file) => ({ file, rel: file.path.slice(prefix.length) }));
+    }
+
+    async function pasteInto(targetDir: string) {
       if (!clipboard) return;
       const { mode, items } = clipboard;
-      if (mode === "cut") {
-        for (const it of items) {
-          const final = targetDir ? `${targetDir}/${it.rel}` : it.rel;
-          if (final === it.file.path) continue;
-          onMove(it.file.id, final);
-        }
-        setClipboard(null);
-      } else {
-        onCopyItems(targetDir, items); // keep clipboard for repeated pastes
+      const destinations = items
+        .map(({ file, rel }) => ({
+          id: file.id,
+          path: targetDir ? `${targetDir}/${rel}` : rel,
+          source: file,
+        }))
+        .filter(
+          ({ path, source }) =>
+            mode === "copy" ||
+            source.workspace_id !== props.workspaceId ||
+            source.path !== path,
+        )
+        .map(({ id, path }) => ({ id, path }));
+      if (!destinations.length) return;
+      try {
+        await onTransfer(mode === "cut" ? "move" : "copy", destinations, mode === "copy" ? "rename" : "error");
+        if (mode === "cut") onClipboardChange(null); // only after success
+      } catch {
+        // Keep the clipboard intact to let the user resolve a name conflict.
       }
     }
 
@@ -371,9 +451,7 @@ const FileTree = memo(
       const dot = name.lastIndexOf(".");
       const stem = dot > 0 ? name.slice(0, dot) : name;
       const ext = dot > 0 ? name.slice(dot) : "";
-      onCopyItems(parentDir(file.path), [
-        { file, rel: `${stem} (copy)${ext}` },
-      ]);
+      void onTransfer("copy", [{ id: file.id, path: parentDir(file.path) ? `${parentDir(file.path)}/${stem} (copy)${ext}` : `${stem} (copy)${ext}` }], "rename").catch(() => {});
     }
 
     function copyPath(path: string) {
@@ -401,9 +479,9 @@ const FileTree = memo(
       const actions = multi
         ? [
             {
-              label: `Download (${targets.length})`,
+              label: `Download ${targets.length} as ZIP`,
               icon: VscCloudDownload,
-              onClick: () => targets.forEach(props.onDownload),
+              onClick: () => props.onDownloadMany(targets, "selected-files"),
             },
             {
               label: "Cut",
@@ -411,7 +489,7 @@ const FileTree = memo(
               onClick: () =>
                 cutOrCopy(
                   "cut",
-                  targets.map((t) => ({ file: t, rel: baseName(t.path) })),
+                  relativeSelection(targets),
                 ),
             },
             {
@@ -420,7 +498,7 @@ const FileTree = memo(
               onClick: () =>
                 cutOrCopy(
                   "copy",
-                  targets.map((t) => ({ file: t, rel: baseName(t.path) })),
+                  relativeSelection(targets),
                 ),
             },
             {
@@ -508,6 +586,11 @@ const FileTree = memo(
           label: "Upload folders…",
           icon: VscFolderOpened,
           onClick: () => onUploadFolder(folderPath),
+        },
+        {
+          label: "Download folder (.zip)",
+          icon: VscCloudDownload,
+          onClick: () => props.onDownloadMany(descendantsOf(folderPath), name),
         },
         {
           label: "Cut",
@@ -599,34 +682,20 @@ const FileTree = memo(
       setMenu({ x: e.clientX, y: e.clientY, actions });
     }
 
-    function drop(targetPath: string, raw: string) {
-      let p: { kind: string; id?: number; ids?: number[]; path?: string };
-      try {
-        p = JSON.parse(raw);
-      } catch {
-        return;
-      }
-      if (p.kind === "files" && p.ids) {
-        for (const id of p.ids) {
-          const f = byId.get(id);
-          if (!f) continue;
-          const base = baseName(f.path);
-          const np = targetPath ? `${targetPath}/${base}` : base;
-          if (np !== f.path) onMove(id, np);
-        }
-      } else if (p.kind === "file" && p.path) {
-        const base = baseName(p.path);
-        const np = targetPath ? `${targetPath}/${base}` : base;
-        if (np !== p.path && p.id != null) onMove(p.id, np);
-      } else if (p.kind === "folder" && p.path) {
-        const F = p.path;
-        if (targetPath === F || targetPath.startsWith(F + "/")) return;
-        const nm = baseName(F);
-        const newFolder = targetPath ? `${targetPath}/${nm}` : nm;
-        if (newFolder === F) return;
-        for (const f of descendantsOf(F))
-          onMove(f.id, newFolder + f.path.slice(F.length));
-      }
+    function drop(targetPath: string, raw: string, copy = false) {
+      const payload = parseExplorerDrag(raw);
+      if (!payload) return;
+      const items = payload.entries.map(({ id, rel }) => ({
+        id,
+        path: targetPath ? `${targetPath}/${rel}` : rel,
+      }));
+      // Folder drags carry their folder-relative paths, not a sequence of
+      // independent per-file renames. The server applies them atomically.
+      void onTransfer(
+        copy ? "copy" : "move",
+        items,
+        copy || payload.sourceWsId !== props.workspaceId ? "rename" : "error",
+      ).catch(() => {});
     }
 
     async function handleDrop(e: DragEvent, targetPath: string) {
@@ -637,16 +706,20 @@ const FileTree = memo(
         const items = await collectDrops(e.dataTransfer);
         if (items.length) onUploadFiles(targetPath, items);
       } else {
-        drop(targetPath, e.dataTransfer.getData("text/plain"));
+        drop(targetPath, e.dataTransfer.getData(CORTEX_DRAG_MIME), e.ctrlKey || e.altKey);
       }
     }
 
     const shared = {
+      workspaceId: props.workspaceId,
+      filesInFolder: descendantsOf,
       activeFileId: props.activeFileId,
       collapsed: props.collapsed,
       onToggle: props.onToggle,
       onDownload: props.onDownload,
       selected,
+      filesFromSelection: selectedFiles,
+      relativeSelection,
       editing,
       creating,
       clipboard,
@@ -659,7 +732,6 @@ const FileTree = memo(
       onCancelCreate: () => setCreating(null),
       onUploadFiles,
       onUploadFolder,
-      onCopyItems,
       onPaste: pasteInto,
       clearExternal: () => setExternalOver(false),
       drop,
@@ -774,9 +846,11 @@ const FileTree = memo(
   // palettes and other shell state from re-rendering thousands of rows.
   (prev, next) =>
     prev.files === next.files &&
+    prev.workspaceId === next.workspaceId &&
     prev.rootName === next.rootName &&
     prev.activeFileId === next.activeFileId &&
-    prev.collapsed === next.collapsed,
+    prev.collapsed === next.collapsed &&
+    prev.clipboard === next.clipboard,
 );
 
 // Row wrapper that paints indent-guide lines for the ancestor levels.
@@ -801,11 +875,15 @@ function RowShell({ depth, children }: { depth: number; children: ReactNode }) {
 }
 
 type ItemShared = {
+  workspaceId: number;
+  filesInFolder: (path: string) => FileRow[];
   activeFileId: number | null;
   collapsed: Set<string>;
   onToggle: (path: string) => void;
   onDownload: (f: FileRow) => void;
   selected: Set<number>;
+  filesFromSelection: () => FileRow[];
+  relativeSelection: (files: FileRow[]) => { file: FileRow; rel: string }[];
   editing: EditState;
   creating: CreateState;
   clipboard: ClipboardState;
@@ -818,10 +896,9 @@ type ItemShared = {
   onCancelCreate: () => void;
   onUploadFiles: (dir: string, items: UploadItem[]) => void;
   onUploadFolder: (dir: string) => void;
-  onCopyItems: (dir: string, items: { file: FileRow; rel: string }[]) => void;
   onPaste: (targetDir: string) => void;
   clearExternal: () => void;
-  drop: (targetPath: string, raw: string) => void;
+  drop: (targetPath: string, raw: string, copy?: boolean) => void;
 };
 
 function TreeItem(
@@ -846,7 +923,6 @@ function TreeItem(
     onCancelCreate,
     onUploadFiles,
     onUploadFolder,
-    onCopyItems,
     onPaste,
     clearExternal,
     drop,
@@ -880,11 +956,16 @@ function TreeItem(
         <HStack
           draggable
           onDragStart={(e: DragEvent) => {
-            const payload =
-              isSelected && selected.size > 1
-                ? { kind: "files", ids: Array.from(selected) }
-                : { kind: "file", id: f.id, path: f.path };
-            e.dataTransfer.setData("text/plain", JSON.stringify(payload));
+            const files = isSelected && selected.size > 1
+              ? props.filesFromSelection()
+              : [f];
+            const payload: ExplorerDrag = {
+              kind: "cortex-files",
+              sourceWsId: f.workspace_id,
+              entries: props.relativeSelection(files).map(({ file, rel }) => ({ id: file.id, rel })),
+            };
+            e.dataTransfer.setData(CORTEX_DRAG_MIME, JSON.stringify(payload));
+            e.dataTransfer.effectAllowed = "copyMove";
           }}
           onContextMenu={(e) => onFileMenu(e, node, parentPath)}
           pl={`${padL}px`}
@@ -936,10 +1017,16 @@ function TreeItem(
             draggable
             onDragStart={(e: DragEvent) => {
               e.stopPropagation();
-              e.dataTransfer.setData(
-                "text/plain",
-                JSON.stringify({ kind: "folder", path: folderPath }),
-              );
+              const payload: ExplorerDrag = {
+                kind: "cortex-files",
+                sourceWsId: props.workspaceId,
+                entries: props.filesInFolder(folderPath).map((f) => ({
+                  id: f.id,
+                  rel: `${baseName(folderPath)}/${f.path.slice(folderPath.length + 1)}`,
+                })),
+              };
+              e.dataTransfer.setData(CORTEX_DRAG_MIME, JSON.stringify(payload));
+              e.dataTransfer.effectAllowed = "copyMove";
             }}
             onContextMenu={(e) => onFolderMenu(e, folderPath, node.name)}
             onDragOver={(e) => {
@@ -958,7 +1045,7 @@ function TreeItem(
                   const items = await collectDrops(e.dataTransfer);
                   if (items.length) onUploadFiles(folderPath, items);
                 } else {
-                  drop(folderPath, e.dataTransfer.getData("text/plain"));
+                  drop(folderPath, e.dataTransfer.getData(CORTEX_DRAG_MIME), e.ctrlKey || e.altKey);
                 }
               };
               void run();

@@ -14,21 +14,39 @@ concurrency:
 
 jobs:
   backend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rustpad-server
-      # Library unit tests (auth, crypto, workspace). The tests/ integration
-      # suite is inherited from Rustpad and predates authentication — it opens
-      # the collaborative socket with no session, which the auth layer now
-      # rejects, so it needs a rewrite for the gated model before it can run.
-      - run: cargo test --lib --manifest-path rustpad-server/Cargo.toml
+      # Log the compiler/test failure as a check annotation as well as in the
+      # step log, so failures stay visible when the Actions log CDN is down.
+      - name: Rust tests
+        shell: bash
+        run: |
+          if cargo test --lib --manifest-path rustpad-server/Cargo.toml > /tmp/cortex-test.log 2>&1; then
+            cat /tmp/cortex-test.log
+          else
+            cat /tmp/cortex-test.log
+            python3 - <<'PY'
+          from pathlib import Path
+          import re
+          lines = Path('/tmp/cortex-test.log').read_text(errors='replace').splitlines()
+          lines = [re.sub(r'\x1b\[[0-9;]*m', '', line) for line in lines]
+          lines = [line for line in lines if not line.lstrip().startswith('Compiling ')]
+          # GitHub command protocol: escape newlines so the error is one annotation.
+          excerpt = '\n'.join(lines[-120:])
+          for i in range(0, min(len(excerpt), 24000), 3000):
+              part = excerpt[i:i+3000].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print(f'::error title=Rust tests failed ({i//3000+1})::{part}')
+          PY
+            exit 1
+          fi
 
   frontend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -48,3 +66,4 @@ jobs:
           node-version: "22.14.0"
       - run: npm ci
       - run: npm run check
+      - run: npm run build

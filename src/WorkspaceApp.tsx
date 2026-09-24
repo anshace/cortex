@@ -20,6 +20,7 @@ import {
   MenuDivider,
   MenuItem,
   MenuList,
+  Select,
   Switch,
   Text,
   Tooltip,
@@ -76,7 +77,13 @@ import CommandPalette, { PaletteItem } from "./CommandPalette";
 import ContextMenu, { MenuState } from "./ContextMenu";
 import { ConfirmModal, PromptModal } from "./Dialogs";
 import EditorPane from "./EditorPane";
-import FileTree, { FileTreeHandle, allFolderPaths } from "./FileTree";
+import FileTree, {
+  CORTEX_DRAG_MIME,
+  ClipboardState,
+  FileTreeHandle,
+  allFolderPaths,
+  parseExplorerDrag,
+} from "./FileTree";
 import Loader from "./Loader";
 import { DEFAULT_NOTIF_PREFS, NotifPrefs } from "./Settings";
 import Settings from "./Settings";
@@ -89,7 +96,11 @@ import { PanelHeader, PanelIconButton } from "./ui";
 type Props = {
   me: Me;
   orgId?: number; // set when the owner is browsing a specific org
+  initialWorkspaceId?: number; // owner cross-org merge/move destination
+  fileClipboard?: ClipboardState;
+  onFileClipboardChange?: (clipboard: ClipboardState) => void;
   onExit?: () => void; // back to the owner console
+  onNavigateOrg?: (orgId: number, workspaceId: number) => void; // owner cross-org merge/move
   onLogout: () => void;
   onUpdated?: () => void; // refresh `me` after a profile/2FA change
 };
@@ -139,7 +150,7 @@ function pruneGroups(gs: GroupState[], exist: Set<number>): GroupState[] {
   return pruned.length ? pruned : [{ fileIds: [], activeId: null }];
 }
 
-function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
+function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalClipboard, onFileClipboardChange, onExit, onNavigateOrg, onLogout, onUpdated }: Props) {
   const toast = useToast();
   const { colorMode, toggleColorMode } = useColorMode();
   const [org, setOrg] = useState<OrgData | null>(null);
@@ -168,6 +179,18 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   const [prompt, setPrompt] = useState<PromptCfg | null>(null);
   const [confirm, setConfirm] = useState<ConfirmCfg | null>(null);
   const [wsMenu, setWsMenu] = useState<MenuState>(null);
+  // Clipboard belongs to the shell, not the tree: switching workspaces must
+  // not turn Cut + Paste into a rename inside the old workspace. The owner
+  // carries it across the org browser/console as well for cross-org transfers.
+  const [localClipboard, setLocalClipboard] = useState<ClipboardState>(null);
+  const fileClipboard = externalClipboard === undefined ? localClipboard : externalClipboard;
+  const setFileClipboard = onFileClipboardChange ?? setLocalClipboard;
+  const [workspaceAction, setWorkspaceAction] = useState<{
+    kind: "merge" | "group";
+    source: Workspace;
+    targetId: number;
+    options: { id: number; label: string; orgId: number; groupId: number }[];
+  } | null>(null);
   // Whether the "Workspaces" section in the Explorer panel is collapsed.
   const [wsSectionOpen, setWsSectionOpen] = useState(true);
   // New-group dialog (name + visibility layer) and group-members dialog.
@@ -510,6 +533,8 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   }, [overview, activeGroupId]);
 
   const uploadDir = useRef<string>("");
+  const zipInput = useRef<HTMLInputElement>(null);
+  const zipWorkspaceId = useRef<number | null>(null);
   const editorLike = section === "explorer";
 
   // Drag the sidebar's right edge to resize it (persisted).
@@ -546,6 +571,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     wsRef.current = data.workspaces;
     setActiveWsId((cur) => {
       if (cur && data.workspaces.some((w) => w.id === cur)) return cur;
+      if (initialWorkspaceId && data.workspaces.some((w) => w.id === initialWorkspaceId)) return initialWorkspaceId;
       if (orgId == null) {
         const slug = window.location.pathname.replace(/^\/+/, "").split("/")[0];
         const bySlug = data.workspaces.find((w) => w.slug === slug);
@@ -554,7 +580,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       return data.workspaces[0]?.id ?? null;
     });
     return data;
-  }, [orgId]);
+  }, [orgId, initialWorkspaceId]);
 
   // The active group follows the active workspace (a workspace lives inside
   // one group), unless the user explicitly picked an empty group.
@@ -987,6 +1013,89 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     });
   }
 
+  async function chooseWorkspaceAction(kind: "merge" | "group", source: Workspace) {
+    if (!org) return;
+    const currentOrgId = org.org?.id ?? orgId;
+    if (currentOrgId == null) return;
+    try {
+      // The owner can select a group/workspace in any org. Org admins can only
+      // select targets in their own org (enforced again by the API).
+      const all: { name: string; id: number; data: OrgData }[] = me.role === "root"
+        ? await Promise.all((await api.adminListOrgs()).orgs.map(async (entry) => ({
+            name: entry.name,
+            id: entry.id,
+            data: await api.getOrg(entry.id),
+          })))
+        : [{ name: org.org?.name ?? "Org", id: currentOrgId, data: org }];
+      const options = all.flatMap(({ name, id, data }) =>
+        kind === "merge"
+          ? data.workspaces.filter((w) => w.id !== source.id).map((w) => ({
+              id: w.id,
+              orgId: id,
+              groupId: w.group_id,
+              label: `${name} / ${data.groups.find((g) => g.id === w.group_id)?.name ?? "Group"} / ${w.name}`,
+            }))
+          : data.groups.filter((g) => g.id !== source.group_id).map((g) => ({
+              id: g.id,
+              orgId: id,
+              groupId: g.id,
+              label: `${name} / ${g.name}`,
+            })),
+      );
+      if (!options.length) {
+        toast({ title: "Create another workspace or group first", status: "info" });
+        return;
+      }
+      setWorkspaceAction({ kind, source, targetId: options[0].id, options });
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  function confirmWorkspaceAction() {
+    if (!workspaceAction) return;
+    const { kind, source, targetId, options } = workspaceAction;
+    const target = options.find((o) => o.id === targetId);
+    if (!target) return;
+    setWorkspaceAction(null);
+    // Switching orgs remounts the explorer, so clipboard state lives in the
+    // owner console. Same-org operations just refresh the current explorer.
+    const after = () => {
+      if (target.orgId !== org?.org?.id && onNavigateOrg) {
+        onNavigateOrg(target.orgId, kind === "merge" ? targetId : source.id);
+      } else {
+        setActiveGroupId(target.groupId);
+        if (kind === "merge" || source.id === activeWsId) {
+          setActiveWsId(kind === "merge" ? targetId : source.id);
+        }
+        loadOrg();
+      }
+    };
+    if (kind === "merge") {
+      setConfirm({
+        title: "Merge workspaces",
+        body: `Move every file from "${source.name}" into "${target.label}", numbering conflicts, then permanently remove "${source.name}"? Open editors will reconnect. This cannot be undone.`,
+        cta: "Merge",
+        onConfirm: () => run(
+          () => api.mergeWorkspaces(source.id, targetId),
+          after,
+          "Workspaces merged",
+        ),
+      });
+    } else {
+      setConfirm({
+        title: "Move workspace",
+        body: `Move "${source.name}" to "${target.label}"? Its members may gain or lose access; open editors will reconnect.`,
+        cta: "Move",
+        onConfirm: () => run(
+          () => api.moveWorkspaceToGroup(source.id, targetId),
+          after,
+          "Workspace moved",
+        ),
+      });
+    }
+  }
+
   // ----- file operations (from the tree; inline create/rename, themed confirm) -----
   function createPath(path: string) {
     if (activeWsId == null) return;
@@ -1016,6 +1125,23 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     uploadInput.current?.click();
   }
 
+  function requestImportZip(workspaceId: number) {
+    zipWorkspaceId.current = workspaceId;
+    zipInput.current?.click();
+  }
+
+  async function importZip(file: File) {
+    const target = zipWorkspaceId.current;
+    if (target === null) return;
+    try {
+      const result = await api.importWorkspaceZip(target, file);
+      if (activeWsId === target) loadWs();
+      toast({ title: `Imported ${result.files.length} files`, status: "success" });
+    } catch (e) {
+      fail(e);
+    }
+  }
+
   // A folder picker (webkitdirectory) — the picked files carry folder-relative
   // paths that we preserve on upload.
   function requestUploadFolder(dir: string) {
@@ -1042,11 +1168,12 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
           if (!rel) continue;
           const finalPath = dir ? `${dir}/${rel}` : rel;
           const free = freePath(existing, finalPath);
+          existing.add(free); // reserve before the next worker chooses a name
           try {
             await api.uploadFile(activeWsId, file, free);
-            existing.add(free);
             ok.push(free);
           } catch (e) {
+            existing.delete(free);
             failed.push(
               `${free}: ${e instanceof Error ? e.message : "upload failed"}`,
             );
@@ -1072,57 +1199,43 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     }
   }
 
-  // Copy-paste / Duplicate: pull each file's bytes down and re-upload it under
-  // the target path (auto-suffixed on collision).
-  async function copyItems(
-    dir: string,
-    items: { file: api.FileRow; rel: string }[],
-  ) {
-    if (activeWsId == null) return;
-    const queue = [...items];
-    const existing = new Set(ws?.files?.map((f) => f.path) ?? []);
-    const ok: string[] = [];
-    const failed: string[] = [];
-    const workers = Array.from(
-      { length: Math.min(3, queue.length) },
-      async () => {
-        while (queue.length) {
-          const { file, rel } = queue.shift()!;
-          const clean = rel.replace(/\\/g, "/").replace(/^\/+/, "");
-          if (!clean) continue;
-          const finalPath = dir ? `${dir}/${clean}` : clean;
-          const free = freePath(existing, finalPath);
-          try {
-            const blob = await api.fetchFileBlob(file);
-            const name = free.split("/").pop() || free;
-            const f = new File([blob], name, { type: blob.type || undefined });
-            await api.uploadFile(activeWsId, f, free);
-            existing.add(free);
-            ok.push(free);
-          } catch (e) {
-            failed.push(
-              `${free}: ${e instanceof Error ? e.message : "copy failed"}`,
-            );
-          }
-        }
-      },
-    );
-    await Promise.all(workers);
-    loadWs();
-    if (failed.length === 0) {
+  // Server-side atomic copy/move: binary bytes never round-trip through the
+  // browser, and a folder succeeds or fails as a whole. The returned paths
+  // include any numbered names assigned to avoid conflicts.
+  async function transferInto(
+    targetWsId: number,
+    mode: "copy" | "move",
+    items: api.TransferItem[],
+    conflict: "error" | "rename" = "error",
+  ): Promise<void> {
+    try {
+      const { files } = await api.transferFiles(targetWsId, items, mode, conflict);
+      loadWs();
       toast({
-        title: ok.length === 1 ? "Duplicated" : `Copied ${ok.length} files`,
+        title: `${mode === "copy" ? "Copied" : "Moved"} ${files.length} ${files.length === 1 ? "file" : "files"}`,
         status: "success",
-        duration: 2000,
+        duration: 2500,
       });
-    } else {
-      toast({
-        title: `${ok.length} copied, ${failed.length} failed`,
-        description: failed.slice(0, 3).join("\n"),
-        status: "warning",
-        duration: 6000,
-      });
+    } catch (e) {
+      fail(e);
+      throw e; // a Cut remains in the clipboard when a transfer failed
     }
+  }
+
+  async function pasteIntoWorkspace(wsId: number) {
+    if (!fileClipboard) return;
+    const { mode, items } = fileClipboard;
+    if (mode === "cut" && items.every((it) => it.file.workspace_id === wsId && it.file.path === it.rel)) {
+      setFileClipboard(null); // cutting and pasting in place is a no-op
+      return;
+    }
+    await transferInto(
+      wsId,
+      mode === "cut" ? "move" : "copy",
+      items.map((it) => ({ id: it.file.id, path: it.rel })),
+      "rename",
+    );
+    if (mode === "cut") setFileClipboard(null);
   }
 
   function deleteFiles(targets: FileRow[], label: string) {
@@ -1136,7 +1249,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       onConfirm: () =>
         run(
           async () => {
-            for (const f of targets) await api.deleteFile(f.id);
+            await api.deleteFiles(targets.map((f) => f.id));
           },
           () => {
             loadWs(); // prunes the deleted files out of any open editor groups
@@ -1206,6 +1319,11 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     !!g &&
     g.scope === "group" &&
     (me.role === "root" || me.role === "admin" || g.created_by === myId);
+  const canManageWorkspace = (w: Workspace) =>
+    me.role === "root" ||
+    me.role === "admin" ||
+    w.created_by === myId ||
+    org.groups.find((g) => g.id === w.group_id)?.created_by === myId;
   const activeKey =
     section === "chat" && !settingsOpen
       ? chatTarget.kind === "group"
@@ -1530,6 +1648,24 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                           }}
                           w="full"
                           onClick={() => selectWorkspace(w.id)}
+                          onDragOver={(e) => {
+                            if (Array.from(e.dataTransfer.types).includes(CORTEX_DRAG_MIME)) {
+                              e.preventDefault();
+                              e.dataTransfer.dropEffect = e.ctrlKey || e.altKey ? "copy" : "move";
+                            }
+                          }}
+                          onDrop={(e) => {
+                            const payload = parseExplorerDrag(e.dataTransfer.getData(CORTEX_DRAG_MIME));
+                            if (!payload) return;
+                            e.preventDefault();
+                            e.stopPropagation();
+                            void transferInto(
+                              w.id,
+                              e.ctrlKey || e.altKey ? "copy" : "move",
+                              payload.entries.map(({ id, rel }) => ({ id, path: rel })),
+                              "rename",
+                            ).catch(() => {});
+                          }}
                           onContextMenu={(e) => {
                             e.preventDefault();
                             e.stopPropagation();
@@ -1537,17 +1673,39 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                               x: e.clientX,
                               y: e.clientY,
                               actions: [
+                                ...(fileClipboard ? [{
+                                  label: `Paste ${fileClipboard.items.length} ${fileClipboard.items.length === 1 ? "file" : "files"} here`,
+                                  icon: VscFiles,
+                                  onClick: () => void pasteIntoWorkspace(w.id).catch(() => {}),
+                                }] : []),
                                 {
-                                  label: "Rename",
-                                  icon: VscEdit,
-                                  onClick: () => renameWorkspace(w),
+                                  label: "Import ZIP…",
+                                  icon: VscCloudUpload,
+                                  onClick: () => requestImportZip(w.id),
                                 },
-                                {
-                                  label: "Delete",
-                                  icon: VscTrash,
-                                  danger: true,
-                                  onClick: () => deleteWorkspace(w),
-                                },
+                                ...(canManageWorkspace(w) ? [
+                                  {
+                                    label: "Rename",
+                                    icon: VscEdit,
+                                    onClick: () => renameWorkspace(w),
+                                  },
+                                  {
+                                    label: "Move to group…",
+                                    icon: VscFolderOpened,
+                                    onClick: () => chooseWorkspaceAction("group", w),
+                                  },
+                                  {
+                                    label: "Merge into…",
+                                    icon: VscFiles,
+                                    onClick: () => chooseWorkspaceAction("merge", w),
+                                  },
+                                  {
+                                    label: "Delete",
+                                    icon: VscTrash,
+                                    danger: true,
+                                    onClick: () => deleteWorkspace(w),
+                                  },
+                                ] : []),
                               ],
                             });
                           }}
@@ -1637,18 +1795,20 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                               Upload files…
                             </MenuItem>
                             <MenuItem
-                              icon={
-                                <Icon
-                                  as={VscFolderOpened}
-                                  fontSize="16px"
-                                  color="ink.muted"
-                                />
-                              }
+                              icon={<Icon as={VscFolderOpened} fontSize="16px" color="ink.muted" />}
                               fontSize="13px"
                               borderRadius="sm"
                               onClick={() => requestUploadFolder("")}
                             >
                               Upload folders…
+                            </MenuItem>
+                            <MenuItem
+                              icon={<Icon as={VscCloudUpload} fontSize="16px" color="ink.muted" />}
+                              fontSize="13px"
+                              borderRadius="sm"
+                              onClick={() => requestImportZip(activeWs.id)}
+                            >
+                              Import ZIP…
                             </MenuItem>
                           </MenuList>
                         </Menu>
@@ -1699,22 +1859,30 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                   }
                 />
                 <Box px={2}>
+                  {/* Selection and context menus belong to one workspace. */}
                   <FileTree
+                    key={activeWs.id}
                     ref={treeRef}
                     files={allFiles}
+                    workspaceId={activeWs.id}
                     rootName={activeWs.name}
                     activeFileId={treeActiveId}
                     collapsed={collapsed}
                     onToggle={toggleFolder}
                     onOpen={openFile}
                     onDownload={(f) => api.downloadFile(f).catch(fail)}
+                    onDownloadMany={(files, name) =>
+                      api.downloadFilesZip(files.map((f) => f.id), name).catch(fail)
+                    }
                     onDelete={deleteFiles}
                     onMove={movePath}
+                    onTransfer={(mode, items, conflict) => transferInto(activeWs.id, mode, items, conflict)}
+                    clipboard={fileClipboard}
+                    onClipboardChange={setFileClipboard}
                     onCreate={createPath}
                     onUpload={requestUpload}
                     onUploadFolder={requestUploadFolder}
                     onUploadFiles={uploadFiles}
-                    onCopyItems={copyItems}
                   />
                   {allFiles.length === 0 && (
                     <Text fontSize="xs" color="ink.subtle" px={2} py={2}>
@@ -1789,6 +1957,17 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       )}
 
       <input
+        ref={zipInput}
+        type="file"
+        accept=".zip,application/zip"
+        hidden
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) void importZip(file);
+          e.target.value = "";
+        }}
+      />
+      <input
         ref={uploadInput}
         type="file"
         multiple
@@ -1840,6 +2019,39 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
         onClose={() => setConfirm(null)}
       />
       <ContextMenu state={wsMenu} onClose={() => setWsMenu(null)} />
+      <AlertDialog
+        isOpen={!!workspaceAction}
+        leastDestructiveRef={dialogRef}
+        onClose={() => setWorkspaceAction(null)}
+        isCentered
+      >
+        <AlertDialogOverlay bg="blackAlpha.600">
+          <AlertDialogContent bg="surface.panel" border="1px solid" borderColor="surface.border" mx={4}>
+            <AlertDialogHeader fontSize="md">
+              {workspaceAction?.kind === "merge" ? "Merge into workspace" : "Move to group"}
+            </AlertDialogHeader>
+            <AlertDialogBody>
+              <Text fontSize="sm" color="ink.muted" mb={3}>
+                From “{workspaceAction?.source.name}”. Files with the same name
+                will be numbered, never overwritten.
+              </Text>
+              <Select
+                value={workspaceAction?.targetId ?? ""}
+                onChange={(e) => setWorkspaceAction((a) => a && ({ ...a, targetId: Number(e.target.value) }))}
+                bg="surface.raised"
+              >
+                {workspaceAction?.options.map((target) => (
+                  <option key={target.id} value={target.id}>{target.label}</option>
+                ))}
+              </Select>
+            </AlertDialogBody>
+            <AlertDialogFooter gap={2}>
+              <Button variant="ghost" onClick={() => setWorkspaceAction(null)}>Cancel</Button>
+              <Button onClick={confirmWorkspaceAction}>Continue…</Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialogOverlay>
+      </AlertDialog>
       <CommandPalette
         isOpen={palette !== null}
         onClose={() => setPalette(null)}

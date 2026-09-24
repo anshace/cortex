@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use dashmap::DashMap;
@@ -29,16 +29,106 @@ pub mod workspace;
 /// Each entry corresponds to a single document. This is garbage collected by a
 /// background task after one day of inactivity, to avoid server memory usage
 /// growing without bound.
-struct Document {
+pub(crate) struct Document {
     last_accessed: Instant,
     rustpad: Arc<Rustpad>,
+    persister: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Block new WebSocket handshakes while changing permissions or deleting
+/// content. Existing editors are closed under the write lock, so none can
+/// reconnect using the old scope before the DB mutation commits.
+pub(crate) fn access_gate() -> &'static tokio::sync::RwLock<()> {
+    static GATE: OnceLock<tokio::sync::RwLock<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::RwLock::new(()))
+}
+
+fn editor_gate() -> impl Filter<Extract = (tokio::sync::RwLockReadGuard<'static, ()>,), Error = Rejection> + Clone {
+    warp::any().and_then(|| async {
+        Ok::<_, Rejection>(access_gate().read().await)
+    })
+}
+
+/// Shared live editor registry. Dropping a cached document closes its sockets.
+pub(crate) type LiveDocs = Arc<DashMap<String, Document>>;
+/// Connected whiteboard presence relays, keyed by file ID.
+pub(crate) type LiveBoards = Arc<DashMap<i64, Arc<BoardHub>>>;
+
+pub(crate) fn evict_boards(boards: &LiveBoards, ids: &[i64]) {
+    for id in ids {
+        if let Some((_, hub)) = boards.remove(id) { hub.close(); }
+    }
+}
+
+pub(crate) async fn evict_org_boards(
+    boards: &LiveBoards, db: &Database, org_id: i64,
+) -> anyhow::Result<()> {
+    let ids: Vec<i64> = boards.iter().map(|entry| *entry.key()).collect();
+    let mut owned = Vec::new();
+    for id in ids {
+        if db.file_org(id).await? == Some(org_id) { owned.push(id); }
+    }
+    evict_boards(boards, &owned);
+    Ok(())
+}
+
+pub(crate) fn evict_all_boards(boards: &LiveBoards) {
+    let ids: Vec<i64> = boards.iter().map(|entry| *entry.key()).collect();
+    evict_boards(boards, &ids);
+}
+
+pub(crate) fn evict_documents(live: &LiveDocs, ids: &[String]) {
+    for id in ids {
+        live.remove(id);
+    }
+}
+
+/// Before moving a document to a different access scope, stop its persister,
+/// wait for any in-flight write, then save its final OT snapshot. If this fails
+/// the caller must abort the move (the client can reconnect to the old scope).
+pub(crate) async fn flush_and_evict(
+    live: &LiveDocs,
+    db: &Database,
+    ids: &[String],
+) -> anyhow::Result<()> {
+    let mut stopped = Vec::new();
+    for id in ids {
+        if let Some((_, entry)) = live.remove(id) {
+            entry.rustpad.kill();
+            stopped.push((id.clone(), entry));
+        }
+    }
+    // Wait together, not one sleep interval per document; a persister already
+    // writing will finish before the final snapshot below is written.
+    let tasks: Vec<_> = stopped.iter_mut().filter_map(|(_, doc)| doc.persister.take()).collect();
+    for result in futures::future::join_all(tasks).await {
+        result?;
+    }
+    for (id, doc) in &stopped {
+        db.store(id, &doc.rustpad.snapshot()).await?;
+    }
+    Ok(())
+}
+
+/// Prefer the current OT snapshot over the last periodic DB flush for
+/// downloads, exports and copies while another user is editing the file.
+pub(crate) async fn current_document(
+    live: &LiveDocs,
+    db: &Database,
+    id: &str,
+) -> anyhow::Result<database::PersistedDocument> {
+    if let Some(entry) = live.get(id) {
+        return Ok(entry.rustpad.snapshot());
+    }
+    db.load(id).await
 }
 
 impl Document {
-    fn new(rustpad: Arc<Rustpad>) -> Self {
+    fn new(rustpad: Arc<Rustpad>, persister: Option<tokio::task::JoinHandle<()>>) -> Self {
         Self {
             last_accessed: Instant::now(),
             rustpad,
+            persister,
         }
     }
 }
@@ -46,6 +136,9 @@ impl Document {
 impl Drop for Document {
     fn drop(&mut self) {
         self.rustpad.kill();
+        if let Some(task) = self.persister.take() {
+            task.abort();
+        }
     }
 }
 
@@ -61,7 +154,7 @@ struct ServerState {
     /// Concurrent map storing in-memory documents.
     documents: Arc<DashMap<String, Document>>,
     /// Ephemeral presence relays keyed by whiteboard file id.
-    boards: Arc<DashMap<i64, Arc<BoardHub>>>,
+    boards: LiveBoards,
     /// Connection to the database pool, if persistence is enabled.
     database: Option<Database>,
 }
@@ -167,27 +260,32 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         database: config.database,
     };
     tokio::spawn(cleaner(state.clone(), config.expiry_days));
+    tokio::spawn(scheduled_maintenance(db.clone()));
 
+    let live = state.documents.clone();
+    let boards = state.boards.clone();
     let state_filter = warp::any().map(move || state.clone());
 
     // Public auth endpoints (login / logout / me).
     let auth_routes = auth::routes(db.clone());
-    // Workspace / file management endpoints (session-gated inside).
-    let workspace_routes = workspace::routes(db.clone());
-    // Profile + hidden root admin console.
-    let account_routes = account::routes(db.clone());
+    // Handlers share the live editor registry so hard deletes can disconnect
+    // editors and downloads/copies can read unsaved OT snapshots.
+    let workspace_routes = workspace::routes(db.clone(), live.clone(), boards.clone());
+    let account_routes = account::routes(db.clone(), live, boards);
 
     // A plain db filter used by the document access checks below.
     let db_for_docs = db.clone();
     let db_filter = warp::any().map(move || db_for_docs.clone());
 
     let socket = warp::path!("socket" / String)
+        .and(editor_gate())
         .and(auth::with_auth(db.clone()))
         .and(warp::ws())
         .and(db_filter.clone())
         .and(state_filter.clone())
         .and_then(
-            |id: String, user: database::User, ws: Ws, db: Database, state: ServerState| async move {
+            |id: String, gate: tokio::sync::RwLockReadGuard<'static, ()>, user: database::User, ws: Ws, db: Database, state: ServerState| async move {
+                let _gate = gate;
                 // The document must belong to a workspace in the user's org
                 // (root may access any) — otherwise no access.
                 if !doc_allowed(&db, &user, &id).await {
@@ -198,16 +296,19 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         );
 
     let board_socket = warp::path!("board-socket" / i64)
+        .and(editor_gate())
         .and(auth::with_auth(db.clone()))
         .and(warp::ws())
         .and(db_filter.clone())
         .and(state_filter.clone())
         .and_then(
             |file_id: i64,
+             gate: tokio::sync::RwLockReadGuard<'static, ()>,
              user: database::User,
              ws: Ws,
              db: Database,
              state: ServerState| async move {
+                let _gate = gate;
                 if !file_allowed(&db, &user, file_id).await {
                     return Err(warp::reject::custom(auth::Forbidden));
                 }
@@ -259,13 +360,16 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
 }
 
 async fn file_allowed(db: &Database, user: &database::User, file_id: i64) -> bool {
-    if user.role == "root" {
-        return true;
-    }
     match db.file_ws_info(file_id).await.ok().flatten() {
         Some((group_id, org, scope, created_by)) => {
+            if user.role == "root" {
+                return true;
+            }
             if Some(org) != user.org_id {
                 return false;
+            }
+            if user.role == "admin" {
+                return true;
             }
             match scope.as_str() {
                 "org" => true,
@@ -298,13 +402,16 @@ async fn board_socket_handler(
 /// Whether a user may access the document `doc_id` (root bypasses; otherwise
 /// the same layered org / group / personal check as the REST workspace routes).
 async fn doc_allowed(db: &Database, user: &database::User, doc_id: &str) -> bool {
-    if user.role == "root" {
-        return true;
-    }
     match db.doc_ws_info(doc_id).await.ok().flatten() {
         Some((group_id, org, scope, created_by)) => {
+            if user.role == "root" {
+                return true;
+            }
             if Some(org) != user.org_id {
                 return false;
+            }
+            if user.role == "admin" {
+                return true;
             }
             match scope.as_str() {
                 "org" => true,
@@ -331,10 +438,10 @@ async fn socket_handler(id: String, ws: Ws, state: ServerState) -> Result<impl R
                 Some(db) => db.load(&id).await.map(Rustpad::from).unwrap_or_default(),
                 None => Rustpad::default(),
             });
-            if let Some(db) = &state.database {
-                tokio::spawn(persister(id, Arc::clone(&rustpad), db.clone()));
-            }
-            e.insert(Document::new(rustpad))
+            let task = state.database.as_ref().map(|db| {
+                tokio::spawn(persister(id, Arc::clone(&rustpad), db.clone()))
+            });
+            e.insert(Document::new(rustpad, task))
         }
     };
 
@@ -380,19 +487,56 @@ async fn stats_handler(start_time: u64, state: ServerState) -> Result<impl Reply
 
 const HOUR: Duration = Duration::from_secs(3600);
 
+/// Runs on the server, not from a separate Docker cron/sidecar, so the same
+/// housekeeping applies to the one-container image and bare-metal installs.
+/// First run is delayed to let migrations/bootstrap finish and serve traffic.
+async fn scheduled_maintenance(db: Database) {
+    time::sleep(Duration::from_secs(5 * 60)).await;
+    let retention = std::env::var("CORTEX_AUDIT_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&n| (1..=3650).contains(&n))
+        .unwrap_or(180);
+    loop {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default();
+        match db.maintain(now, retention, false).await {
+            Ok(result) => info!(
+                "maintenance: vacuumed={}, freed={} bytes, removed {} orphan docs, {} sessions",
+                result.vacuumed,
+                result.db_bytes_before - result.db_bytes_after,
+                result.orphan_documents,
+                result.expired_sessions
+            ),
+            Err(e) => error!("scheduled maintenance failed: {e}"),
+        }
+        time::sleep(HOUR * 24).await;
+    }
+}
+
 /// Reclaims memory for documents.
 async fn cleaner(state: ServerState, expiry_days: u32) {
     loop {
         time::sleep(HOUR).await;
         let mut keys = Vec::new();
         for entry in &*state.documents {
-            if entry.last_accessed.elapsed() > HOUR * 24 * expiry_days {
+            if entry.last_accessed.elapsed() > HOUR * 24 * expiry_days
+                && !entry.rustpad.has_users()
+            {
                 keys.push(entry.key().clone());
             }
         }
-        info!("cleaner removing keys: {:?}", keys);
-        for key in keys {
-            state.documents.remove(&key);
+        if !keys.is_empty() {
+            info!("cleaner evicting {} idle documents", keys.len());
+            if let Some(db) = &state.database {
+                if let Err(e) = flush_and_evict(&state.documents, db, &keys).await {
+                    error!("when flushing idle documents: {e}");
+                }
+            } else {
+                evict_documents(&state.documents, &keys);
+            }
         }
     }
 }

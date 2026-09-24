@@ -13,8 +13,10 @@ that the deployment image is a different thing from "Authpad"; the DB file is
 - Frontend: React + TypeScript + Vite + Chakra UI. Monaco editor.
 - Data: SQLite. On first run (empty DB) a default owner is created:
   username `admin`, password `admin`.
-- Roles: `root`/owner (provisions accounts, owns console), `admin` (manages a
-  workspace, uploads/downloads files), `user` (opens/edits collaboratively).
+- Roles: `root`/owner (cross-org account, workspace, backup and maintenance
+  control), `admin` (manages users, groups, workspaces and moderation within
+  their own org), `user` (edits, uploads/downloads and transfers files in
+  accessible workspaces). Deletes are hard deletes, not Trash.
 
 ## Commands
 

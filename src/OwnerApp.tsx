@@ -39,6 +39,7 @@ import { FiDownload, FiMoon, FiSun, FiUpload } from "react-icons/fi";
 import {
   VscChromeClose,
   VscDatabase,
+  VscEdit,
   VscKey,
   VscSettingsGear,
   VscShield,
@@ -46,8 +47,10 @@ import {
   VscTrash,
 } from "react-icons/vsc";
 
+import PasswordResetDialog from "./PasswordResetDialog";
 import Settings from "./Settings";
 import WorkspaceApp from "./WorkspaceApp";
+import type { ClipboardState } from "./FileTree";
 import * as api from "./api";
 import { AdminOrg, AdminUser, Me } from "./api";
 
@@ -67,7 +70,10 @@ function OwnerApp({
   const { colorMode, toggleColorMode } = useColorMode();
   const [orgs, setOrgs] = useState<AdminOrg[]>([]);
   const [users, setUsers] = useState<AdminUser[]>([]);
+  const [resetTarget, setResetTarget] = useState<AdminUser | null>(null);
   const [browse, setBrowse] = useState<number | null>(null);
+  const [browseWorkspace, setBrowseWorkspace] = useState<number | null>(null);
+  const [fileClipboard, setFileClipboard] = useState<ClipboardState>(null);
   const importInput = useRef<HTMLInputElement>(null);
 
   // org form
@@ -143,9 +149,14 @@ function OwnerApp({
   if (browse != null) {
     return (
       <WorkspaceApp
+        key={browse}
         me={me}
         orgId={browse}
-        onExit={() => setBrowse(null)}
+        initialWorkspaceId={browseWorkspace ?? undefined}
+        fileClipboard={fileClipboard}
+        onFileClipboardChange={setFileClipboard}
+        onExit={() => { setBrowse(null); setBrowseWorkspace(null); }}
+        onNavigateOrg={(id, workspaceId) => { setBrowseWorkspace(workspaceId); setBrowse(id); }}
         onLogout={onLogout}
       />
     );
@@ -242,6 +253,14 @@ function OwnerApp({
         display={settingsOpen ? "none" : "block"}
       >
         <Box maxW="880px" mx="auto">
+          {fileClipboard && (
+            <Flex align="center" gap={3} mb={4} px={4} py={2} bg="surface.panel" border="1px solid" borderColor="brand.500" borderRadius="md">
+              <Text flex={1} fontSize="sm">
+                {fileClipboard.mode === "cut" ? "Moving" : "Copying"} {fileClipboard.items.length} files. Open the destination org and paste into a workspace.
+              </Text>
+              <Button size="xs" variant="ghost" onClick={() => setFileClipboard(null)}>Cancel</Button>
+            </Flex>
+          )}
           <Tabs colorScheme="brand" isLazy>
             <TabList mb={6} borderColor={border}>
               <Tab fontSize="sm">Orgs</Tab>
@@ -342,7 +361,7 @@ function OwnerApp({
                             <Button
                               size="xs"
                               colorScheme="brand"
-                              onClick={() => setBrowse(o.id)}
+                              onClick={() => { setBrowseWorkspace(null); setBrowse(o.id); }}
                             >
                               Open
                             </Button>
@@ -544,15 +563,13 @@ function OwnerApp({
                               run(
                                 () =>
                                   api.adminUpdateUser(u.id, {
-                                    org_id: Number(e.target.value),
+                                    org_id: e.target.value ? Number(e.target.value) : null,
                                   }),
                                 "Org updated",
                               )
                             }
                           >
-                            <option value="" disabled>
-                              {u.org_name ?? "— none —"}
-                            </option>
+                            <option value="">No org</option>
                             {orgs.map((o) => (
                               <option key={o.id} value={o.id}>
                                 {o.name}
@@ -562,6 +579,24 @@ function OwnerApp({
                         </Td>
                         <Td borderColor={border} textAlign="right">
                           <HStack spacing={0.5} justify="flex-end">
+                            <Tooltip label="Edit username and name">
+                              <IconButton
+                                aria-label="Edit username and name"
+                                icon={<VscEdit />}
+                                size="xs"
+                                variant="ghost"
+                                color="ink.muted"
+                                onClick={() => {
+                                  const username = window.prompt(`Login username for ${u.email}:`, u.email);
+                                  if (username === null) return;
+                                  const name = window.prompt(`Display name for ${username}:`, u.name);
+                                  if (name !== null) run(
+                                    () => api.adminUpdateUser(u.id, { email: username, name }),
+                                    "Account updated; user signed out",
+                                  );
+                                }}
+                              />
+                            </Tooltip>
                             <Tooltip label="Reset password">
                               <IconButton
                                 aria-label="Reset password"
@@ -569,16 +604,7 @@ function OwnerApp({
                                 size="xs"
                                 variant="ghost"
                                 color="ink.muted"
-                                onClick={() => {
-                                  const pw = prompt(
-                                    `New password for ${u.email} (min 8):`,
-                                  );
-                                  if (pw)
-                                    run(
-                                      () => api.adminResetPassword(u.id, pw),
-                                      "Password reset",
-                                    );
-                                }}
+                                onClick={() => setResetTarget(u)}
                               />
                             </Tooltip>
                             <Tooltip label="Reset two-factor (lost device)">
@@ -703,6 +729,15 @@ function OwnerApp({
           </Tabs>
         </Box>
       </Box>
+      <PasswordResetDialog
+        target={resetTarget}
+        onClose={() => setResetTarget(null)}
+        onReset={async (id, pw) => {
+          await api.adminResetPassword(id, pw);
+          load();
+          toast({ title: "Password reset; user signed out", status: "success" });
+        }}
+      />
     </Flex>
   );
 }

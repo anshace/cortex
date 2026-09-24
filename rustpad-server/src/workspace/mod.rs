@@ -20,7 +20,8 @@ use warp::{http::StatusCode, hyper::Body, reply::Reply, Filter, Rejection};
 
 use crate::auth::{with_auth, Forbidden};
 use crate::crypto;
-use crate::database::{ChatMessage, Database, Group, PersistedDocument, ReactionView, User, Workspace};
+use crate::database::{ChatMessage, Database, FileRow, Group, ImportedFile, ReactionView, User, Workspace};
+use crate::{current_document, evict_all_boards, evict_boards, evict_documents, flush_and_evict, LiveBoards, LiveDocs};
 
 /// Filter extracting the client's ECDH public key header (present when the
 /// client encrypts the payload).
@@ -97,21 +98,34 @@ fn random_doc_id() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Normalize a virtual file path: forward slashes, no empty/`.`/`..` segments,
-/// bounded length. Returns None if nothing valid remains.
+/// Normalize separators, but *reject* invalid segments rather than silently
+/// removing `..` or empty parts (important for zip import and path conflicts).
 fn clean_path(raw: &str) -> Option<String> {
-    let joined = raw
-        .replace('\\', "/")
-        .split('/')
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-        .collect::<Vec<_>>()
-        .join("/");
-    (!joined.is_empty() && joined.len() <= 512).then_some(joined)
+    let path = raw.replace('\\', "/");
+    if path.is_empty() || path.len() > 512 || path.starts_with('/') {
+        return None;
+    }
+    if path.split('/').any(|part| {
+        part.trim().is_empty()
+            || part == "."
+            || part == ".."
+            || part.chars().any(char::is_control)
+    }) {
+        return None;
+    }
+    Some(path)
 }
 
 fn with_db(db: Database) -> impl Filter<Extract = (Database,), Error = Infallible> + Clone {
     warp::any().map(move || db.clone())
+}
+
+fn with_docs(live: LiveDocs) -> impl Filter<Extract = (LiveDocs,), Error = Infallible> + Clone {
+    warp::any().map(move || live.clone())
+}
+
+fn with_boards(boards: LiveBoards) -> impl Filter<Extract = (LiveBoards,), Error = Infallible> + Clone {
+    warp::any().map(move || boards.clone())
 }
 
 fn err(status: StatusCode, msg: &str) -> warp::reply::Response {
@@ -141,6 +155,14 @@ fn scope_ok(scope: &str, created_by: i64, me: i64, is_member: bool) -> bool {
 
 /// Resolve a workspace the user may access, else reject with Forbidden.
 /// Visibility comes from the workspace's group.
+// A request may have authenticated *before* waiting for the access write
+// gate. Re-read its role/org after acquiring it: a concurrent demotion or
+// org move must take effect before this request changes protected content.
+async fn current_actor(db: &Database, user: &User) -> Result<User, Rejection> {
+    db.admin_target(user.id).await.ok().flatten()
+        .ok_or_else(|| warp::reject::custom(Forbidden))
+}
+
 async fn ensure_ws(db: &Database, user: &User, ws_id: i64) -> Result<Workspace, Rejection> {
     match db.get_workspace(ws_id).await.ok().flatten() {
         Some(ws) if user.role == "root" => Ok(ws),
@@ -191,6 +213,27 @@ async fn ensure_group(db: &Database, user: &User, group_id: i64) -> Result<Group
     }
 }
 
+/// Revoke existing text and whiteboard sockets before membership or scope
+/// changes; checking only the initial WebSocket handshake is insufficient.
+async fn disconnect_group(
+    db: &Database, live: &LiveDocs, boards: &LiveBoards, group_id: i64,
+) -> Result<(), warp::reply::Response> {
+    let ids = db.group_doc_ids(group_id).await.map_err(|e| {
+        warn!("disconnect_group docs: {e}");
+        err(StatusCode::INTERNAL_SERVER_ERROR, "could not save live edits")
+    })?;
+    flush_and_evict(live, db, &ids).await.map_err(|e| {
+        warn!("disconnect_group flush: {e}");
+        err(StatusCode::INTERNAL_SERVER_ERROR, "could not save live edits")
+    })?;
+    let files = db.group_file_ids(group_id).await.map_err(|e| {
+        warn!("disconnect_group files: {e}");
+        err(StatusCode::INTERNAL_SERVER_ERROR, "could not close board editors")
+    })?;
+    evict_boards(boards, &files);
+    Ok(())
+}
+
 /// The owner of a group may manage it: the group's creator or a root/org admin.
 async fn group_owner(db: &Database, user: &User, group_id: i64) -> bool {
     user.role == "root"
@@ -202,6 +245,15 @@ async fn group_owner(db: &Database, user: &User, group_id: i64) -> bool {
             .flatten()
             .map(|g| g.created_by == user.id)
             .unwrap_or(false)
+}
+
+/// Destructive workspace operations are restricted to its creator or a group
+/// manager (not every editor in a shared group).
+async fn workspace_manager(db: &Database, user: &User, ws: &Workspace) -> bool {
+    user.role == "root"
+        || user.role == "admin"
+        || ws.created_by == user.id
+        || group_owner(db, user, ws.group_id).await
 }
 
 #[derive(Deserialize, Default)]
@@ -248,6 +300,36 @@ struct CreateFile {
 #[derive(Deserialize)]
 struct MoveFile {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct FileTransfer {
+    target_workspace_id: i64,
+    mode: String,
+    #[serde(default)]
+    on_conflict: Option<String>,
+    items: Vec<TransferItem>,
+}
+
+#[derive(Deserialize)]
+struct TransferItem {
+    id: i64,
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct FileBatch {
+    ids: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+struct MergeWs {
+    target_workspace_id: i64,
+}
+
+#[derive(Deserialize)]
+struct GroupMove {
+    group_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -305,7 +387,7 @@ fn dm_org(user: &User, q: &DmQuery) -> Option<i64> {
 }
 
 /// Org, workspace, file, and chat HTTP routes.
-pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
     let get_org = warp::path!("org")
         .and(warp::get())
         .and(with_auth(db.clone()))
@@ -340,6 +422,8 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(warp::delete())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
         .and_then(delete_group);
 
     let add_member = warp::path!("groups" / i64 / "members")
@@ -353,6 +437,8 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(warp::delete())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
         .and_then(remove_member);
 
     let create_ws_in_group = warp::path!("groups" / i64 / "workspaces")
@@ -379,7 +465,35 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(warp::delete())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
         .and_then(delete_workspace);
+
+    let merge_ws = warp::path!("workspaces" / i64 / "merge")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
+        .and(warp::body::json())
+        .and_then(merge_workspace);
+
+    let reparent_ws = warp::path!("workspaces" / i64 / "group")
+        .and(warp::put())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
+        .and(warp::body::json())
+        .and_then(reparent_workspace);
+
+    let import_ws = warp::path!("workspaces" / i64 / "import")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::body::content_length_limit(64 * 1024 * 1024))
+        .and(warp::body::bytes())
+        .and_then(import_workspace);
 
     let create_file = warp::path!("files")
         .and(warp::post())
@@ -400,19 +514,31 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(warp::get())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
         .and_then(raw_file);
 
     let download = warp::path!("files" / i64 / "download")
         .and(warp::get())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
         .and_then(download_file);
 
     let export_ws = warp::path!("workspaces" / i64 / "export")
         .and(warp::get())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
         .and_then(export_workspace);
+
+    let archive_files = warp::path!("files" / "archive")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(warp::body::content_length_limit(128 * 1024))
+        .and(warp::body::json())
+        .and_then(archive_files);
 
     // Solo-editor saves for oversized text files (no live OT session).
     let put_text = warp::path!("files" / i64 / "text")
@@ -420,6 +546,7 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(with_auth(db.clone()))
         .and(warp::body::json())
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
         .and_then(put_file_text);
 
     // Whiteboard scene saves: overwrite a binary file's stored blob.
@@ -442,7 +569,29 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(warp::delete())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
         .and_then(delete_file);
+
+    let transfer_r = warp::path!("files" / "transfer")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
+        .and(warp::body::content_length_limit(4 * 1024 * 1024))
+        .and(warp::body::json())
+        .and_then(transfer_files);
+
+    let delete_batch_r = warp::path!("files" / "delete-batch")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
+        .and(warp::body::content_length_limit(128 * 1024))
+        .and(warp::body::json())
+        .and_then(delete_file_batch);
 
     // Workspace group chat.
     let chat_overview_r = warp::path!("chat" / "overview")
@@ -582,6 +731,12 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .and(with_db(db.clone()))
         .and_then(admin_storage);
 
+    let compact_r = warp::path!("admin" / "compact")
+        .and(warp::post())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and_then(admin_compact);
+
     // Whole-instance migration (root only): export every table + blobs as one
     // zip, or restore such a zip into this instance.
     let admin_export_all_r = warp::path!("admin" / "export-all")
@@ -593,8 +748,11 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
     let admin_import_all_r = warp::path!("admin" / "import-all")
         .and(warp::post())
         .and(with_auth(db.clone()))
+        .and(warp::body::content_length_limit(256 * 1024 * 1024))
         .and(warp::body::bytes())
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
         .and_then(admin_import_all);
 
     // Boxed separately: the main chain sits right at the compiler's nesting
@@ -619,6 +777,8 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
     // Box the two halves: warp's `.or()` builds a deeply-nested type, and past
     // ~two-dozen routes the compiler overflows resolving it (E0275). `.boxed()`
     // erases each half's type so the final combination stays shallow.
+    let file_ops = transfer_r.or(delete_batch_r).or(archive_files).boxed();
+    let ws_ops = merge_ws.or(reparent_ws).or(import_ws).boxed();
     let workspace_routes = get_org
         .or(create_group_r)
         .or(get_group_r)
@@ -641,7 +801,10 @@ pub fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error = Reje
         .or(delete_file)
         .or(audit_r)
         .or(storage_r)
+        .or(compact_r)
         .or(admin_all_r)
+        .or(file_ops)
+        .or(ws_ops)
         .boxed();
 
     let chat_routes = chat_overview_r
@@ -672,23 +835,20 @@ async fn get_org(user: User, db: Database, q: OrgQuery) -> Result<impl Reply, Re
     let org_id = acting_org(&user, &q);
     let (org, groups, workspaces, members) = match org_id {
         Some(oid) => {
-            // Every person gets their own private "Personal" group — create it
-            // on first access so each user always has a personal space.
-            let has_personal = if is_owner {
-                db.list_groups(oid).await.unwrap_or_default()
-            } else {
-                db.list_groups_for_user(oid, user.id)
-                    .await
-                    .unwrap_or_default()
+            // Give org members their own Personal group on first access. Root
+            // enumerates orgs for transfer targets; don't create an unused
+            // private group in every org just by inspecting it.
+            if !is_owner {
+                let existing = if user.role == "admin" {
+                    db.list_groups(oid).await.unwrap_or_default()
+                } else {
+                    db.list_groups_for_user(oid, user.id).await.unwrap_or_default()
+                };
+                if !existing.iter().any(|g| g.scope == "personal" && g.created_by == user.id) {
+                    let _ = db.create_group(oid, "Personal", user.id, now_secs(), "personal").await;
+                }
             }
-            .iter()
-            .any(|g| g.scope == "personal" && g.created_by == user.id);
-            if !has_personal {
-                let _ = db
-                    .create_group(oid, "Personal", user.id, now_secs(), "personal")
-                    .await;
-            }
-            let groups = if is_owner {
+            let groups = if is_owner || user.role == "admin" {
                 db.list_groups(oid).await.unwrap_or_default()
             } else {
                 db.list_groups_for_user(oid, user.id)
@@ -744,6 +904,8 @@ async fn create_group(
     q: OrgQuery,
     body: CreateWorkspace,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let org_id = match acting_org(&user, &q) {
         Some(o) => o,
         None => return Ok(err(StatusCode::FORBIDDEN, "you are not assigned to an org")),
@@ -781,6 +943,8 @@ async fn rename_group(
     db: Database,
     body: RenameReq,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let g = ensure_group(&db, &user, group_id).await?;
     let name = body.name.trim();
     if name.is_empty() {
@@ -789,17 +953,41 @@ async fn rename_group(
     if !group_owner(&db, &user, g.id).await {
         return Ok(err(StatusCode::FORBIDDEN, "only the group owner can rename"));
     }
-    let _ = db.rename_group(g.id, name).await;
-    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+    match db.rename_group(g.id, name).await {
+        Ok(()) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
+        Err(e) => {
+            warn!("rename_group {group_id}: {e}");
+            Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not rename group"))
+        }
+    }
 }
 
-async fn delete_group(group_id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+async fn delete_group(
+    group_id: i64,
+    user: User,
+    db: Database,
+    live: LiveDocs,
+    boards: LiveBoards,
+) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let g = ensure_group(&db, &user, group_id).await?;
     if !group_owner(&db, &user, g.id).await {
         return Ok(err(StatusCode::FORBIDDEN, "only the group owner can delete"));
     }
-    let _ = db.delete_group(g.id).await;
-    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+    if let Err(response) = disconnect_group(&db, &live, &boards, g.id).await {
+        return Ok(response);
+    }
+    match db.delete_group(g.id).await {
+        Ok(ids) => {
+            evict_documents(&live, &ids);
+            Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+        }
+        Err(e) => {
+            warn!("delete_group {group_id}: {e}");
+            Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not delete group"))
+        }
+    }
 }
 
 async fn create_ws_in_group(
@@ -808,6 +996,8 @@ async fn create_ws_in_group(
     db: Database,
     body: CreateWsInGroup,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let g = ensure_group(&db, &user, group_id).await?;
     let name = body.name.trim();
     if name.is_empty() {
@@ -833,6 +1023,8 @@ async fn add_member(
     db: Database,
     body: MemberReq,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let g = ensure_group(&db, &user, group_id).await?;
     if g.scope != "group" {
         return Ok(err(StatusCode::BAD_REQUEST, "only group-scope groups have members"));
@@ -840,8 +1032,17 @@ async fn add_member(
     if !group_owner(&db, &user, g.id).await {
         return Ok(err(StatusCode::FORBIDDEN, "only the group owner can manage members"));
     }
-    let _ = db.add_group_member(g.id, body.user_id, "member").await;
-    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+    // Never grant a user from another org access, even if the caller knows the id.
+    if db.user_org(body.user_id).await.ok().flatten() != Some(g.org_id) {
+        return Ok(err(StatusCode::BAD_REQUEST, "member must belong to this org"));
+    }
+    match db.add_group_member(g.id, body.user_id, "member").await {
+        Ok(()) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
+        Err(e) => {
+            warn!("add_group_member {}: {e}", g.id);
+            Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not add member"))
+        }
+    }
 }
 
 async fn remove_member(
@@ -849,7 +1050,11 @@ async fn remove_member(
     user_id: i64,
     user: User,
     db: Database,
+    live: LiveDocs,
+    boards: LiveBoards,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let g = ensure_group(&db, &user, group_id).await?;
     if g.scope != "group" {
         return Ok(err(StatusCode::BAD_REQUEST, "only group-scope groups have members"));
@@ -857,10 +1062,19 @@ async fn remove_member(
     if !group_owner(&db, &user, g.id).await {
         return Ok(err(StatusCode::FORBIDDEN, "only the group owner can manage members"));
     }
-    if user_id != g.created_by {
-        let _ = db.remove_group_member(g.id, user_id).await;
+    if user_id == g.created_by {
+        return Ok(err(StatusCode::CONFLICT, "transfer ownership before removing the owner"));
     }
-    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+    if let Err(response) = disconnect_group(&db, &live, &boards, g.id).await {
+        return Ok(response);
+    }
+    match db.remove_group_member(g.id, user_id).await {
+        Ok(()) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
+        Err(e) => {
+            warn!("remove_group_member {}: {e}", g.id);
+            Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not remove member"))
+        }
+    }
 }
 
 async fn rename_workspace(
@@ -869,19 +1083,264 @@ async fn rename_workspace(
     db: Database,
     body: RenameReq,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let ws = ensure_ws(&db, &user, ws_id).await?;
     let name = body.name.trim();
     if name.is_empty() {
         return Ok(err(StatusCode::BAD_REQUEST, "name cannot be empty"));
     }
-    let _ = db.rename_workspace(ws.id, name).await;
-    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+    if !workspace_manager(&db, &user, &ws).await {
+        return Ok(err(StatusCode::FORBIDDEN, "only a workspace manager can rename"));
+    }
+    match db.rename_workspace(ws.id, name).await {
+        Ok(()) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
+        Err(e) => {
+            warn!("rename_workspace {ws_id}: {e}");
+            Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not rename workspace"))
+        }
+    }
 }
 
-async fn delete_workspace(ws_id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+async fn delete_workspace(
+    ws_id: i64,
+    user: User,
+    db: Database,
+    live: LiveDocs,
+    boards: LiveBoards,
+) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let ws = ensure_ws(&db, &user, ws_id).await?;
-    let _ = db.delete_workspace(ws.id).await;
-    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+    if !workspace_manager(&db, &user, &ws).await {
+        return Ok(err(StatusCode::FORBIDDEN, "only a workspace manager can delete"));
+    }
+    let files = match db.workspace_file_ids(ws.id).await {
+        Ok(ids) => ids,
+        Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not list files")),
+    };
+    match db.delete_workspace(ws.id).await {
+        Ok(ids) => {
+            evict_documents(&live, &ids);
+            evict_boards(&boards, &files);
+            Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+        }
+        Err(e) => {
+            warn!("delete_workspace {ws_id}: {e}");
+            Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not delete workspace"))
+        }
+    }
+}
+
+/// Move a workspace between groups. All live OT editors are flushed and
+/// disconnected first so membership changes take effect immediately.
+async fn reparent_workspace(
+    ws_id: i64,
+    user: User,
+    db: Database,
+    live: LiveDocs,
+    boards: LiveBoards,
+    body: GroupMove,
+) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
+    let ws = ensure_ws(&db, &user, ws_id).await?;
+    let target = ensure_group(&db, &user, body.group_id).await?;
+    if !workspace_manager(&db, &user, &ws).await {
+        return Ok(err(StatusCode::FORBIDDEN, "only a workspace manager can move it"));
+    }
+    if ws.group_id == target.id {
+        return Ok(warp::reply::json(&json!({ "workspace": ws })).into_response());
+    }
+    let ids = match db.workspace_doc_ids(ws.id).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!("reparent_workspace docs: {e}");
+            return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not move workspace"));
+        }
+    };
+    if let Err(e) = flush_and_evict(&live, &db, &ids).await {
+        warn!("reparent_workspace flush: {e}");
+        return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not save live edits"));
+    }
+    let files = match db.workspace_file_ids(ws.id).await {
+        Ok(ids) => ids,
+        Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not close board editors")),
+    };
+    evict_boards(&boards, &files);
+    match db.move_workspace_to_group(&ws, target.id).await {
+        Ok(updated) => {
+            let _ = db.audit(Some(target.org_id), Some(user.id), "move_workspace", Some(&ws.name), now_secs()).await;
+            Ok(warp::reply::json(&json!({ "workspace": updated })).into_response())
+        }
+        Err(e) => {
+            warn!("reparent_workspace {ws_id}: {e}");
+            Ok(err(StatusCode::CONFLICT, "could not move workspace"))
+        }
+    }
+}
+
+/// Merge all files into an existing workspace and remove the empty source.
+/// Each conflicting file gets a numbered suffix, never an overwrite.
+async fn merge_workspace(
+    ws_id: i64,
+    user: User,
+    db: Database,
+    live: LiveDocs,
+    boards: LiveBoards,
+    body: MergeWs,
+) -> Result<impl Reply, Rejection> {
+    if ws_id == body.target_workspace_id {
+        return Ok(err(StatusCode::BAD_REQUEST, "choose a different destination"));
+    }
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
+    let source = ensure_ws(&db, &user, ws_id).await?;
+    let target = ensure_ws(&db, &user, body.target_workspace_id).await?;
+    if !workspace_manager(&db, &user, &source).await {
+        return Ok(err(StatusCode::FORBIDDEN, "only a workspace manager can merge it"));
+    }
+    let ids = match db.workspace_doc_ids(ws_id).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!("merge_workspace docs: {e}");
+            return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not merge workspaces"));
+        }
+    };
+    if let Err(e) = flush_and_evict(&live, &db, &ids).await {
+        warn!("merge_workspace flush: {e}");
+        return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not save live edits"));
+    }
+    let files = match db.workspace_file_ids(source.id).await {
+        Ok(ids) => ids,
+        Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not close board editors")),
+    };
+    evict_boards(&boards, &files);
+    match db.merge_workspaces(source.id, target.id).await {
+        Ok((moved, _)) => {
+            let _ = db.audit(user.org_id, Some(user.id), "merge_workspaces", Some(&format!("{} → {} ({moved} files)", source.name, target.name)), now_secs()).await;
+            Ok(warp::reply::json(&json!({ "ok": true, "moved": moved })).into_response())
+        }
+        Err(e) => {
+            warn!("merge_workspace {ws_id}: {e}");
+            Ok(err(StatusCode::CONFLICT, "merge failed; no files were moved"))
+        }
+    }
+}
+
+/// One atomic server-side copy/move, even for an entire folder. Every source
+/// and the destination are checked individually. Copies use the latest OT
+/// snapshot rather than the last periodic persistence tick.
+async fn transfer_files(
+    user: User,
+    db: Database,
+    live: LiveDocs,
+    boards: LiveBoards,
+    body: FileTransfer,
+) -> Result<impl Reply, Rejection> {
+    let copy = match body.mode.as_str() {
+        "copy" => true,
+        "move" => false,
+        _ => return Ok(err(StatusCode::BAD_REQUEST, "mode must be copy or move")),
+    };
+    let rename_conflicts = match body.on_conflict.as_deref().unwrap_or("error") {
+        "rename" => true,
+        "error" => false,
+        _ => return Ok(err(StatusCode::BAD_REQUEST, "invalid conflict policy")),
+    };
+    if body.items.is_empty() || body.items.len() > 5000 {
+        return Ok(err(StatusCode::BAD_REQUEST, "select 1–5000 files"));
+    }
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
+    let target = ensure_ws(&db, &user, body.target_workspace_id).await?;
+    let mut items = Vec::new(); // capped above; avoid user-sized reservations
+    let mut snapshots = HashMap::new();
+    let mut to_revoke = Vec::new();
+    let mut boards_to_revoke = Vec::new();
+    let mut size: i64 = 0;
+    let mut incoming = body.items;
+    incoming.sort_unstable_by_key(|item| item.id);
+    let mut last_id = None;
+    for item in incoming {
+        if last_id == Some(item.id) {
+            return Ok(err(StatusCode::BAD_REQUEST, "duplicate file id"));
+        }
+        last_id = Some(item.id);
+        let path = match clean_path(&item.path) {
+            Some(p) => p,
+            None => return Ok(err(StatusCode::BAD_REQUEST, "invalid destination path")),
+        };
+        let file = match db.get_file(item.id).await {
+            Ok(Some(f)) => f,
+            Ok(None) => return Ok(err(StatusCode::NOT_FOUND, "source file not found")),
+            Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not read source")),
+        };
+        let source = ensure_ws(&db, &user, file.workspace_id).await?;
+        if copy && file.kind == "text" && live.contains_key(&file.doc_id) {
+            match current_document(&live, &db, &file.doc_id).await {
+                Ok(doc) => { snapshots.insert(file.doc_id.clone(), doc); }
+                Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not read source")),
+            }
+        }
+        if !copy && source.group_id != target.group_id {
+            to_revoke.push(file.doc_id.clone());
+            boards_to_revoke.push(file.id);
+        }
+        size += file.size;
+        if copy && size > 256 * 1024 * 1024 {
+            return Ok(err(StatusCode::PAYLOAD_TOO_LARGE, "copy exceeds 256 MB"));
+        }
+        items.push((item.id, path));
+    }
+    if let Err(e) = flush_and_evict(&live, &db, &to_revoke).await {
+        warn!("transfer flush: {e}");
+        return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not save live edits"));
+    }
+    evict_boards(&boards, &boards_to_revoke);
+    match db.transfer_files(target.id, &items, copy, rename_conflicts, &snapshots, now_secs()).await {
+        Ok(files) => {
+            let _ = db.audit(user.org_id, Some(user.id), if copy { "copy_files" } else { "move_files" }, Some(&format!("{} file(s) → workspace {}", files.len(), target.id)), now_secs()).await;
+            Ok(warp::reply::json(&json!({ "files": files })).into_response())
+        }
+        Err(e) => {
+            warn!("transfer_files: {e}");
+            Ok(err(StatusCode::CONFLICT, "transfer failed; no files were changed (check names and content)"))
+        }
+    }
+}
+
+/// Delete a folder/multi-selection in one transaction, rather than leaving a
+/// half-deleted folder after one of hundreds of per-file requests fails.
+async fn delete_file_batch(
+    user: User,
+    db: Database,
+    live: LiveDocs,
+    boards: LiveBoards,
+    body: FileBatch,
+) -> Result<impl Reply, Rejection> {
+    if body.ids.is_empty() || body.ids.len() > 5000 {
+        return Ok(err(StatusCode::BAD_REQUEST, "select 1–5000 files"));
+    }
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
+    for id in &body.ids {
+        if !file_allowed(&db, &user, *id).await {
+            return Err(warp::reject::custom(Forbidden));
+        }
+    }
+    match db.delete_files(&body.ids).await {
+        Ok(ids) => {
+            evict_documents(&live, &ids);
+            evict_boards(&boards, &body.ids);
+            let _ = db.audit(user.org_id, Some(user.id), "delete_files", Some(&format!("{} file(s)", ids.len())), now_secs()).await;
+            Ok(warp::reply::json(&json!({ "ok": true, "deleted": ids.len() })).into_response())
+        }
+        Err(e) => {
+            warn!("delete_file_batch: {e}");
+            Ok(err(StatusCode::CONFLICT, "delete failed; no files were removed"))
+        }
+    }
 }
 
 async fn create_file(user: User, db: Database, body: CreateFile) -> Result<impl Reply, Rejection> {
@@ -911,6 +1370,121 @@ async fn create_file(user: User, db: Database, body: CreateFile) -> Result<impl 
             StatusCode::BAD_REQUEST,
             "could not create file (name may already exist)",
         )),
+    }
+}
+
+/// MIME inference for ZIP entries (ZIP itself carries no trusted MIME type).
+fn mime_from_path(path: &str) -> Option<String> {
+    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+/// Extract a bounded ZIP, rejecting traversal, symlinks, duplicate paths and
+/// decompression bombs BEFORE any database changes are attempted.
+fn unpack_workspace_zip(body: bytes::Bytes) -> anyhow::Result<Vec<ImportedFile>> {
+    use std::io::Read as _;
+    const MAX_FILE: u64 = 32 * 1024 * 1024;
+    const MAX_TOTAL: u64 = 128 * 1024 * 1024;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(body))?;
+    if archive.len() > 6000 {
+        anyhow::bail!("too many ZIP entries");
+    }
+    let mut entries = Vec::new();
+    let mut dirs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        if entry.unix_mode().is_some_and(|mode| mode & 0o170000 == 0o120000) {
+            anyhow::bail!("ZIP contains a symlink");
+        }
+        // Common ZIP tools prefix paths with "./"; no other dot or parent
+        // components are accepted. A literal leading slash is also rejected.
+        let name = entry.name().strip_prefix("./").unwrap_or(entry.name());
+        let path = clean_path(name.trim_end_matches('/'))
+            .ok_or_else(|| anyhow::anyhow!("ZIP contains an unsafe path"))?;
+        if !seen.insert(path.clone()) {
+            anyhow::bail!("ZIP contains duplicate paths");
+        }
+        if entry.is_dir() {
+            dirs.push(path);
+            continue;
+        }
+        if entry.size() > MAX_FILE || total + entry.size() > MAX_TOTAL {
+            anyhow::bail!("ZIP exceeds the size limit");
+        }
+        let mut bytes = Vec::new();
+        (&mut entry).take(MAX_FILE + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_FILE {
+            anyhow::bail!("ZIP entry exceeds 32 MB");
+        }
+        total += bytes.len() as u64;
+        if total > MAX_TOTAL {
+            anyhow::bail!("ZIP exceeds 128 MB uncompressed");
+        }
+        let mime = mime_from_path(&path);
+        let is_text = mime.is_none()
+            && !path.to_ascii_lowercase().ends_with(".board")
+            && bytes.len() <= 1_000_000
+            && !bytes.contains(&0)
+            && std::str::from_utf8(&bytes).is_ok();
+        entries.push(ImportedFile {
+            mime,
+            path,
+            bytes,
+            is_text,
+        });
+    }
+    for dir in dirs {
+        if !entries.iter().any(|e| e.path.starts_with(&format!("{dir}/"))) {
+            let path = format!("{dir}/.keep");
+            if path.len() > 512 { anyhow::bail!("ZIP directory path is too long"); }
+            entries.push(ImportedFile { path, mime: None, bytes: Vec::new(), is_text: true });
+        }
+    }
+    if entries.len() > 5000 {
+        anyhow::bail!("ZIP has more than 5000 files");
+    }
+    Ok(entries)
+}
+
+/// Import a ZIP into the workspace atomically. Existing files are never
+/// overwritten; numbered names preserve both sides of a collision.
+async fn import_workspace(
+    ws_id: i64,
+    user: User,
+    db: Database,
+    body: bytes::Bytes,
+) -> Result<impl Reply, Rejection> {
+    let ws = ensure_ws(&db, &user, ws_id).await?;
+    let files = match unpack_workspace_zip(body) {
+        Ok(files) => files,
+        Err(e) => return Ok(err(StatusCode::BAD_REQUEST, &format!("invalid ZIP: {e}"))),
+    };
+    match db.import_files(ws.id, &files, now_secs()).await {
+        Ok(added) => {
+            let _ = db.audit(user.org_id, Some(user.id), "import_workspace", Some(&format!("{} files", added.len())), now_secs()).await;
+            Ok(warp::reply::json(&json!({ "files": added })).into_response())
+        }
+        Err(e) => {
+            warn!("import_workspace {ws_id}: {e}");
+            Ok(err(StatusCode::CONFLICT, "ZIP import failed; no files were added"))
+        }
     }
 }
 
@@ -970,45 +1544,24 @@ async fn upload_file(
         None
     };
     let doc_id = random_doc_id();
-    let kind = if text.is_some() { "text" } else { "binary" };
     let file = match db
-        .create_file(
+        .create_uploaded_file(
             q.workspace_id,
             &filename,
             &doc_id,
-            kind,
             mime.as_deref(),
+            text,
+            &bytes,
             now_secs(),
         )
         .await
     {
         Ok(file) => file,
-        Err(_) => {
-            return Ok(err(
-                StatusCode::BAD_REQUEST,
-                "could not create file (name may already exist)",
-            ))
+        Err(e) => {
+            warn!("upload_file {filename}: {e}");
+            return Ok(err(StatusCode::CONFLICT, "could not store file (name may already exist)"));
         }
     };
-    let stored = match text {
-        Some(t) => db
-            .store(
-                &doc_id,
-                &PersistedDocument {
-                    text: t.replace("\r\n", "\n"),
-                    language: None,
-                },
-            )
-            .await
-            .is_ok(),
-        None => db.store_blob(file.id, &bytes).await.is_ok(),
-    };
-    if !stored {
-        return Ok(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not store file",
-        ));
-    }
     let _ = db
         .audit(
             user.org_id,
@@ -1071,7 +1624,7 @@ async fn put_file_blob(
     }
 }
 
-async fn raw_file(file_id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+async fn raw_file(file_id: i64, user: User, db: Database, live: LiveDocs) -> Result<impl Reply, Rejection> {
     if !file_allowed(&db, &user, file_id).await {
         return Err(warp::reject::custom(Forbidden));
     }
@@ -1082,29 +1635,29 @@ async fn raw_file(file_id: i64, user: User, db: Database) -> Result<impl Reply, 
     // Text files are stored as OT documents; serve their current text so the HTML
     // preview can inline sibling CSS/JS. Binary files serve their stored blob.
     let (bytes, mime, revision) = if file.kind == "binary" {
-        let (bytes, revision) = db
-            .load_blob_with_revision(file.id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        (
-            bytes,
-            file.mime
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
-            revision,
-        )
+        let (bytes, revision) = match db.load_blob_with_revision(file.id).await {
+            Ok(Some(b)) => b,
+            _ => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "file content missing")),
+        };
+        // A client-supplied MIME is not authority to serve active HTML/SVG/JS
+        // from our authenticated origin. Previews fetch bytes or use PDF/media.
+        let mime = file.mime.unwrap_or_default();
+        let safe_mime = if mime == "application/pdf"
+            || mime.starts_with("image/") && mime != "image/svg+xml"
+            || mime.starts_with("audio/")
+            || mime.starts_with("video/")
+        {
+            mime
+        } else {
+            "application/octet-stream".to_string()
+        };
+        (bytes, safe_mime, revision)
     } else {
-        let text = db
-            .load(&file.doc_id)
-            .await
-            .map(|d| d.text)
-            .unwrap_or_default();
-        (
-            text.into_bytes(),
-            "text/plain; charset=utf-8".to_string(),
-            0,
-        )
+        let text = match current_document(&live, &db, &file.doc_id).await {
+            Ok(d) => d.text,
+            Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "file content missing")),
+        };
+        (text.into_bytes(), "text/plain; charset=utf-8".to_string(), 0)
     };
     let resp = warp::http::Response::builder()
         .header("content-type", mime)
@@ -1114,7 +1667,7 @@ async fn raw_file(file_id: i64, user: User, db: Database) -> Result<impl Reply, 
     Ok(resp)
 }
 
-async fn download_file(file_id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+async fn download_file(file_id: i64, user: User, db: Database, live: LiveDocs) -> Result<impl Reply, Rejection> {
     if !file_allowed(&db, &user, file_id).await {
         return Err(warp::reject::custom(Forbidden));
     }
@@ -1132,26 +1685,21 @@ async fn download_file(file_id: i64, user: User, db: Database) -> Result<impl Re
         )
         .await;
     let bytes: Vec<u8> = if file.kind == "binary" {
-        db.load_blob(file.id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default()
+        match db.load_blob(file.id).await {
+            Ok(Some(bytes)) => bytes,
+            _ => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "file content missing")),
+        }
     } else {
-        db.load(&file.doc_id)
-            .await
-            .map(|d| d.text.into_bytes())
-            .unwrap_or_default()
+        match current_document(&live, &db, &file.doc_id).await {
+            Ok(doc) => doc.text.into_bytes(),
+            Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "file content missing")),
+        }
     };
     // Keep the header well-formed regardless of what the path contains.
-    let filename: String = file
-        .path
-        .rsplit('/')
-        .next()
-        .unwrap_or("download")
-        .chars()
-        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
-        .collect();
+    let filename = safe_download_filename(
+        file.path.rsplit('/').next().unwrap_or("download"),
+        "download",
+    );
     let resp = warp::http::Response::builder()
         .header(
             "content-disposition",
@@ -1162,102 +1710,164 @@ async fn download_file(file_id: i64, user: User, db: Database) -> Result<impl Re
     Ok(resp)
 }
 
-/// Sanitize a workspace name into a safe zip filename (no path separators,
-/// quotes, backslashes, or control chars).
-fn zip_filename(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| {
-            if c.is_control() || c == '"' || c == '\\' || c == '/' {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let s = s.trim().to_string();
-    if s.is_empty() {
-        "workspace".to_string()
-    } else {
-        s
-    }
+/// The HTTP header must be ASCII, bounded and free of quotes/separators. The
+/// client saves the requested Unicode name from its download attribute; this
+/// ASCII fallback also works when downloading directly without the UI.
+fn safe_download_filename(name: &str, fallback: &str) -> String {
+    let s: String = name.chars().take(180).map(|c| {
+        if c.is_ascii() && (c.is_ascii_alphanumeric() || " ._-()[]".contains(c)) {
+            c
+        } else {
+            '_'
+        }
+    }).collect();
+    let s = s.trim_matches(|c: char| c == ' ' || c == '.').to_string();
+    if s.is_empty() { fallback.to_string() } else { s }
 }
 
-/// Zip every file in the workspace (text and binary) and stream it down.
-async fn export_workspace(ws_id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
-    let ws = ensure_ws(&db, &user, ws_id).await?;
-    let files = db.list_files(ws.id).await.unwrap_or_default();
-    let mut buf: Vec<u8> = Vec::new();
+fn zip_filename(name: &str) -> String {
+    safe_download_filename(name, "workspace")
+}
+
+/// Build a bounded archive. Both selected-file and full-workspace downloads
+/// use the live OT snapshot, not the potentially stale 3-second DB copy.
+async fn make_archive(files: &[FileRow], db: &Database, live: &LiveDocs) -> anyhow::Result<Vec<u8>> {
+    use std::io::Write as _;
+    if files.len() > 5000 {
+        anyhow::bail!("too many files for one archive");
+    }
+    let mut buf = Vec::new();
+    let mut total = 0usize;
+    let mut dirs = std::collections::HashSet::new();
     {
-        use std::io::Write as _;
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
-        for f in &files {
-            let path = f.path.trim_start_matches('/').to_string();
-            if path.is_empty() || path == ".keep" || path.ends_with("/.keep") {
+        for f in files {
+            let path = clean_path(&f.path).ok_or_else(|| anyhow::anyhow!("invalid stored path"))?;
+            if path == ".keep" || path.ends_with("/.keep") {
+                if let Some(folder) = path.strip_suffix("/.keep") {
+                    if dirs.insert(folder.to_string()) {
+                        zip.add_directory(format!("{folder}/"), options)?;
+                    }
+                }
                 continue;
             }
-            let bytes: Vec<u8> = if f.kind == "binary" {
-                db.load_blob(f.id).await.ok().flatten().unwrap_or_default()
+            let bytes = if f.kind == "binary" {
+                db.load_blob(f.id).await?.ok_or_else(|| anyhow::anyhow!("blob missing"))?
             } else {
-                db.load(&f.doc_id)
-                    .await
-                    .map(|d| d.text.into_bytes())
-                    .unwrap_or_default()
+                current_document(live, db, &f.doc_id).await?.text.into_bytes()
             };
-            if zip.start_file(path, options).is_err() {
-                return Ok(err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "failed to create archive",
-                ));
+            total += bytes.len();
+            if total > 256 * 1024 * 1024 {
+                anyhow::bail!("archive exceeds 256 MB");
             }
-            if zip.write_all(&bytes).is_err() {
-                return Ok(err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "failed to create archive",
-                ));
-            }
+            zip.start_file(path, options)?;
+            zip.write_all(&bytes)?;
         }
-        if zip.finish().is_err() {
-            return Ok(err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to create archive",
-            ));
-        }
+        zip.finish()?;
     }
-    let _ = db
-        .audit(
-            user.org_id,
-            Some(user.id),
-            "export_workspace",
-            Some(&ws.name),
-            now_secs(),
-        )
-        .await;
-    let filename = format!("{}.zip", zip_filename(&ws.name));
-    let resp = warp::http::Response::builder()
-        .header(
-            "content-disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header("content-type", "application/zip")
-        .body(Body::from(buf))
-        .expect("valid response");
-    Ok(resp)
+    Ok(buf)
 }
 
-async fn delete_file(file_id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+fn archive_reply(bytes: Vec<u8>, name: &str) -> warp::reply::Response {
+    warp::http::Response::builder()
+        .header("content-disposition", format!("attachment; filename=\"{}.zip\"", zip_filename(name)))
+        .header("content-type", "application/zip")
+        .body(Body::from(bytes))
+        .expect("valid response")
+}
+
+/// Export all workspace files, including markers for empty folders.
+async fn export_workspace(
+    ws_id: i64,
+    user: User,
+    db: Database,
+    live: LiveDocs,
+) -> Result<impl Reply, Rejection> {
+    let ws = ensure_ws(&db, &user, ws_id).await?;
+    let files = match db.list_files(ws.id).await {
+        Ok(files) => files,
+        Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not list files")),
+    };
+    match make_archive(&files, &db, &live).await {
+        Ok(buf) => {
+            let _ = db.audit(user.org_id, Some(user.id), "export_workspace", Some(&ws.name), now_secs()).await;
+            Ok(archive_reply(buf, &ws.name))
+        }
+        Err(e) => {
+            warn!("export_workspace {ws_id}: {e}");
+            let too_large = e.to_string().contains("archive exceeds") || e.to_string().contains("too many files");
+            Ok(err(if too_large { StatusCode::PAYLOAD_TOO_LARGE } else { StatusCode::INTERNAL_SERVER_ERROR },
+                if too_large { "archive exceeds the download limit" } else { "file content missing; archive could not be built" }))
+        }
+    }
+}
+
+/// Zip just the selected files (one HTTP request instead of N blocked browser
+/// downloads). All IDs must be in the same visible workspace.
+async fn archive_files(
+    user: User,
+    db: Database,
+    live: LiveDocs,
+    body: FileBatch,
+) -> Result<impl Reply, Rejection> {
+    if body.ids.is_empty() || body.ids.len() > 5000 {
+        return Ok(err(StatusCode::BAD_REQUEST, "select 1–5000 files"));
+    }
+    // Sorting/deduplicating the already bounded request avoids a second
+    // user-sized hash-table allocation. The ZIP does not depend on ID order.
+    let mut ids = body.ids;
+    ids.sort_unstable();
+    let requested = ids.len();
+    ids.dedup();
+    if ids.len() != requested {
+        return Ok(err(StatusCode::BAD_REQUEST, "duplicate file id"));
+    }
+    let mut files = Vec::new();
+    let mut workspace_id = None;
+    for id in ids {
+        let file = match db.get_file(id).await {
+            Ok(Some(f)) => f,
+            _ => return Ok(err(StatusCode::NOT_FOUND, "file not found")),
+        };
+        ensure_ws(&db, &user, file.workspace_id).await?;
+        if workspace_id.is_some() && workspace_id != Some(file.workspace_id) {
+            return Ok(err(StatusCode::BAD_REQUEST, "select files in one workspace"));
+        }
+        workspace_id = Some(file.workspace_id);
+        files.push(file);
+    }
+    match make_archive(&files, &db, &live).await {
+        Ok(buf) => {
+            let _ = db.audit(user.org_id, Some(user.id), "download_files", Some(&format!("{} files", files.len())), now_secs()).await;
+            Ok(archive_reply(buf, "selected-files"))
+        }
+        Err(e) => {
+            warn!("archive_files: {e}");
+            let too_large = e.to_string().contains("archive exceeds") || e.to_string().contains("too many files");
+            Ok(err(if too_large { StatusCode::PAYLOAD_TOO_LARGE } else { StatusCode::INTERNAL_SERVER_ERROR },
+                if too_large { "archive exceeds the download limit" } else { "file content missing; archive could not be built" }))
+        }
+    }
+}
+
+async fn delete_file(file_id: i64, user: User, db: Database, live: LiveDocs, boards: LiveBoards) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     if !file_allowed(&db, &user, file_id).await {
         return Err(warp::reject::custom(Forbidden));
     }
     let path = db.get_file(file_id).await.ok().flatten().map(|f| f.path);
-    if let Err(e) = db.delete_file(file_id).await {
-        warn!("delete_file {file_id}: {e}");
-        return Ok(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not delete file",
-        ));
+    match db.delete_file(file_id).await {
+        Ok(doc_id) => {
+            evict_documents(&live, &[doc_id]);
+            evict_boards(&boards, &[file_id]);
+        }
+        Err(e) => {
+            warn!("delete_file {file_id}: {e}");
+            return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not delete file"));
+        }
     }
     let _ = db
         .audit(
@@ -1280,6 +1890,7 @@ async fn put_file_text(
     user: User,
     body: serde_json::Value,
     db: Database,
+    live: LiveDocs,
 ) -> Result<impl Reply, Rejection> {
     if !file_allowed(&db, &user, file_id).await {
         return Err(warp::reject::custom(Forbidden));
@@ -1290,6 +1901,9 @@ async fn put_file_text(
     };
     if file.kind != "text" {
         return Ok(err(StatusCode::BAD_REQUEST, "not a text file"));
+    }
+    if live.contains_key(&file.doc_id) {
+        return Ok(err(StatusCode::CONFLICT, "this file has a live collaborative editor"));
     }
     let text = match body["text"].as_str() {
         Some(t) => t.to_string(),
@@ -1378,7 +1992,7 @@ async fn chat_overview(
     // preview and unread count.
     let mut gss = Vec::new();
     if let Some(org) = org {
-        let groups = if user.role == "root" {
+        let groups = if user.role == "root" || user.role == "admin" {
             db.list_groups(org).await.unwrap_or_default()
         } else {
             db.list_groups_for_user(org, user.id)
@@ -1429,6 +2043,8 @@ async fn get_chat(
     q: ChatQuery,
     epk: Option<String>,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     ensure_group(&db, &user, q.group_id).await?;
     let messages = db
         .list_messages(q.group_id, 300)
@@ -1453,6 +2069,8 @@ async fn post_chat(
     epk: Option<String>,
     raw: bytes::Bytes,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     ensure_group(&db, &user, q.group_id).await?;
     let body: ChatPost =
         match crypto::open_request(&epk, &raw).and_then(|b| serde_json::from_slice(&b).ok()) {
@@ -1481,12 +2099,19 @@ async fn post_chat(
 
 /// Clear a group's chat. Admin, root, or the group owner.
 async fn clear_chat(user: User, db: Database, q: ChatQuery) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     let g = ensure_group(&db, &user, q.group_id).await?;
     if user.role != "admin" && user.role != "root" && !group_owner(&db, &user, g.id).await {
         return Err(warp::reject::custom(Forbidden));
     }
-    let _ = db.clear_messages(g.id).await;
-    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+    match db.clear_messages(g.id).await {
+        Ok(()) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
+        Err(e) => {
+            warn!("clear_messages {}: {e}", g.id);
+            Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not clear chat"))
+        }
+    }
 }
 
 /// Resolve the org for a DM and verify the peer is a co-member. Returns the org.
@@ -1508,6 +2133,8 @@ async fn get_dm(
     q: DmQuery,
     epk: Option<String>,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     let org = dm_ctx(&db, &user, &q).await?;
     let messages = db
         .list_dm(org, user.id, q.with, 300)
@@ -1532,6 +2159,8 @@ async fn post_dm(
     epk: Option<String>,
     raw: bytes::Bytes,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     let org = dm_ctx(&db, &user, &q).await?;
     let body: ChatPost =
         match crypto::open_request(&epk, &raw).and_then(|b| serde_json::from_slice(&b).ok()) {
@@ -1560,9 +2189,16 @@ async fn post_dm(
 
 /// Clear a 1:1 conversation. Either participant may do this (clears for both).
 async fn clear_dm(user: User, db: Database, q: DmQuery) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     let org = dm_ctx(&db, &user, &q).await?;
-    let _ = db.clear_dm(org, user.id, q.with).await;
-    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+    match db.clear_dm(org, user.id, q.with).await {
+        Ok(()) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
+        Err(e) => {
+            warn!("clear_dm {org}: {e}");
+            Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not clear conversation"))
+        }
+    }
 }
 
 /// Validate an edited body (shared by chat + DM edits).
@@ -1593,17 +2229,49 @@ async fn edit_chat(
         Some(t) => t,
         None => return Ok(err(StatusCode::BAD_REQUEST, "empty or oversized message")),
     };
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
+    let group_id = db.message_group(id).await.ok().flatten()
+        .ok_or_else(|| warp::reject::custom(Forbidden))?;
+    ensure_group(&db, &user, group_id).await?;
     match db.edit_message(id, user.id, text, now_secs()).await {
         Ok(true) => Ok(crypto::seal_reply(&epk, &json!({ "ok": true }))),
         _ => Ok(err(StatusCode::FORBIDDEN, "cannot edit this message")),
     }
 }
 
-/// Delete one of your own group-chat messages.
+/// Authors can delete their own messages. Group managers can moderate any
+/// message in their group; they still cannot read/moderate private DMs.
 async fn delete_chat_msg(id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
-    match db.delete_message(id, user.id).await {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
+    let group_id = match db.message_group(id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return Ok(err(StatusCode::NOT_FOUND, "message not found")),
+        Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not delete message")),
+    };
+    ensure_group(&db, &user, group_id).await?;
+    let moderator = group_owner(&db, &user, group_id).await;
+    match db.delete_message(id, user.id, moderator).await {
         Ok(true) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
-        _ => Ok(err(StatusCode::FORBIDDEN, "cannot delete this message")),
+        Ok(false) => Ok(err(StatusCode::FORBIDDEN, "cannot delete this message")),
+        Err(e) => {
+            warn!("delete_chat_msg {id}: {e}");
+            Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not delete message"))
+        }
+    }
+}
+
+/// The author/recipient may act on a DM only while they still have access to
+/// its org. The UPDATE/DELETE additionally requires the author in SQL.
+async fn dm_message_allowed(db: &Database, user: &User, id: i64) -> Result<(), Rejection> {
+    let (sender, org, recipient) = db.reaction_context("dm", id).await.ok().flatten()
+        .ok_or_else(|| warp::reject::custom(Forbidden))?;
+    if (user.id == sender || user.id == recipient)
+        && (user.role == "root" || user.org_id == Some(org)) {
+        Ok(())
+    } else {
+        Err(warp::reject::custom(Forbidden))
     }
 }
 
@@ -1624,6 +2292,9 @@ async fn edit_dm(
         Some(t) => t,
         None => return Ok(err(StatusCode::BAD_REQUEST, "empty or oversized message")),
     };
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
+    dm_message_allowed(&db, &user, id).await?;
     match db.edit_dm(id, user.id, text, now_secs()).await {
         Ok(true) => Ok(crypto::seal_reply(&epk, &json!({ "ok": true }))),
         _ => Ok(err(StatusCode::FORBIDDEN, "cannot edit this message")),
@@ -1632,6 +2303,9 @@ async fn edit_dm(
 
 /// Delete one of your own direct messages.
 async fn delete_dm_msg(id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
+    dm_message_allowed(&db, &user, id).await?;
     match db.delete_dm_message(id, user.id).await {
         Ok(true) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
         _ => Ok(err(StatusCode::FORBIDDEN, "cannot delete this message")),
@@ -1659,9 +2333,7 @@ struct ReactBody {
     emoji: String,
 }
 
-/// Toggle an emoji reaction on a message. Reactions only ever surface through
-/// the thread-scoped join, so a reaction to an unseen id stays invisible —
-/// ponytail: no extra ownership/access check needed here.
+/// Toggle a reaction only after checking visibility of the underlying message.
 async fn toggle_reaction(
     user: User,
     db: Database,
@@ -1680,10 +2352,28 @@ async fn toggle_reaction(
     if emoji.is_empty() || emoji.chars().count() > 8 {
         return Ok(err(StatusCode::BAD_REQUEST, "bad emoji"));
     }
-    let _ = db
-        .toggle_reaction(&body.kind, body.msg_id, user.id, emoji)
-        .await;
-    Ok(crypto::seal_reply(&epk, &json!({ "ok": true })))
+    let ctx = match db.reaction_context(&body.kind, body.msg_id).await {
+        Ok(Some(ctx)) => ctx,
+        Ok(None) => return Ok(err(StatusCode::NOT_FOUND, "message not found")),
+        Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not react")),
+    };
+    let allowed = if body.kind == "ws" {
+        ensure_group(&db, &user, ctx.0).await.is_ok()
+    } else {
+        // Private DMs are accessible only to the sender/recipient, not admins.
+        (user.id == ctx.0 || user.id == ctx.2)
+            && (user.role == "root" || user.org_id == Some(ctx.1))
+    };
+    if !allowed {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    match db.toggle_reaction(&body.kind, body.msg_id, user.id, emoji).await {
+        Ok(()) => Ok(crypto::seal_reply(&epk, &json!({ "ok": true }))),
+        Err(e) => {
+            warn!("toggle_reaction {}: {e}", body.msg_id);
+            Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not react"))
+        }
+    }
 }
 
 /// Heartbeat: record that the caller is currently online.
@@ -1719,9 +2409,9 @@ async fn audit_log(user: User, db: Database) -> Result<impl Reply, Rejection> {
     Ok(warp::reply::json(&json!({ "entries": entries })).into_response())
 }
 
-/// Owner/admin storage readout: database size, blob bytes, and per-table rows.
+/// Owner-only instance-wide storage readout (never expose other orgs' usage).
 async fn admin_storage(user: User, db: Database) -> Result<impl Reply, Rejection> {
-    if user.role != "admin" && user.role != "root" {
+    if user.role != "root" {
         return Err(warp::reject::custom(Forbidden));
     }
     const TABLES: &[&str] = &[
@@ -1748,10 +2438,33 @@ async fn admin_storage(user: User, db: Database) -> Result<impl Reply, Rejection
     }
     Ok(warp::reply::json(&json!({
         "db_bytes": db.db_size_bytes().await.unwrap_or(0),
+        "free_bytes": db.free_bytes().await.unwrap_or(0),
         "blob_bytes": db.blob_bytes().await.unwrap_or(0),
         "tables": tables,
     }))
     .into_response())
+}
+
+/// Owner-only forced compaction. No external process should open the live DB.
+async fn admin_compact(user: User, db: Database) -> Result<impl Reply, Rejection> {
+    if user.role != "root" {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    let retention = std::env::var("CORTEX_AUDIT_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&n| (1..=3650).contains(&n))
+        .unwrap_or(180);
+    match db.maintain(now_secs(), retention, true).await {
+        Ok(report) => {
+            let _ = db.audit(None, Some(user.id), "compact", None, now_secs()).await;
+            Ok(warp::reply::json(&report).into_response())
+        }
+        Err(e) => {
+            warn!("owner compact: {e}");
+            Ok(err(StatusCode::SERVICE_UNAVAILABLE, "compaction failed; see server log"))
+        }
+    }
 }
 
 /// Whole-instance export (root only): every migrated table plus blobs,
@@ -1760,17 +2473,13 @@ async fn admin_export_all(user: User, db: Database) -> Result<impl Reply, Reject
     if user.role != "root" {
         return Err(warp::reject::custom(Forbidden));
     }
-    let mut tables_obj = serde_json::Map::new();
-    for table in Database::MIGRATE_TABLES {
-        match db.export_table(table).await {
-            Ok(rows) => {
-                tables_obj.insert((*table).to_string(), serde_json::Value::Array(rows));
-            }
-            Err(_) => {
-                return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "export failed"));
-            }
+    let tables_obj = match db.export_snapshot().await {
+        Ok(tables) => tables,
+        Err(e) => {
+            warn!("admin_export_all snapshot: {e}");
+            return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "export failed"));
         }
-    }
+    };
     let manifest = json!({
         "cortex_export": 1,
         "exported_at": now_secs(),
@@ -1822,6 +2531,8 @@ async fn admin_import_all(
     user: User,
     body: bytes::Bytes,
     db: Database,
+    live: LiveDocs,
+    boards: LiveBoards,
 ) -> Result<impl Reply, Rejection> {
     if user.role != "root" {
         return Err(warp::reject::custom(Forbidden));
@@ -1835,7 +2546,7 @@ async fn admin_import_all(
     let manifest: serde_json::Value = match archive
         .by_name("manifest.json")
         .ok()
-        .map(|f| serde_json::from_reader(f))
+        .map(|f| serde_json::from_reader(std::io::Read::take(f, 512 * 1024 * 1024)))
     {
         Some(Ok(m)) => m,
         _ => {
@@ -1855,11 +2566,19 @@ async fn admin_import_all(
             .unwrap_or_default();
         restore.push(((*table).to_string(), rows));
     }
-    match db.import_replace_all(&restore).await {
-        Ok(()) => {}
-        Err(_) => {
-            return Ok(err(StatusCode::BAD_REQUEST, "import failed; nothing changed"));
-        }
+    // Stop editors and persisters BEFORE replacing row ids. Otherwise a
+    // pending save from the old dataset can overwrite a newly imported doc
+    // with the same id after the import transaction commits.
+    let _gate = crate::access_gate().write().await;
+    let live_ids: Vec<String> = live.iter().map(|item| item.key().clone()).collect();
+    if let Err(e) = flush_and_evict(&live, &db, &live_ids).await {
+        warn!("admin_import_all flush: {e}");
+        return Ok(err(StatusCode::SERVICE_UNAVAILABLE, "could not save live edits"));
+    }
+    evict_all_boards(&boards);
+    if let Err(e) = db.import_replace_all(&restore).await {
+        warn!("admin_import_all: {e}");
+        return Ok(err(StatusCode::BAD_REQUEST, "import failed; nothing changed"));
     }
     let _ = db
         .audit(
@@ -1935,5 +2654,114 @@ async fn get_chat_image(id: i64, user: User, db: Database) -> Result<impl Reply,
         }
         Some(_) => Err(warp::reject::custom(Forbidden)),
         None => Ok(err(StatusCode::NOT_FOUND, "no such image")),
+    }
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn workspace_zip_roundtrip_preserves_text_binary_and_empty_folders() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(&format!("sqlite://{}", tmp.path().display())).await.unwrap();
+        db.create_user_if_absent("owner", "Owner", "hash", "root", None).await.unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let org = db.create_org("Org", "org", 1).await.unwrap();
+        let group = db.create_group(org.id, "Group", owner.id, 1, "group").await.unwrap();
+        let ws = db.create_workspace(group.id, "Source", owner.id, 1).await.unwrap();
+        let other = db.create_workspace(group.id, "Destination", owner.id, 1).await.unwrap();
+        db.create_uploaded_file(ws.id, "docs/hello.txt", "doc-a", None, Some("Unicode ✓"), "Unicode ✓".as_bytes(), 1).await.unwrap();
+        db.create_uploaded_file(ws.id, "images/a.png", "doc-b", Some("image/png"), None, &[0, 2, 255], 1).await.unwrap();
+        db.create_file(ws.id, "empty/.keep", "doc-c", "text", None, 1).await.unwrap();
+        let live: LiveDocs = Default::default();
+        let bytes = make_archive(&db.list_files(ws.id).await.unwrap(), &db, &live).await.unwrap();
+        let files = unpack_workspace_zip(bytes::Bytes::from(bytes)).unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files.iter().find(|f| f.path == "docs/hello.txt").unwrap().bytes, "Unicode ✓".as_bytes());
+        assert_eq!(files.iter().find(|f| f.path == "images/a.png").unwrap().bytes, vec![0, 2, 255]);
+        assert!(files.iter().any(|f| f.path == "empty/.keep"));
+        let imported = db.import_files(other.id, &files, 1).await.unwrap();
+        assert_eq!(imported.len(), 3);
+        assert_eq!(db.load(&imported.iter().find(|f| f.path == "docs/hello.txt").unwrap().doc_id).await.unwrap().text, "Unicode ✓");
+        assert_eq!(db.load_blob(imported.iter().find(|f| f.path == "images/a.png").unwrap().id).await.unwrap().unwrap(), vec![0, 2, 255]);
+    }
+
+    #[test]
+    fn zip_import_rejects_traversal_and_duplicate_names() {
+        fn pack(entries: &[(&str, &[u8])]) -> bytes::Bytes {
+            let mut buf = Vec::new();
+            {
+                let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+                let options = zip::write::SimpleFileOptions::default();
+                for (name, data) in entries {
+                    zip.start_file(*name, options).unwrap();
+                    zip.write_all(data).unwrap();
+                }
+                zip.finish().unwrap();
+            }
+            bytes::Bytes::from(buf)
+        }
+        assert!(unpack_workspace_zip(pack(&[("../private.txt", b"leak")])).is_err());
+        assert!(unpack_workspace_zip(pack(&[("/root.txt", b"leak")])).is_err());
+        assert!(unpack_workspace_zip(pack(&[("safe\\..\\bad.txt", b"leak")])).is_err());
+        // Distinct ZIP entry names can collide after separator normalization.
+        assert!(unpack_workspace_zip(pack(&[("a\\b.txt", b"one"), ("a/b.txt", b"two")])).is_err());
+        assert!(unpack_workspace_zip(pack(&[("./docs/a.txt", b"safe")])).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+    use warp::Filter;
+
+    #[tokio::test]
+    async fn org_admin_moderates_only_own_org_and_owner_can_transfer_across_orgs() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(&format!("sqlite://{}", tmp.path().display())).await.unwrap();
+        db.create_user_if_absent("owner", "Owner", "hash", "root", None).await.unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let first = db.create_org("First", "first", 1).await.unwrap();
+        let second = db.create_org("Second", "second", 1).await.unwrap();
+        db.create_user_if_absent("admin1", "Admin 1", "hash", "admin", Some(first.id)).await.unwrap();
+        db.create_user_if_absent("admin2", "Admin 2", "hash", "admin", Some(second.id)).await.unwrap();
+        let admin1 = db.get_user_by_email("admin1").await.unwrap().unwrap();
+        let group1 = db.create_group(first.id, "First group", owner.id, 1, "group").await.unwrap();
+        let group2 = db.create_group(second.id, "Second group", owner.id, 1, "group").await.unwrap();
+        let ws1 = db.create_workspace(group1.id, "Source", owner.id, 1).await.unwrap();
+        let ws2 = db.create_workspace(group2.id, "Target", owner.id, 1).await.unwrap();
+        let file = db.create_file(ws1.id, "docs/start.txt", "original-doc", "text", None, 1).await.unwrap();
+        db.create_message(group1.id, owner.id, "Keep me", 1).await.unwrap();
+        let msg = db.group_last_msg(group1.id).await.unwrap().unwrap().0;
+        for (email, token) in [("owner", "owner-token"), ("admin1", "first-token"), ("admin2", "second-token")] {
+            let user = db.get_user_by_email(email).await.unwrap().unwrap();
+            db.create_session(token, user.id, now_secs() + 3600).await.unwrap();
+        }
+        let api = routes(db.clone(), Default::default(), Default::default())
+            .recover(crate::auth::handle_rejection);
+        let forbidden = warp::test::request().method("DELETE").path(&format!("/chat/{msg}"))
+            .header("cookie", "authpad_session=second-token").reply(&api).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert!(db.group_last_msg(group1.id).await.unwrap().is_some());
+        let moderated = warp::test::request().method("DELETE").path(&format!("/chat/{msg}"))
+            .header("cookie", "authpad_session=first-token").reply(&api).await;
+        assert_eq!(moderated.status(), StatusCode::OK);
+        assert!(db.group_last_msg(group1.id).await.unwrap().is_none());
+
+        let body = json!({
+            "target_workspace_id": ws2.id, "mode": "move", "on_conflict": "rename",
+            "items": [{"id": file.id, "path": "docs/start.txt"}],
+        });
+        let forbidden = warp::test::request().method("POST").path("/files/transfer")
+            .header("cookie", "authpad_session=first-token").json(&body).reply(&api).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert_eq!(db.get_file(file.id).await.unwrap().unwrap().workspace_id, ws1.id);
+        let moved = warp::test::request().method("POST").path("/files/transfer")
+            .header("cookie", "authpad_session=owner-token").json(&body).reply(&api).await;
+        assert_eq!(moved.status(), StatusCode::OK);
+        assert_eq!(db.get_file(file.id).await.unwrap().unwrap().workspace_id, ws2.id);
+        assert!(ensure_ws(&db, &admin1, ws2.id).await.is_err());
     }
 }
