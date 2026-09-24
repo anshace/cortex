@@ -658,7 +658,7 @@ export async function adminCreateUser(u: {
 }
 export async function adminUpdateUser(
   id: number,
-  patch: { name?: string; role?: string; org_id?: number | null },
+  patch: { email?: string; name?: string; role?: string; org_id?: number | null },
 ): Promise<void> {
   await json(await fetch(`/api/admin/users/${id}`, opts("POST", patch)));
 }

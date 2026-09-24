@@ -37,6 +37,7 @@ import {
 } from "react-icons/vsc";
 import useLocalStorageState from "use-local-storage-state";
 
+import PasswordResetDialog from "./PasswordResetDialog";
 import * as api from "./api";
 import { Me } from "./api";
 import { EditorPrefs, useEditorPrefs } from "./editorPrefs";
@@ -1119,6 +1120,7 @@ function ActivityPanel() {
 function OrgMembersPanel({ me }: { me: Me }) {
   const toast = useToast();
   const [members, setMembers] = useState<api.AdminUser[]>([]);
+  const [resetTarget, setResetTarget] = useState<api.AdminUser | null>(null);
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
@@ -1193,13 +1195,15 @@ function OrgMembersPanel({ me }: { me: Me }) {
                       <option value="user">Member</option><option value="admin">Org admin</option>
                     </Select>
                     <Button size="xs" variant="ghost" isDisabled={busy} onClick={() => {
+                      const value = window.prompt(`Login username for ${member.email}:`, member.email);
+                      if (value !== null) void run(() => api.adminUpdateUser(member.id, { email: value }), "Username updated; member signed out");
+                    }}>Username</Button>
+                    <Button size="xs" variant="ghost" isDisabled={busy} onClick={() => {
                       const value = window.prompt(`Display name for ${member.email}:`, member.name);
                       if (value !== null) void run(() => api.adminUpdateUser(member.id, { name: value }), "Name updated");
-                    }}>Rename</Button>
-                    <Button size="xs" variant="ghost" isDisabled={busy} onClick={() => {
-                      const value = window.prompt(`New password for ${member.email} (at least 8 characters):`);
-                      if (value) void run(() => api.adminResetPassword(member.id, value), "Password reset; member signed out");
-                    }}>Reset password</Button>
+                    }}>Name</Button>
+                    <Button size="xs" variant="ghost" isDisabled={busy}
+                      onClick={() => setResetTarget(member)}>Reset password</Button>
                     <Button size="xs" variant="ghost" isDisabled={busy} onClick={() => {
                       if (window.confirm(`Reset two-factor for ${member.email}? All their sessions will be revoked.`))
                         void run(() => api.adminReset2fa(member.id), "Two-factor reset; member signed out");
@@ -1216,6 +1220,12 @@ function OrgMembersPanel({ me }: { me: Me }) {
           {members.length === 0 && <Text fontSize="sm" color="ink.muted">No members yet.</Text>}
         </VStack>
       </Card>
+      <PasswordResetDialog target={resetTarget} onClose={() => setResetTarget(null)}
+        onReset={async (id, password) => {
+          await api.adminResetPassword(id, password);
+          refresh();
+          toast({ title: "Password reset; member signed out", status: "success" });
+        }} />
     </>
   );
 }

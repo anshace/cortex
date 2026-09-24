@@ -111,6 +111,8 @@ fn default_role() -> String {
 #[derive(Deserialize)]
 struct AdminUserUpdate {
     #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     role: Option<String>,
@@ -420,6 +422,7 @@ async fn admin_reset_2fa(
 ) -> Result<impl Reply, Rejection> {
     let other = checked_target(&db, &user, target).await?;
     let scope = manager_scope(&user)?;
+    let _gate = crate::access_gate().write().await;
     if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
     match db.admin_reset_credentials(target, None, scope).await {
         Ok(true) => {
@@ -488,6 +491,7 @@ async fn admin_reset_password(
         Ok(h) => h,
         Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not hash")),
     };
+    let _gate = crate::access_gate().write().await;
     if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
     match db.admin_reset_credentials(target, Some(&hash), scope).await {
         Ok(true) => {
@@ -511,13 +515,21 @@ async fn admin_update_user(
         return Ok(err(StatusCode::BAD_REQUEST, "invalid role"));
     }
     let name = body.name.as_deref().map(str::trim);
+    let email = body.email.as_deref().map(str::trim).map(str::to_lowercase);
     if name.is_some_and(|n| n.len() > 80) {
         return Ok(err(StatusCode::BAD_REQUEST, "name too long"));
     }
-    if body.role.is_some() || body.org_id.is_some() {
-        if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
+    if email.as_deref().is_some_and(|value| value.is_empty() || value.len() > 120 || value.chars().any(char::is_whitespace)) {
+        return Ok(err(StatusCode::BAD_REQUEST, "username must be 1–120 characters with no spaces"));
     }
-    match db.admin_update_user(target, name, body.role.as_deref(), body.org_id, scope).await {
+    let _gate = if body.role.is_some() || body.org_id.is_some() || email.is_some() {
+        let guard = crate::access_gate().write().await;
+        if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
+        Some(guard)
+    } else {
+        None
+    };
+    match db.admin_update_user(target, email.as_deref(), name, body.role.as_deref(), body.org_id, scope).await {
         Ok(true) => {
             let _ = db.audit(other.org_id, Some(user.id), "admin_update_user", Some(&other.email), now_secs()).await;
             Ok(warp::reply::json(&json!({ "ok": true })).into_response())
@@ -532,6 +544,7 @@ async fn admin_delete(
 ) -> Result<impl Reply, Rejection> {
     let other = checked_target(&db, &user, target).await?;
     let scope = manager_scope(&user)?;
+    let _gate = crate::access_gate().write().await;
     if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
     let ids = match db.admin_delete_user(target, scope).await {
         Ok(ids) => ids,
@@ -595,6 +608,7 @@ async fn org_delete(
     boards: LiveBoards,
 ) -> Result<impl Reply, Rejection> {
     require_root(&user)?;
+    let _gate = crate::access_gate().write().await;
     if let Err(response) = disconnect_org(&db, &live, &boards, Some(target)).await { return Ok(response); }
     match db.delete_org(target).await {
         Ok(ids) => {
