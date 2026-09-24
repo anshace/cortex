@@ -194,6 +194,36 @@ pub struct ChatMessage {
     pub edited_at: Option<i64>,
 }
 
+/// The conversation a pasted chat image belongs to, recorded at upload time so
+/// a read can be scoped to it. Exactly one side may be set; both None means the
+/// uploader pasted it with no target yet, so only they may read it.
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
+pub struct ChatImageScope {
+    /// Group channel the image was pasted into.
+    pub group_id: Option<i64>,
+    /// The other user in the DM the image was pasted into.
+    pub dm_with: Option<i64>,
+}
+
+/// A chat attachment blob with the tenancy and conversation it may be read in.
+#[derive(sqlx::FromRow, Clone, Debug)]
+pub struct ChatImage {
+    /// Owning org.
+    pub org_id: i64,
+    /// Uploader; always allowed to read their own paste. NULL on a row the
+    /// migration could not trace back to a message.
+    pub uploaded_by: Option<i64>,
+    /// Conversation scope — see `ChatImageScope`. A row with no uploader and no
+    /// scope falls back to the org-wide rule that predates them.
+    pub group_id: Option<i64>,
+    /// See `group_id`.
+    pub dm_with: Option<i64>,
+    /// Declared MIME type.
+    pub mime: Option<String>,
+    /// The bytes.
+    pub data: Vec<u8>,
+}
+
 /// One emoji's tally on a message, from the requesting user's point of view.
 #[derive(Serialize, PartialEq, Eq, Clone, Debug)]
 pub struct ReactionView {
@@ -2494,36 +2524,44 @@ impl Database {
         Ok(rows)
     }
 
-    // ----- Chat images (org-scoped blobs, separate from workspace files) -----
+    // ----- Chat images (conversation-scoped blobs, separate from workspace files) -----
 
     /// Store a pasted chat image and return its id.
     pub async fn create_chat_image(
         &self,
         org_id: i64,
+        uploaded_by: i64,
+        scope: ChatImageScope,
         mime: Option<&str>,
         data: &[u8],
         now: i64,
     ) -> Result<i64> {
         let row: (i64,) = sqlx::query_as(
-            r#"INSERT INTO chat_image (org_id, mime, data, created_at) VALUES ($1, $2, $3, $4) RETURNING id"#,
+            r#"INSERT INTO chat_image
+                 (org_id, mime, data, created_at, uploaded_by, group_id, dm_with)
+               VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id"#,
         )
         .bind(org_id)
         .bind(mime)
         .bind(data)
         .bind(now)
+        .bind(uploaded_by)
+        .bind(scope.group_id)
+        .bind(scope.dm_with)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
     }
 
-    /// Load a chat image: (org_id, mime, bytes).
-    pub async fn get_chat_image(&self, id: i64) -> Result<Option<(i64, Option<String>, Vec<u8>)>> {
-        let row: Option<(i64, Option<String>, Vec<u8>)> =
-            sqlx::query_as(r#"SELECT org_id, mime, data FROM chat_image WHERE id = $1"#)
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row)
+    /// Load a chat image with the conversation it may be read in.
+    pub async fn get_chat_image(&self, id: i64) -> Result<Option<ChatImage>> {
+        Ok(sqlx::query_as(
+            r#"SELECT org_id, uploaded_by, group_id, dm_with, mime, data
+               FROM chat_image WHERE id = $1"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     // ----- Full export / import (root owner, whole-instance migration) -----
@@ -2693,7 +2731,7 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::Database;
+    use super::{ChatImageScope, Database};
 
     async fn test_database() -> (tempfile::NamedTempFile, Database) {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -2765,7 +2803,19 @@ mod tests {
         db.create_file(shared_ws.id, "keep.txt", "shared-doc", "text", None, 1).await.unwrap();
         db.create_message(shared.id, alice.id, "hello", 1).await.unwrap();
         db.create_dm(org.id, alice.id, bob.id, "hi", 1).await.unwrap();
-        db.create_chat_image(org.id, Some("image/png"), b"img", 1).await.unwrap();
+        db.create_chat_image(
+            org.id,
+            alice.id,
+            ChatImageScope {
+                group_id: Some(shared.id),
+                ..Default::default()
+            },
+            Some("image/png"),
+            b"img",
+            1,
+        )
+        .await
+        .unwrap();
         let docs = db.admin_delete_user(alice.id, None).await.unwrap();
         assert!(docs.contains(&private_file.doc_id));
         assert!(db.get_group(personal.id).await.unwrap().is_none());

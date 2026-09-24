@@ -624,16 +624,25 @@ export async function getAudit(): Promise<{ entries: AuditEntry[] }> {
   return json(await fetch("/api/audit", { credentials: "include" }));
 }
 
-// Images pasted into chat: stored org-scoped, separate from workspace files.
+// The conversation a pasted image is being uploaded into. The server records it
+// alongside the blob and only serves the image back inside that conversation.
+export type ChatConversation = { groupId?: number; dmWith?: number };
+
+// Images pasted into chat: stored per conversation, separate from workspace files.
 export async function uploadChatImage(
   file: File,
-  orgId?: number,
+  orgId: number | undefined,
+  target: ChatConversation,
 ): Promise<{ id: number; url: string }> {
   const fd = new FormData();
   fd.append("file", file);
-  const q = orgId != null ? `?org=${orgId}` : "";
+  const q = new URLSearchParams();
+  if (orgId != null) q.set("org", `${orgId}`);
+  if (target.groupId != null) q.set("group", `${target.groupId}`);
+  else if (target.dmWith != null) q.set("dm", `${target.dmWith}`);
+  const qs = q.toString();
   return json(
-    await fetch(`/api/chat-image${q}`, {
+    await fetch(`/api/chat-image${qs ? `?${qs}` : ""}`, {
       method: "POST",
       credentials: "include",
       body: fd,

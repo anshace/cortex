@@ -2,7 +2,8 @@
 //!
 //! Access model: a user may act within their assigned org; the root owner may
 //! act within any org (passing `?org=<id>`). Any org member can create and open
-//! every workspace in their org. Chat is org-wide.
+//! every workspace in their org. Chat is scoped to a group or a DM, and so are
+//! the images pasted into it.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -20,7 +21,7 @@ use warp::{http::StatusCode, hyper::Body, reply::Reply, Filter, Rejection};
 
 use crate::auth::{with_auth, Forbidden};
 use crate::crypto;
-use crate::database::{ChatMessage, Database, FileRow, Group, ImportedFile, ReactionView, User, Workspace};
+use crate::database::{ChatImageScope, ChatMessage, Database, FileRow, Group, ImportedFile, ReactionView, User, Workspace};
 use crate::{current_document, evict_all_boards, evict_boards, evict_documents, flush_and_evict, LiveBoards, LiveDocs};
 
 /// Filter extracting the client's ECDH public key header (present when the
@@ -350,6 +351,16 @@ struct DmQuery {
     with: i64,
     #[serde(default)]
     org: Option<i64>,
+}
+
+/// An image paste names the conversation it lands in, so the stored blob can be
+/// read back only there. Exactly one of `group`/`dm` is expected; with neither,
+/// the image is visible to its uploader alone.
+#[derive(Deserialize)]
+struct ChatImageQuery {
+    org: Option<i64>,
+    group: Option<i64>,
+    dm: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -762,7 +773,7 @@ pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl F
         .and(warp::post())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
-        .and(warp::query::<OrgQuery>())
+        .and(warp::query::<ChatImageQuery>())
         .and(warp::multipart::form().max_length(16 * 1024 * 1024))
         .and_then(upload_chat_image);
 
@@ -2595,15 +2606,48 @@ async fn admin_import_all(
 }
 
 /// Store an image pasted into chat; returns its id + URL.
+///
+/// The conversation comes from `?group=`/`?dm=` so the read route can scope the
+/// blob to it — image ids are sequential, and without a recorded conversation
+/// any org member could walk the range and read pictures pasted into other
+/// people's DMs.
 async fn upload_chat_image(
     user: User,
     db: Database,
-    q: OrgQuery,
+    q: ChatImageQuery,
     mut form: FormData,
 ) -> Result<impl Reply, Rejection> {
-    let org = match acting_org(&user, &q) {
-        Some(o) => o,
-        None => return Ok(err(StatusCode::FORBIDDEN, "no org")),
+    // Authorize before draining the body: a paste may carry 16MB, and the
+    // access gate should only be held for the membership lookups.
+    let (org, uploaded_by, scope) = {
+        let _gate = crate::access_gate().read().await;
+        let user = current_actor(&db, &user).await?;
+        let org = match acting_org(&user, &OrgQuery { org: q.org }) {
+            Some(o) => o,
+            None => return Ok(err(StatusCode::FORBIDDEN, "no org")),
+        };
+        let scope = match (q.group, q.dm) {
+            (Some(g), None) => {
+                // Must be a channel the caller may post in at all.
+                ensure_group(&db, &user, g).await?;
+                ChatImageScope {
+                    group_id: Some(g),
+                    ..Default::default()
+                }
+            }
+            (None, Some(peer)) => {
+                dm_ctx(&db, &user, &DmQuery { with: peer, org: q.org }).await?;
+                ChatImageScope {
+                    dm_with: Some(peer),
+                    ..Default::default()
+                }
+            }
+            (Some(_), Some(_)) => {
+                return Ok(err(StatusCode::BAD_REQUEST, "pick one conversation"))
+            }
+            (None, None) => ChatImageScope::default(),
+        };
+        (org, user.id, scope)
     };
     let mut found: Option<(Option<String>, Vec<u8>)> = None;
     loop {
@@ -2628,7 +2672,7 @@ async fn upload_chat_image(
         None => return Ok(err(StatusCode::BAD_REQUEST, "no file field")),
     };
     match db
-        .create_chat_image(org, mime.as_deref(), &bytes, now_secs())
+        .create_chat_image(org, uploaded_by, scope, mime.as_deref(), &bytes, now_secs())
         .await
     {
         Ok(id) => Ok(warp::reply::json(
@@ -2642,21 +2686,47 @@ async fn upload_chat_image(
     }
 }
 
-/// Serve a chat image to members of its org (root may view any).
+/// Serve a chat image to whoever may see the conversation it was pasted into
+/// (root may view any).
 async fn get_chat_image(id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
-    match db.get_chat_image(id).await.ok().flatten() {
-        Some((org, mime, data)) if user.role == "root" || Some(org) == user.org_id => {
-            let mime = mime.unwrap_or_else(|| "application/octet-stream".to_string());
-            let resp = warp::http::Response::builder()
-                .header("content-type", mime)
-                .header("cache-control", "private, max-age=86400")
-                .body(Body::from(data))
-                .expect("valid response");
-            Ok(resp)
-        }
-        Some(_) => Err(warp::reject::custom(Forbidden)),
-        None => Ok(err(StatusCode::NOT_FOUND, "no such image")),
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
+    let img = match db.get_chat_image(id).await.ok().flatten() {
+        Some(img) => img,
+        None => return Ok(err(StatusCode::NOT_FOUND, "no such image")),
+    };
+    if user.role != "root" && Some(img.org_id) != user.org_id {
+        return Err(warp::reject::custom(Forbidden));
     }
+    let visible = if img.uploaded_by.is_none() {
+        // Nothing is known about this upload's conversation, so it keeps the
+        // original org-wide rule; migration 33 backfills the rest.
+        true
+    } else if img.uploaded_by == Some(user.id) {
+        true
+    } else if let Some(g) = img.group_id {
+        // Membership is exactly the rule for posting into that channel, which
+        // also lets an org admin moderate what was pasted there.
+        ensure_group(&db, &user, g).await.is_ok()
+    } else if let Some(peer) = img.dm_with {
+        // A DM: the two participants and nobody else.
+        peer == user.id
+    } else {
+        // Pasted with no conversation set: the uploader's own draft.
+        false
+    };
+    if !visible {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    let mime = img
+        .mime
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let resp = warp::http::Response::builder()
+        .header("content-type", mime)
+        .header("cache-control", "private, max-age=86400")
+        .body(Body::from(img.data))
+        .expect("valid response");
+    Ok(resp)
 }
 
 #[cfg(test)]
@@ -2719,6 +2789,20 @@ mod permission_tests {
     use super::*;
     use warp::Filter;
 
+    /// Fetch a chat image as one session. The router is rebuilt per call:
+    /// building a filter is cheap and it keeps the assertions one line each.
+    async fn read_image(db: &Database, token: &str, id: i64) -> StatusCode {
+        let api = routes(db.clone(), Default::default(), Default::default())
+            .recover(crate::auth::handle_rejection);
+        warp::test::request()
+            .method("GET")
+            .path(&format!("/chat-image/{id}"))
+            .header("cookie", format!("authpad_session={token}"))
+            .reply(&api)
+            .await
+            .status()
+    }
+
     #[tokio::test]
     async fn org_admin_moderates_only_own_org_and_owner_can_transfer_across_orgs() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -2765,5 +2849,58 @@ mod permission_tests {
         assert_eq!(moved.status(), StatusCode::OK);
         assert_eq!(db.get_file(file.id).await.unwrap().unwrap().workspace_id, ws2.id);
         assert!(ensure_ws(&db, &admin1, ws2.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_images_are_readable_only_in_their_conversation() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(&format!("sqlite://{}", tmp.path().display())).await.unwrap();
+        db.create_user_if_absent("owner", "Owner", "hash", "root", None).await.unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let org = db.create_org("First", "first", 1).await.unwrap();
+        db.create_user_if_absent("admin", "Admin", "hash", "admin", Some(org.id)).await.unwrap();
+        let team = db.create_group(org.id, "Team", owner.id, 1, "group").await.unwrap();
+        for (email, name) in [("alice", "Alice"), ("bob", "Bob"), ("carol", "Carol")] {
+            db.create_user_if_absent(email, name, "hash", "user", Some(org.id)).await.unwrap();
+            let user = db.get_user_by_email(email).await.unwrap().unwrap();
+            db.create_session(&format!("{email}-token"), user.id, now_secs() + 3600).await.unwrap();
+            if email == "alice" {
+                db.add_group_member(team.id, user.id, "member").await.unwrap();
+            }
+        }
+        let admin = db.get_user_by_email("admin").await.unwrap().unwrap();
+        db.create_session("admin-token", admin.id, now_secs() + 3600).await.unwrap();
+        let alice = db.get_user_by_email("alice").await.unwrap().unwrap();
+        let bob = db.get_user_by_email("bob").await.unwrap().unwrap();
+        let scoped = |group: Option<i64>, dm: Option<i64>| ChatImageScope {
+            group_id: group,
+            dm_with: dm,
+        };
+        let team_img = db
+            .create_chat_image(org.id, alice.id, scoped(Some(team.id), None), Some("image/png"), b"team", 1)
+            .await
+            .unwrap();
+        let dm_img = db
+            .create_chat_image(org.id, alice.id, scoped(None, Some(bob.id)), Some("image/png"), b"dm", 1)
+            .await
+            .unwrap();
+        let draft_img = db
+            .create_chat_image(org.id, alice.id, scoped(None, None), Some("image/png"), b"draft", 1)
+            .await
+            .unwrap();
+        // The uploader and the channel's people see the group paste; the rest of
+        // the org does not.
+        assert_eq!(read_image(&db, "alice-token", team_img).await, StatusCode::OK);
+        db.add_group_member(team.id, bob.id, "member").await.unwrap();
+        assert_eq!(read_image(&db, "bob-token", team_img).await, StatusCode::OK);
+        assert_eq!(read_image(&db, "admin-token", team_img).await, StatusCode::OK);
+        assert_eq!(read_image(&db, "carol-token", team_img).await, StatusCode::FORBIDDEN);
+        // A DM paste reaches its two participants only.
+        assert_eq!(read_image(&db, "bob-token", dm_img).await, StatusCode::OK);
+        assert_eq!(read_image(&db, "carol-token", dm_img).await, StatusCode::FORBIDDEN);
+        assert_eq!(read_image(&db, "admin-token", dm_img).await, StatusCode::FORBIDDEN);
+        // With no conversation at all only the uploader has it.
+        assert_eq!(read_image(&db, "alice-token", draft_img).await, StatusCode::OK);
+        assert_eq!(read_image(&db, "bob-token", draft_img).await, StatusCode::FORBIDDEN);
     }
 }

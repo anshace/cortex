@@ -827,6 +827,12 @@ function ChatView({
       ? members.find((m) => m.id === target.userId)
       : undefined;
   const canSend = target.kind === "group" ? groupId != null : !!peer;
+  // Attachments are stored against the conversation they are pasted into, and
+  // only read back there.
+  const convo: api.ChatConversation =
+    target.kind === "dm"
+      ? { dmWith: target.userId }
+      : { groupId: groupId ?? undefined };
 
   const load = useCallback(async () => {
     try {
@@ -997,7 +1003,7 @@ function ChatView({
           const named = new File([file], `pasted-${Date.now()}.${ext}`, {
             type: it.type,
           });
-          const { url } = await api.uploadChatImage(named, orgId);
+          const { url } = await api.uploadChatImage(named, orgId, convo);
           setDraft((d) => (d ? `${d}\n` : "") + `![image](${url})`);
         } catch (err) {
           toast({
@@ -1020,7 +1026,7 @@ function ChatView({
       [];
     for (const f of Array.from(files)) {
       try {
-        const { url } = await api.uploadChatImage(f, orgId);
+        const { url } = await api.uploadChatImage(f, orgId, convo);
         added.push(
           f.type.startsWith("image/")
             ? { kind: "image", name: f.name, markdown: `![${f.name}](${url})` }
@@ -1086,7 +1092,7 @@ function ChatView({
           const named = new File([blob], `voice-${Date.now()}.${ext}`, {
             type: blob.type,
           });
-          const { url } = await api.uploadChatImage(named, orgId);
+          const { url } = await api.uploadChatImage(named, orgId, convo);
           // The blob URL is id-based, so carry the audio extension in a query
           // param — the message renderer keys on it to show an inline player.
           setPends((p) => [
