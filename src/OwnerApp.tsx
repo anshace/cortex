@@ -39,6 +39,7 @@ import { FiDownload, FiMoon, FiSun, FiUpload } from "react-icons/fi";
 import {
   VscChromeClose,
   VscDatabase,
+  VscEdit,
   VscKey,
   VscSettingsGear,
   VscShield,
@@ -46,6 +47,7 @@ import {
   VscTrash,
 } from "react-icons/vsc";
 
+import PasswordResetDialog from "./PasswordResetDialog";
 import Settings from "./Settings";
 import WorkspaceApp from "./WorkspaceApp";
 import * as api from "./api";
@@ -67,6 +69,7 @@ function OwnerApp({
   const { colorMode, toggleColorMode } = useColorMode();
   const [orgs, setOrgs] = useState<AdminOrg[]>([]);
   const [users, setUsers] = useState<AdminUser[]>([]);
+  const [resetTarget, setResetTarget] = useState<AdminUser | null>(null);
   const [browse, setBrowse] = useState<number | null>(null);
   const importInput = useRef<HTMLInputElement>(null);
 
@@ -560,6 +563,24 @@ function OwnerApp({
                         </Td>
                         <Td borderColor={border} textAlign="right">
                           <HStack spacing={0.5} justify="flex-end">
+                            <Tooltip label="Edit username and name">
+                              <IconButton
+                                aria-label="Edit username and name"
+                                icon={<VscEdit />}
+                                size="xs"
+                                variant="ghost"
+                                color="ink.muted"
+                                onClick={() => {
+                                  const username = window.prompt(`Login username for ${u.email}:`, u.email);
+                                  if (username === null) return;
+                                  const name = window.prompt(`Display name for ${username}:`, u.name);
+                                  if (name !== null) run(
+                                    () => api.adminUpdateUser(u.id, { email: username, name }),
+                                    "Account updated; user signed out",
+                                  );
+                                }}
+                              />
+                            </Tooltip>
                             <Tooltip label="Reset password">
                               <IconButton
                                 aria-label="Reset password"
@@ -567,16 +588,7 @@ function OwnerApp({
                                 size="xs"
                                 variant="ghost"
                                 color="ink.muted"
-                                onClick={() => {
-                                  const pw = prompt(
-                                    `New password for ${u.email} (min 8):`,
-                                  );
-                                  if (pw)
-                                    run(
-                                      () => api.adminResetPassword(u.id, pw),
-                                      "Password reset",
-                                    );
-                                }}
+                                onClick={() => setResetTarget(u)}
                               />
                             </Tooltip>
                             <Tooltip label="Reset two-factor (lost device)">
@@ -701,6 +713,15 @@ function OwnerApp({
           </Tabs>
         </Box>
       </Box>
+      <PasswordResetDialog
+        target={resetTarget}
+        onClose={() => setResetTarget(null)}
+        onReset={async (id, pw) => {
+          await api.adminResetPassword(id, pw);
+          load();
+          toast({ title: "Password reset; user signed out", status: "success" });
+        }}
+      />
     </Flex>
   );
 }

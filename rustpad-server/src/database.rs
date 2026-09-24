@@ -428,8 +428,13 @@ impl Database {
         // Migrate through the same pool that will serve requests. Opening a
         // second WAL-enabled connection while the migrator's worker is still
         // closing can yield SQLITE_BUSY on fresh databases (notably in tests).
+        // SQLx 0.6 starts transactions DEFERRED. With multiple pooled
+        // connections, a read-then-write (rename/delete/import) can fail
+        // immediately with SQLITE_BUSY_SNAPSHOT despite busy_timeout. One
+        // writer/reader connection serializes in-process operations; WAL
+        // still lets external backup readers coexist with the application.
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(1)
             .connect_with(options)
             .await?;
         sqlx::migrate!().run(&pool).await?;
@@ -700,6 +705,7 @@ impl Database {
     pub async fn admin_update_user(
         &self,
         id: i64,
+        email: Option<&str>,
         name: Option<&str>,
         role: Option<&str>,
         new_org: Option<Option<i64>>,
@@ -707,10 +713,11 @@ impl Database {
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         let r = sqlx::query(
-            "UPDATE users SET name = COALESCE($1, name), role = COALESCE($2, role), \
-             org_id = CASE WHEN $3 THEN $4 ELSE org_id END \
-             WHERE id = $5 AND role != 'root' AND ($6 IS NULL OR org_id = $6)",
+            "UPDATE users SET email = COALESCE($1, email), name = COALESCE($2, name), role = COALESCE($3, role), \
+             org_id = CASE WHEN $4 THEN $5 ELSE org_id END \
+             WHERE id = $6 AND role != 'root' AND ($7 IS NULL OR org_id = $7)",
         )
+        .bind(email)
         .bind(name)
         .bind(role)
         .bind(new_org.is_some())
@@ -721,7 +728,7 @@ impl Database {
         .await?;
         if r.rows_affected() == 0 { return Ok(false); }
         // Reauth after permission changes (name-only edits keep sessions).
-        if role.is_some() || new_org.is_some() {
+        if email.is_some() || role.is_some() || new_org.is_some() {
             sqlx::query("DELETE FROM session WHERE user_id = $1")
                 .bind(id).execute(&mut tx).await?;
         }
@@ -2501,32 +2508,40 @@ impl Database {
         "dm",
         "reaction",
         "chat_image",
+        "audit",
     ];
 
-    /// Dump every row of a table as JSON objects; BLOB columns become base64
-    /// strings, everything else maps straight onto JSON types.
-    pub async fn export_table(&self, table: &str) -> Result<Vec<serde_json::Value>> {
+    /// Read a consistent whole-instance snapshot in one SQLite read
+    /// transaction. Exporting tables one-by-one without a snapshot can produce
+    /// dangling file/blob/user references during concurrent edits and deletes.
+    /// The session table is deliberately excluded (auth tokens never travel).
+    pub async fn export_snapshot(&self) -> Result<serde_json::Map<String, serde_json::Value>> {
         use sqlx::Row;
-        let rows = sqlx::query(&format!("SELECT * FROM {}", table))
-            .fetch_all(&self.pool)
-            .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut obj = serde_json::Map::new();
-            for (i, col) in row.columns().iter().enumerate() {
-                let name = col.name();
-                if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
-                    obj.insert(name.into(), serde_json::to_value(v)?);
-                } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
-                    obj.insert(name.into(), serde_json::to_value(v)?);
-                } else if let Ok(v) = row.try_get::<Option<String>, _>(i) {
-                    obj.insert(name.into(), serde_json::to_value(v)?);
-                } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
-                    obj.insert(name.into(), serde_json::to_value(v.map(|b| B64.encode(b)))?);
+        let mut tx = self.pool.begin().await?;
+        let mut out = serde_json::Map::new();
+        for table in Self::MIGRATE_TABLES {
+            let rows = sqlx::query(&format!("SELECT * FROM {table}"))
+                .fetch_all(&mut tx).await?;
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut obj = serde_json::Map::new();
+                for (i, col) in row.columns().iter().enumerate() {
+                    let name = col.name();
+                    if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
+                        obj.insert(name.into(), serde_json::to_value(v)?);
+                    } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
+                        obj.insert(name.into(), serde_json::to_value(v)?);
+                    } else if let Ok(v) = row.try_get::<Option<String>, _>(i) {
+                        obj.insert(name.into(), serde_json::to_value(v)?);
+                    } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
+                        obj.insert(name.into(), serde_json::to_value(v.map(|b| B64.encode(b)))?);
+                    }
                 }
+                values.push(serde_json::Value::Object(obj));
             }
-            out.push(serde_json::Value::Object(obj));
+            out.insert((*table).to_string(), serde_json::Value::Array(values));
         }
+        tx.rollback().await?;
         Ok(out)
     }
 
@@ -2551,7 +2566,6 @@ impl Database {
         // deleting users; leaving this until afterward made every import fail
         // under SQLx's default foreign-key enforcement.
         sqlx::query("DELETE FROM session").execute(&mut tx).await?;
-        sqlx::query("DELETE FROM audit").execute(&mut tx).await?;
         for table in Self::MIGRATE_TABLES.iter().rev() {
             sqlx::query(&format!("DELETE FROM {}", table))
                 .execute(&mut tx)
@@ -2797,18 +2811,18 @@ mod tests {
         let alice = db.get_user_by_email("alice").await.unwrap().unwrap();
         let bob = db.get_user_by_email("bob").await.unwrap().unwrap();
         assert_eq!(db.admin_list_users_in_org(first.id).await.unwrap().iter().map(|u| u.email.as_str()).collect::<Vec<_>>(), vec!["alice"]);
-        assert!(!db.admin_update_user(bob.id, None, Some("admin"), None, Some(first.id)).await.unwrap());
+        assert!(!db.admin_update_user(bob.id, None, None, Some("admin"), None, Some(first.id)).await.unwrap());
         assert!(!db.admin_reset_credentials(bob.id, Some("newhash"), Some(first.id)).await.unwrap());
         assert!(db.admin_delete_user(bob.id, Some(first.id)).await.is_err());
         assert_eq!(db.admin_target(bob.id).await.unwrap().unwrap().role, "user");
         db.create_session("old-session", alice.id, 999).await.unwrap();
-        assert!(db.admin_update_user(alice.id, None, Some("admin"), None, Some(first.id)).await.unwrap());
+        assert!(db.admin_update_user(alice.id, None, None, Some("admin"), None, Some(first.id)).await.unwrap());
         assert_eq!(db.admin_target(alice.id).await.unwrap().unwrap().role, "admin");
         assert!(db.get_session_user("old-session", 1).await.unwrap().is_none());
         db.create_session("another-session", alice.id, 999).await.unwrap();
         assert!(db.admin_reset_credentials(alice.id, None, Some(first.id)).await.unwrap());
         assert!(db.get_session_user("another-session", 1).await.unwrap().is_none());
-        assert!(db.admin_update_user(alice.id, None, None, Some(Some(second.id)), None).await.unwrap());
+        assert!(db.admin_update_user(alice.id, None, None, None, Some(Some(second.id)), None).await.unwrap());
         assert_eq!(db.admin_target(alice.id).await.unwrap().unwrap().org_id, Some(second.id));
         assert_no_bad_foreign_keys(&db).await;
     }

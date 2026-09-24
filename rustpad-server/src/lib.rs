@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use dashmap::DashMap;
@@ -33,6 +33,20 @@ pub(crate) struct Document {
     last_accessed: Instant,
     rustpad: Arc<Rustpad>,
     persister: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Block new WebSocket handshakes while changing permissions or deleting
+/// content. Existing editors are closed under the write lock, so none can
+/// reconnect using the old scope before the DB mutation commits.
+pub(crate) fn access_gate() -> &'static tokio::sync::RwLock<()> {
+    static GATE: OnceLock<tokio::sync::RwLock<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::RwLock::new(()))
+}
+
+fn editor_gate() -> impl Filter<Extract = (tokio::sync::RwLockReadGuard<'static, ()>,), Error = Rejection> + Clone {
+    warp::any().and_then(|| async {
+        Ok::<_, Rejection>(access_gate().read().await)
+    })
 }
 
 /// Shared live editor registry. Dropping a cached document closes its sockets.
@@ -264,12 +278,14 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
     let db_filter = warp::any().map(move || db_for_docs.clone());
 
     let socket = warp::path!("socket" / String)
+        .and(editor_gate())
         .and(auth::with_auth(db.clone()))
         .and(warp::ws())
         .and(db_filter.clone())
         .and(state_filter.clone())
         .and_then(
-            |id: String, user: database::User, ws: Ws, db: Database, state: ServerState| async move {
+            |id: String, gate: tokio::sync::RwLockReadGuard<'static, ()>, user: database::User, ws: Ws, db: Database, state: ServerState| async move {
+                let _gate = gate;
                 // The document must belong to a workspace in the user's org
                 // (root may access any) — otherwise no access.
                 if !doc_allowed(&db, &user, &id).await {
@@ -280,16 +296,19 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         );
 
     let board_socket = warp::path!("board-socket" / i64)
+        .and(editor_gate())
         .and(auth::with_auth(db.clone()))
         .and(warp::ws())
         .and(db_filter.clone())
         .and(state_filter.clone())
         .and_then(
             |file_id: i64,
+             gate: tokio::sync::RwLockReadGuard<'static, ()>,
              user: database::User,
              ws: Ws,
              db: Database,
              state: ServerState| async move {
+                let _gate = gate;
                 if !file_allowed(&db, &user, file_id).await {
                     return Err(warp::reject::custom(auth::Forbidden));
                 }

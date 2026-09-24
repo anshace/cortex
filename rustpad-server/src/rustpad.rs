@@ -200,19 +200,23 @@ impl Rustpad {
     }
 
     async fn handle_connection(&self, id: u64, mut socket: WebSocket) -> Result<()> {
+        if self.killed() { return Ok(()); }
         // Handshake: the first text frame carries the client's ECDH public key.
         let epk = loop {
-            match socket.next().await {
-                Some(Ok(msg)) if msg.is_text() => {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), socket.next()).await {
+                Ok(Some(Ok(msg))) if msg.is_text() => {
                     match serde_json::from_str::<EpkFrame>(msg.to_str().unwrap_or("")) {
                         Ok(f) => break f.epk,
                         Err(_) => return Ok(()), // not a handshake frame
                     }
                 }
-                Some(Ok(_)) => continue, // ping / binary before handshake
+                Ok(Some(Ok(_))) => continue, // ping / binary before handshake
                 _ => return Ok(()),
             }
         };
+        // A delete or access change may have killed the cached editor while
+        // the WebSocket was still waiting for its first frame.
+        if self.killed() { return Ok(()); }
         // Fail fast if we can't derive a shared key from this public key.
         if crypto::keys().seal(&epk, b"ping").is_none() {
             return Ok(());

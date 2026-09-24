@@ -740,6 +740,7 @@ pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl F
     let admin_import_all_r = warp::path!("admin" / "import-all")
         .and(warp::post())
         .and(with_auth(db.clone()))
+        .and(warp::body::content_length_limit(256 * 1024 * 1024))
         .and(warp::body::bytes())
         .and(with_db(db.clone()))
         .and(with_docs(live.clone()))
@@ -963,6 +964,7 @@ async fn delete_group(
     if !group_owner(&db, &user, g.id).await {
         return Ok(err(StatusCode::FORBIDDEN, "only the group owner can delete"));
     }
+    let _gate = crate::access_gate().write().await;
     if let Err(response) = disconnect_group(&db, &live, &boards, g.id).await {
         return Ok(response);
     }
@@ -1047,6 +1049,7 @@ async fn remove_member(
     if user_id == g.created_by {
         return Ok(err(StatusCode::CONFLICT, "transfer ownership before removing the owner"));
     }
+    let _gate = crate::access_gate().write().await;
     if let Err(response) = disconnect_group(&db, &live, &boards, g.id).await {
         return Ok(response);
     }
@@ -1093,6 +1096,7 @@ async fn delete_workspace(
     if !workspace_manager(&db, &user, &ws).await {
         return Ok(err(StatusCode::FORBIDDEN, "only a workspace manager can delete"));
     }
+    let _gate = crate::access_gate().write().await;
     let files = match db.workspace_file_ids(ws.id).await {
         Ok(ids) => ids,
         Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not list files")),
@@ -1128,6 +1132,7 @@ async fn reparent_workspace(
     if ws.group_id == target.id {
         return Ok(warp::reply::json(&json!({ "workspace": ws })).into_response());
     }
+    let _gate = crate::access_gate().write().await;
     let ids = match db.workspace_doc_ids(ws.id).await {
         Ok(ids) => ids,
         Err(e) => {
@@ -1174,6 +1179,7 @@ async fn merge_workspace(
     if !workspace_manager(&db, &user, &source).await {
         return Ok(err(StatusCode::FORBIDDEN, "only a workspace manager can merge it"));
     }
+    let _gate = crate::access_gate().write().await;
     let ids = match db.workspace_doc_ids(ws_id).await {
         Ok(ids) => ids,
         Err(e) => {
@@ -1262,6 +1268,7 @@ async fn transfer_files(
         }
         items.push((item.id, path));
     }
+    let _gate = crate::access_gate().write().await;
     if let Err(e) = flush_and_evict(&live, &db, &to_revoke).await {
         warn!("transfer flush: {e}");
         return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not save live edits"));
@@ -1296,6 +1303,7 @@ async fn delete_file_batch(
             return Err(warp::reject::custom(Forbidden));
         }
     }
+    let _gate = crate::access_gate().write().await;
     match db.delete_files(&body.ids).await {
         Ok(ids) => {
             evict_documents(&live, &ids);
@@ -1821,6 +1829,7 @@ async fn delete_file(file_id: i64, user: User, db: Database, live: LiveDocs, boa
         return Err(warp::reject::custom(Forbidden));
     }
     let path = db.get_file(file_id).await.ok().flatten().map(|f| f.path);
+    let _gate = crate::access_gate().write().await;
     match db.delete_file(file_id).await {
         Ok(doc_id) => {
             evict_documents(&live, &[doc_id]);
@@ -2397,17 +2406,13 @@ async fn admin_export_all(user: User, db: Database) -> Result<impl Reply, Reject
     if user.role != "root" {
         return Err(warp::reject::custom(Forbidden));
     }
-    let mut tables_obj = serde_json::Map::new();
-    for table in Database::MIGRATE_TABLES {
-        match db.export_table(table).await {
-            Ok(rows) => {
-                tables_obj.insert((*table).to_string(), serde_json::Value::Array(rows));
-            }
-            Err(_) => {
-                return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "export failed"));
-            }
+    let tables_obj = match db.export_snapshot().await {
+        Ok(tables) => tables,
+        Err(e) => {
+            warn!("admin_export_all snapshot: {e}");
+            return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "export failed"));
         }
-    }
+    };
     let manifest = json!({
         "cortex_export": 1,
         "exported_at": now_secs(),
@@ -2474,7 +2479,7 @@ async fn admin_import_all(
     let manifest: serde_json::Value = match archive
         .by_name("manifest.json")
         .ok()
-        .map(|f| serde_json::from_reader(f))
+        .map(|f| serde_json::from_reader(std::io::Read::take(f, 512 * 1024 * 1024)))
     {
         Some(Ok(m)) => m,
         _ => {
@@ -2497,6 +2502,7 @@ async fn admin_import_all(
     // Stop editors and persisters BEFORE replacing row ids. Otherwise a
     // pending save from the old dataset can overwrite a newly imported doc
     // with the same id after the import transaction commits.
+    let _gate = crate::access_gate().write().await;
     let live_ids: Vec<String> = live.iter().map(|item| item.key().clone()).collect();
     if let Err(e) = flush_and_evict(&live, &db, &live_ids).await {
         warn!("admin_import_all flush: {e}");
