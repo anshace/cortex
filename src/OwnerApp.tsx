@@ -544,15 +544,13 @@ function OwnerApp({
                               run(
                                 () =>
                                   api.adminUpdateUser(u.id, {
-                                    org_id: Number(e.target.value),
+                                    org_id: e.target.value ? Number(e.target.value) : null,
                                   }),
                                 "Org updated",
                               )
                             }
                           >
-                            <option value="" disabled>
-                              {u.org_name ?? "— none —"}
-                            </option>
+                            <option value="">No org</option>
                             {orgs.map((o) => (
                               <option key={o.id} value={o.id}>
                                 {o.name}

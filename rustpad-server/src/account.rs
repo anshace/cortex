@@ -11,7 +11,7 @@ use crate::auth::{
     hash_password, provision_totp, verify_password, verify_totp, with_auth, Forbidden,
 };
 use crate::database::{Database, User};
-use crate::{evict_documents, LiveDocs};
+use crate::{evict_documents, evict_org_boards, flush_and_evict, LiveBoards, LiveDocs};
 
 fn with_db(db: Database) -> impl Filter<Extract = (Database,), Error = Infallible> + Clone {
     warp::any().map(move || db.clone())
@@ -19,6 +19,9 @@ fn with_db(db: Database) -> impl Filter<Extract = (Database,), Error = Infallibl
 
 fn with_docs(live: LiveDocs) -> impl Filter<Extract = (LiveDocs,), Error = Infallible> + Clone {
     warp::any().map(move || live.clone())
+}
+fn with_boards(boards: LiveBoards) -> impl Filter<Extract = (LiveBoards,), Error = Infallible> + Clone {
+    warp::any().map(move || boards.clone())
 }
 
 fn err(status: StatusCode, msg: &str) -> warp::reply::Response {
@@ -31,6 +34,51 @@ fn require_root(user: &User) -> Result<(), Rejection> {
     } else {
         Err(warp::reject::custom(Forbidden))
     }
+}
+
+/// None = owner may manage all orgs; Some = org-admin restricted to that org.
+fn manager_scope(user: &User) -> Result<Option<i64>, Rejection> {
+    match user.role.as_str() {
+        "root" => Ok(None),
+        "admin" => user.org_id.map(Some).ok_or_else(|| warp::reject::custom(Forbidden)),
+        _ => Err(warp::reject::custom(Forbidden)),
+    }
+}
+
+/// Read authorization first for a clear error; scoped DB writes check again
+/// inside their transaction so reassignment cannot race this check.
+async fn checked_target(db: &Database, actor: &User, target: i64) -> Result<User, Rejection> {
+    let scope = manager_scope(actor)?;
+    if scope.is_some() && target == actor.id {
+        // Profile manages self-service; an admin must not reset their own 2FA.
+        return Err(warp::reject::custom(Forbidden));
+    }
+    let target = db.admin_target(target).await.ok().flatten()
+        .ok_or_else(|| warp::reject::custom(Forbidden))?;
+    if target.role == "root" || (scope.is_some() && target.org_id != scope) {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    Ok(target)
+}
+
+async fn disconnect_org(
+    db: &Database, live: &LiveDocs, boards: &LiveBoards, org_id: Option<i64>,
+) -> Result<(), warp::reply::Response> {
+    if let Some(id) = org_id {
+        let ids = db.org_doc_ids(id).await.map_err(|e| {
+            log::warn!("could not list org docs before access change: {e}");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "could not save live edits")
+        })?;
+        flush_and_evict(live, db, &ids).await.map_err(|e| {
+            log::warn!("could not flush org docs before access change: {e}");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "could not save live edits")
+        })?;
+        evict_org_boards(boards, db, id).await.map_err(|e| {
+            log::warn!("could not close org boards before access change: {e}");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "could not disconnect board editors")
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -66,8 +114,9 @@ struct AdminUserUpdate {
     name: Option<String>,
     #[serde(default)]
     role: Option<String>,
+    // Some(None) explicitly unassigns a user (owner only).
     #[serde(default)]
-    org_id: Option<i64>,
+    org_id: Option<Option<i64>>,
 }
 
 #[derive(Deserialize)]
@@ -96,7 +145,7 @@ struct RenameReq {
     name: String,
 }
 
-pub fn routes(db: Database, live: LiveDocs) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
     let update_name = warp::path!("profile")
         .and(warp::post())
         .and(with_auth(db.clone()))
@@ -142,6 +191,8 @@ pub fn routes(db: Database, live: LiveDocs) -> impl Filter<Extract = (impl Reply
         .and(warp::post())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
         .and_then(admin_reset_2fa);
 
     let admin_list = warp::path!("admin" / "users")
@@ -161,6 +212,8 @@ pub fn routes(db: Database, live: LiveDocs) -> impl Filter<Extract = (impl Reply
         .and(warp::post())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
         .and(warp::body::json())
         .and_then(admin_reset_password);
 
@@ -168,6 +221,8 @@ pub fn routes(db: Database, live: LiveDocs) -> impl Filter<Extract = (impl Reply
         .and(warp::post())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
         .and(warp::body::json())
         .and_then(admin_update_user);
 
@@ -176,6 +231,7 @@ pub fn routes(db: Database, live: LiveDocs) -> impl Filter<Extract = (impl Reply
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
         .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
         .and_then(admin_delete);
 
     let org_list = warp::path!("admin" / "orgs")
@@ -203,6 +259,7 @@ pub fn routes(db: Database, live: LiveDocs) -> impl Filter<Extract = (impl Reply
         .and(with_auth(db.clone()))
         .and(with_db(db))
         .and(with_docs(live.clone()))
+        .and(with_boards(boards.clone()))
         .and_then(org_delete);
 
     update_name
@@ -355,145 +412,128 @@ async fn disable_2fa(user: User, db: Database, body: DisableReq) -> Result<impl 
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
-/// Owner recovery: clear a user's 2FA if they lose their authenticator.
-async fn admin_reset_2fa(target: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
-    require_root(&user)?;
-    if db.clear_totp(target).await.is_err() {
-        return Ok(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not reset two-factor",
-        ));
+/// Owner/org-admin recovery: clear another member's 2FA after a lost device.
+/// All existing sessions are revoked; org admins cannot target other orgs,
+/// owner accounts, or themselves.
+async fn admin_reset_2fa(
+    target: i64, user: User, db: Database, live: LiveDocs, boards: LiveBoards,
+) -> Result<impl Reply, Rejection> {
+    let other = checked_target(&db, &user, target).await?;
+    let scope = manager_scope(&user)?;
+    if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
+    match db.admin_reset_credentials(target, None, scope).await {
+        Ok(true) => {
+            let _ = db.audit(other.org_id, Some(user.id), "admin_reset_2fa", Some(&other.email), now_secs()).await;
+            Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+        }
+        Ok(false) => Ok(err(StatusCode::FORBIDDEN, "account no longer in your org")),
+        Err(e) => { log::warn!("admin_reset_2fa: {e}"); Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not reset two-factor")) },
     }
-    let d = target.to_string();
-    let _ = db
-        .audit(
-            user.org_id,
-            Some(user.id),
-            "admin_reset_2fa",
-            Some(&d),
-            now_secs(),
-        )
-        .await;
-    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
 async fn admin_list(user: User, db: Database) -> Result<impl Reply, Rejection> {
-    require_root(&user)?;
-    let users = db.admin_list_users().await.unwrap_or_default();
-    Ok(warp::reply::json(&json!({ "users": users })))
+    let scope = manager_scope(&user)?;
+    let result = match scope {
+        Some(org_id) => db.admin_list_users_in_org(org_id).await,
+        None => db.admin_list_users().await,
+    };
+    match result {
+        Ok(users) => Ok(warp::reply::json(&json!({ "users": users })).into_response()),
+        Err(e) => { log::warn!("admin_list_users: {e}"); Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not list users")) },
+    }
 }
 
 async fn admin_create(user: User, db: Database, body: NewUserReq) -> Result<impl Reply, Rejection> {
-    require_root(&user)?;
+    let scope = manager_scope(&user)?;
+    if let Some(org_id) = scope {
+        if body.org_id.is_some_and(|id| id != org_id) {
+            return Ok(err(StatusCode::FORBIDDEN, "cannot create users in another org"));
+        }
+    }
+    let org_id = scope.or(body.org_id);
     let email = body.email.trim().to_lowercase();
-    let email = email.as_str();
-    let role = if body.role == "admin" {
-        "admin"
-    } else {
-        "user"
+    let role = match body.role.as_str() {
+        "user" | "admin" => body.role.as_str(),
+        _ => return Ok(err(StatusCode::BAD_REQUEST, "invalid role")),
     };
-    if email.is_empty() || body.password.len() < 8 {
-        return Ok(err(
-            StatusCode::BAD_REQUEST,
-            "email required and password must be at least 8 characters",
-        ));
+    let name = body.name.trim();
+    if email.is_empty() || email.len() > 120 || email.chars().any(char::is_whitespace)
+        || name.len() > 80 || body.password.len() < 8
+    {
+        return Ok(err(StatusCode::BAD_REQUEST, "username (max 120, no spaces), name (max 80) and password (min 8) are required"));
     }
     let hash = match hash_password(&body.password) {
         Ok(h) => h,
         Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not hash")),
     };
-    match db
-        .create_user_if_absent(email, body.name.trim(), &hash, role, body.org_id)
-        .await
-    {
+    match db.create_user_if_absent(&email, name, &hash, role, org_id).await {
         Ok(true) => {
-            let _ = db
-                .audit(
-                    user.org_id,
-                    Some(user.id),
-                    "admin_create_user",
-                    Some(email),
-                    now_secs(),
-                )
-                .await;
+            let _ = db.audit(org_id, Some(user.id), "admin_create_user", Some(&email), now_secs()).await;
             Ok(warp::reply::json(&json!({ "ok": true })).into_response())
         }
-        Ok(false) => Ok(err(
-            StatusCode::CONFLICT,
-            "a user with that email already exists",
-        )),
-        Err(_) => Ok(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not create user",
-        )),
+        Ok(false) => Ok(err(StatusCode::CONFLICT, "a user with that username already exists")),
+        Err(e) => { log::warn!("admin_create_user: {e}"); Ok(err(StatusCode::CONFLICT, "could not create user; check the org")) },
     }
 }
 
 async fn admin_reset_password(
-    target: i64,
-    user: User,
-    db: Database,
-    body: AdminPasswordReq,
+    target: i64, user: User, db: Database, live: LiveDocs, boards: LiveBoards, body: AdminPasswordReq,
 ) -> Result<impl Reply, Rejection> {
-    require_root(&user)?;
+    let other = checked_target(&db, &user, target).await?;
+    let scope = manager_scope(&user)?;
     if body.password.len() < 8 {
-        return Ok(err(
-            StatusCode::BAD_REQUEST,
-            "password must be at least 8 characters",
-        ));
+        return Ok(err(StatusCode::BAD_REQUEST, "password must be at least 8 characters"));
     }
     let hash = match hash_password(&body.password) {
         Ok(h) => h,
         Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not hash")),
     };
-    if db.update_password(target, &hash).await.is_err() {
-        return Ok(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not reset password",
-        ));
+    if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
+    match db.admin_reset_credentials(target, Some(&hash), scope).await {
+        Ok(true) => {
+            let _ = db.audit(other.org_id, Some(user.id), "admin_reset_password", Some(&other.email), now_secs()).await;
+            Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+        }
+        Ok(false) => Ok(err(StatusCode::FORBIDDEN, "account no longer in your org")),
+        Err(e) => { log::warn!("admin_reset_password: {e}"); Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not reset password")) },
     }
-    let d = target.to_string();
-    let _ = db
-        .audit(
-            user.org_id,
-            Some(user.id),
-            "admin_reset_password",
-            Some(&d),
-            now_secs(),
-        )
-        .await;
-    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
 async fn admin_update_user(
-    target: i64,
-    user: User,
-    db: Database,
-    body: AdminUserUpdate,
+    target: i64, user: User, db: Database, live: LiveDocs, boards: LiveBoards, body: AdminUserUpdate,
 ) -> Result<impl Reply, Rejection> {
-    require_root(&user)?;
-    if let Some(name) = body.name {
-        let _ = db.update_name(target, name.trim()).await;
+    let other = checked_target(&db, &user, target).await?;
+    let scope = manager_scope(&user)?;
+    if scope.is_some() && body.org_id.is_some() {
+        return Ok(err(StatusCode::FORBIDDEN, "only the owner can assign orgs"));
     }
-    if let Some(role) = body.role {
-        if role == "admin" || role == "user" {
-            let _ = db.admin_set_role(target, &role).await;
+    if body.role.as_deref().is_some_and(|role| role != "admin" && role != "user") {
+        return Ok(err(StatusCode::BAD_REQUEST, "invalid role"));
+    }
+    let name = body.name.as_deref().map(str::trim);
+    if name.is_some_and(|n| n.len() > 80) {
+        return Ok(err(StatusCode::BAD_REQUEST, "name too long"));
+    }
+    if body.role.is_some() || body.org_id.is_some() {
+        if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
+    }
+    match db.admin_update_user(target, name, body.role.as_deref(), body.org_id, scope).await {
+        Ok(true) => {
+            let _ = db.audit(other.org_id, Some(user.id), "admin_update_user", Some(&other.email), now_secs()).await;
+            Ok(warp::reply::json(&json!({ "ok": true })).into_response())
         }
+        Ok(false) => Ok(err(StatusCode::FORBIDDEN, "account no longer in your org")),
+        Err(e) => { log::warn!("admin_update_user: {e}"); Ok(err(StatusCode::CONFLICT, "could not update account")) },
     }
-    if let Some(org_id) = body.org_id {
-        let _ = db.admin_set_org(target, Some(org_id)).await;
-    }
-    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
 async fn admin_delete(
-    target: i64,
-    user: User,
-    db: Database,
-    live: LiveDocs,
+    target: i64, user: User, db: Database, live: LiveDocs, boards: LiveBoards,
 ) -> Result<impl Reply, Rejection> {
-    require_root(&user)?;
-    let ids = match db.admin_delete_user(target).await {
+    let other = checked_target(&db, &user, target).await?;
+    let scope = manager_scope(&user)?;
+    if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
+    let ids = match db.admin_delete_user(target, scope).await {
         Ok(ids) => ids,
         Err(e) => {
             log::warn!("admin_delete_user {target}: {e}");
@@ -501,8 +541,7 @@ async fn admin_delete(
         }
     };
     evict_documents(&live, &ids);
-    let d = target.to_string();
-    let _ = db.audit(user.org_id, Some(user.id), "admin_delete_user", Some(&d), now_secs()).await;
+    let _ = db.audit(other.org_id, Some(user.id), "admin_delete_user", Some(&other.email), now_secs()).await;
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
 }
 
@@ -553,8 +592,10 @@ async fn org_delete(
     user: User,
     db: Database,
     live: LiveDocs,
+    boards: LiveBoards,
 ) -> Result<impl Reply, Rejection> {
     require_root(&user)?;
+    if let Err(response) = disconnect_org(&db, &live, &boards, Some(target)).await { return Ok(response); }
     match db.delete_org(target).await {
         Ok(ids) => {
             evict_documents(&live, &ids);
