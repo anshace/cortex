@@ -808,10 +808,12 @@ const FileTree = memo(
               onContextMenu={rootMenu}
             >
               <Icon
-                as={rootOpen ? VscChevronDown : VscChevronRight}
+                as={VscChevronRight}
                 boxSize={`${CHEV}px`}
                 color="ink.subtle"
                 flexShrink={0}
+                transform={rootOpen ? "rotate(90deg)" : "rotate(0deg)"}
+                transition="transform 0.18s var(--cx-ease-spring)"
               />
               <Text
                 fontWeight={700}
@@ -955,7 +957,10 @@ function TreeItem(
     const f = node.file;
     const fi = fileIcon(f.path);
     const isSelected = selected.has(f.id);
-    const active = f.id === activeFileId || isSelected;
+    // The file you are typing in and the files you ticked read differently:
+    // one is a location (accent bar), the other is a set (flat wash).
+    const isOpen = f.id === activeFileId;
+    const active = isOpen || isSelected;
     if (isRenaming) {
       return (
         <RowShell depth={depth}>
@@ -993,11 +998,31 @@ function TreeItem(
           borderRadius="sm"
           cursor="pointer"
           spacing={0}
-          bg={active ? "accent.tint" : "transparent"}
+          position="relative"
+          bg={isOpen ? "surface.active" : isSelected ? "accent.tint" : "transparent"}
           color={active ? "ink.base" : "ink.muted"}
-          _hover={{ bg: active ? "accent.tint" : "surface.hover" }}
+          fontWeight={isOpen ? 500 : 400}
+          transition="background 0.12s var(--cx-ease-soft), color 0.12s var(--cx-ease-soft)"
+          _hover={{
+            bg: isOpen
+              ? "surface.active"
+              : isSelected
+                ? "accent.tint"
+                : "surface.hover",
+          }}
           onClick={(e) => onClickFile(f, e)}
         >
+          {isOpen && (
+            <Box
+              position="absolute"
+              left={0}
+              top="3px"
+              bottom="3px"
+              w="2px"
+              borderRadius="full"
+              bg="accent.base"
+            />
+          )}
           <Box w={`${CHEV}px`} flexShrink={0} />
           <Icon
             as={fi.icon}
@@ -1078,17 +1103,25 @@ function TreeItem(
             cursor="pointer"
             color="ink.muted"
             bg={over ? "accent.tint" : "transparent"}
+            outline={over ? "1px dashed" : "0"}
+            outlineColor="accent.base"
+            outlineOffset="-1px"
+            transition="background 0.12s var(--cx-ease-soft), color 0.12s var(--cx-ease-soft)"
             _hover={{
               bg: over ? "accent.tint" : "surface.hover",
               color: "ink.base",
             }}
             onClick={() => onToggle(folderPath)}
           >
+            {/* One chevron that turns, rather than two icons that swap: the
+                rotation tells you which way the folder moved. */}
             <Icon
-              as={open ? VscChevronDown : VscChevronRight}
+              as={VscChevronRight}
               boxSize={`${CHEV}px`}
               color="ink.subtle"
               flexShrink={0}
+              transform={open ? "rotate(90deg)" : "rotate(0deg)"}
+              transition="transform 0.18s var(--cx-ease-spring)"
             />
             <Icon
               as={fic.icon}

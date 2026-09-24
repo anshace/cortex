@@ -12,5 +12,143 @@ body {
      past the viewport edge — clip those instead of scrolling the page. */
   overflow-x: hidden;
   /* Fallback matching theme surface.bg so first paint is dark, no white flash. */
-  background: #0a0a0e;
+  background: #0a0b0e;
+}
+
+/* The motion vocabulary. Two easings only: `soft` for anything that arrives or
+   leaves (ease-out, no bounce), `spring` for anything you press (slight
+   overshoot). Durations stay under 320ms — a workspace you use all day must
+   never feel like it is waiting for you. */
+:root {
+  --cx-ease-soft: cubic-bezier(0.22, 1, 0.36, 1);
+  --cx-ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
+}
+
+@keyframes cx-pop {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes cx-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Rows entering a list: they slide in from the reading edge, not upward, so a
+   re-rendered file tree does not look like it fell over. */
+@keyframes cx-in {
+  from {
+    opacity: 0;
+    transform: translateX(-5px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Presence and "live" indicators breathe; a static dot reads as a dead one. */
+@keyframes cx-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 currentColor;
+  }
+  70% {
+    opacity: 0.72;
+    box-shadow: 0 0 0 3px rgba(0, 0, 0, 0);
+  }
+}
+
+@keyframes cx-shimmer {
+  from {
+    background-position: -180% 0;
+  }
+  to {
+    background-position: 180% 0;
+  }
+}
+
+/* Popovers, menus and dialogs all enter the same way (see theme.ts recipes). */
+.chakra-menu__menu-list,
+.chakra-popover__content,
+.chakra-modal__dialog {
+  animation: cx-pop 0.22s var(--cx-ease-soft);
+}
+
+.chakra-modal__overlay,
+.chakra-drawer__overlay {
+  animation: cx-fade 0.18s linear;
+}
+
+/* Hand-rolled portals — the right-click menu and command palette are our own
+   Boxes, not Chakra popups, so they opt into the same entry explicitly. */
+.cx-pop {
+  animation: cx-pop 0.16s var(--cx-ease-soft);
+  transform-origin: top left;
+}
+
+/* Apply to a container to stagger its direct children on mount. Capped at 12 so
+   a 400-row list does not take half a second to finish arriving. */
+.cx-stagger > * {
+  animation: cx-in 0.24s var(--cx-ease-soft) both;
+}
+.cx-stagger > *:nth-child(1) {
+  animation-delay: 0ms;
+}
+.cx-stagger > *:nth-child(2) {
+  animation-delay: 22ms;
+}
+.cx-stagger > *:nth-child(3) {
+  animation-delay: 44ms;
+}
+.cx-stagger > *:nth-child(4) {
+  animation-delay: 66ms;
+}
+.cx-stagger > *:nth-child(5) {
+  animation-delay: 88ms;
+}
+.cx-stagger > *:nth-child(6) {
+  animation-delay: 110ms;
+}
+.cx-stagger > *:nth-child(n + 7) {
+  animation-delay: 132ms;
+}
+
+.cx-live {
+  animation: cx-pulse 2.4s var(--cx-ease-soft) infinite;
+}
+
+.cx-skeleton {
+  background-image: linear-gradient(
+    90deg,
+    rgba(128, 128, 128, 0) 0%,
+    rgba(128, 128, 128, 0.16) 50%,
+    rgba(128, 128, 128, 0) 100%
+  );
+  background-size: 200% 100%;
+  animation: cx-shimmer 1.5s linear infinite;
+}
+
+/* Motion is decoration here, never information — so it goes away entirely when
+   asked to, and the app stays fully legible without it. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

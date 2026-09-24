@@ -60,7 +60,7 @@ export default function PasswordResetDialog({
               Set a new password for {target?.email}. All their existing sessions will be revoked.
             </Text>
             <FormControl isRequired>
-              <FormLabel fontSize="xs">New password (at least 8 characters)</FormLabel>
+              <FormLabel>New password (at least 8 characters)</FormLabel>
               <Input type="password" autoComplete="new-password" value={password}
                 onChange={(e) => setPassword(e.target.value)} minLength={8} autoFocus />
             </FormControl>

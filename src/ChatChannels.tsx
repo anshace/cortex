@@ -102,6 +102,7 @@ function Row({
       borderRadius="lg"
       cursor="pointer"
       bg={active ? "accent.tint" : "transparent"}
+      transition="background 0.12s var(--cx-ease-soft)"
       _hover={{ bg: active ? "accent.tint" : "surface.hover" }}
       onClick={onClick}
     >
@@ -118,7 +119,7 @@ function Row({
             right="-1px"
             boxSize="11px"
             borderRadius="full"
-            bg={online ? "green.400" : "surface.borderStrong"}
+            bg={online ? "signal.ok" : "surface.borderStrong"}
             border="2px solid"
             borderColor="surface.panel"
             title={online ? "Online" : "Offline"}

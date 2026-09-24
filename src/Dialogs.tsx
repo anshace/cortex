@@ -66,7 +66,7 @@ export function PromptModal({
           <AlertDialogBody>
             <FormControl>
               {label && (
-                <FormLabel fontSize="xs" color="ink.muted">
+                <FormLabel>
                   {label}
                 </FormLabel>
               )}

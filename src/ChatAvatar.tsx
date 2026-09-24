@@ -73,7 +73,7 @@ export function PresenceDot({
       right="-1px"
       boxSize="11px"
       borderRadius="full"
-      bg={online ? "green.400" : "surface.borderStrong"}
+      bg={online ? "signal.ok" : "surface.borderStrong"}
       border="2px solid"
       borderColor={panel}
       title={online ? "Online" : "Offline"}

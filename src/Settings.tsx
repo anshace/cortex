@@ -247,7 +247,7 @@ function ProfilePanel({
       <Card>
         <Box as="form" onSubmit={saveUsername} mb={5}>
           <FormControl>
-            <FormLabel fontSize="xs" color="ink.muted">
+            <FormLabel>
               Username{" "}
               <Text as="span" color="ink.subtle">
                 (what you sign in with)
@@ -277,7 +277,7 @@ function ProfilePanel({
         </Box>
         <Box as="form" onSubmit={save}>
           <FormControl>
-            <FormLabel fontSize="xs" color="ink.muted">
+            <FormLabel>
               Display name
             </FormLabel>
             <HStack>
@@ -621,7 +621,7 @@ function SecurityPanel({
           </Text>
           <VStack spacing={3} align="stretch" maxW="360px">
             <FormControl isRequired>
-              <FormLabel fontSize="xs" color="ink.muted">
+              <FormLabel>
                 Current password
               </FormLabel>
               <Input
@@ -633,7 +633,7 @@ function SecurityPanel({
               />
             </FormControl>
             <FormControl isRequired>
-              <FormLabel fontSize="xs" color="ink.muted">
+              <FormLabel>
                 New password
               </FormLabel>
               <Input

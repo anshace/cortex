@@ -10,7 +10,6 @@ import {
   MenuItem,
   MenuList,
   Popover,
-  PopoverArrow,
   PopoverBody,
   PopoverContent,
   PopoverTrigger,
@@ -63,6 +62,7 @@ import {
 } from "./editorThemes";
 import { fileIcon } from "./fileIcon";
 import Rustpad, { UserInfo } from "./rustpad";
+import { LiveDot } from "./ui";
 
 type Connection = "connected" | "disconnected" | "desynchronized";
 
@@ -221,18 +221,18 @@ type StatusInfo = {
 function StatusBar({ info }: { info: StatusInfo }) {
   const connectionColor =
     info.connection === "connected"
-      ? "green.400"
+      ? "state.ok"
       : info.connection === "desynchronized"
-        ? "red.400"
-        : "orange.300";
+        ? "state.bad"
+        : "state.warn";
   return (
     <Flex
       h="22px"
       align="stretch"
-      bg="surface.panel"
+      bg="surface.panel2"
       borderTop="1px solid"
       borderColor="surface.border"
-      fontSize="12px"
+      fontSize="11px"
       color="ink.muted"
       flexShrink={0}
       sx={{ fontVariantNumeric: "tabular-nums" }}
@@ -335,21 +335,19 @@ function StatusBar({ info }: { info: StatusInfo }) {
             whiteSpace="nowrap"
             title="Connection & people in this file"
           >
-            <Icon as={VscCircleFilled} fontSize="8px" />
+            {/* A steady dot reads as a dead one, so only a live socket pulses. */}
+            <LiveDot
+              color={connectionColor}
+              size="7px"
+              pulse={info.connection === "connected"}
+            />
             <Text textTransform="capitalize">{info.connection}</Text>
             {info.collaborators.length > 0 && (
               <Text color="ink.muted">· {info.collaborators.length + 1}</Text>
             )}
           </HStack>
         </PopoverTrigger>
-        <PopoverContent
-          bg="surface.raised"
-          borderColor="surface.border"
-          boxShadow="pop"
-          w="240px"
-          _focusVisible={{ outline: "none" }}
-        >
-          <PopoverArrow bg="surface.raised" />
+        <PopoverContent w="240px">
           <PopoverBody>
             <HStack mb={2} color={connectionColor}>
               <Icon as={VscCircleFilled} fontSize="9px" />
@@ -357,7 +355,7 @@ function StatusBar({ info }: { info: StatusInfo }) {
                 {info.connection}
               </Text>
             </HStack>
-            <Divider borderColor="surface.border" mb={2} />
+            <Divider mb={2} />
             <Text fontSize="xs" color="ink.subtle" mb={1.5}>
               People in this file
             </Text>
@@ -866,13 +864,15 @@ function EditorGroup({
       color={previewActive ? "ink.base" : "ink.muted"}
       borderRight="1px solid"
       borderColor="surface.border"
+      borderBottom="1px solid"
+      borderBottomColor={previewActive ? "surface.bg" : "transparent"}
       borderTop="1px solid"
       borderTopColor={previewActive && isFocused ? "brand.500" : "transparent"}
       _hover={{
         color: "ink.base",
         bg: previewActive ? "surface.bg" : "surface.hover",
       }}
-      transition="background 0.1s ease"
+      transition="background 0.12s var(--cx-ease-soft), color 0.12s, border-color 0.12s"
       onClick={() => setView("preview")}
     >
       <Icon
@@ -983,14 +983,16 @@ function EditorGroup({
         </Flex>
       )}
 
-      {/* Tab bar */}
+      {/* Tab bar. The hairline under it is an inset shadow rather than a border
+          so the active tab can cover its own slice of it (below) and read as
+          continuous with the editor — the VS Code "selected tab is the editor"
+          fusion, without a negative margin the scroll container would clip. */}
       <Flex
         h="35px"
-        bg="surface.panel"
-        borderBottom="1px solid"
-        borderColor="surface.border"
+        bg="surface.panel2"
         align="stretch"
         flexShrink={0}
+        sx={{ boxShadow: "inset 0 -1px 0 var(--chakra-colors-surface-border)" }}
       >
         <Flex
           align="stretch"
@@ -1032,6 +1034,8 @@ function EditorGroup({
                   color={active ? "ink.base" : "ink.muted"}
                   borderRight="1px solid"
                   borderColor="surface.border"
+                  borderBottom="1px solid"
+                  borderBottomColor={active ? "surface.bg" : "transparent"}
                   borderTop="1px solid"
                   borderTopColor={
                     active && isFocused ? "brand.500" : "transparent"
@@ -1040,7 +1044,7 @@ function EditorGroup({
                     color: "ink.base",
                     bg: active ? "surface.bg" : "surface.hover",
                   }}
-                  transition="background 0.1s ease"
+                  transition="background 0.12s var(--cx-ease-soft), color 0.12s, border-color 0.12s"
                   onClick={() => {
                     setView("editor");
                     onSelectTab(f.id);
@@ -1090,6 +1094,8 @@ function EditorGroup({
               color="ink.base"
               borderRight="1px solid"
               borderColor="surface.border"
+              borderBottom="1px solid"
+              borderBottomColor="surface.bg"
               borderTop="1px solid"
               borderTopColor={isFocused ? "brand.500" : "transparent"}
             >

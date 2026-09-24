@@ -360,6 +360,9 @@ function Landing({ onSignIn }: { onSignIn: () => void }) {
         py={{ base: 14, md: 20 }}
       >
         <VStack spacing={3} align="center" textAlign="center" mb={12}>
+          <Text textStyle="eyebrow" color="accent.base">
+            Features
+          </Text>
           <Heading
             as="h2"
             fontSize={{ base: "2xl", md: "4xl" }}

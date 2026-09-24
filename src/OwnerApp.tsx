@@ -643,7 +643,7 @@ function OwnerApp({
                                 icon={<VscTrash />}
                                 size="xs"
                                 variant="ghost"
-                                color="red.400"
+                                color="state.bad"
                                 onClick={() => {
                                   if (confirm(`Delete ${u.email}?`))
                                     run(

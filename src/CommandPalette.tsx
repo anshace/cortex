@@ -1,6 +1,7 @@
 import {
   Box,
   Flex,
+  Icon,
   Input,
   Kbd,
   Modal,
@@ -8,6 +9,7 @@ import {
   ModalOverlay,
   Text,
 } from "@chakra-ui/react";
+import { VscSearch } from "react-icons/vsc";
 import {
   KeyboardEvent,
   ReactNode,
@@ -17,6 +19,10 @@ import {
   useRef,
   useState,
 } from "react";
+
+import { KeyHint } from "./ui";
+
+const NO_MARKS = new Set<number>();
 
 // One modal, two uses: Quick Open (a list of files) and the Command Palette (a
 // list of app actions). Both are just a filtered, keyboard-driven list, so
@@ -37,6 +43,10 @@ type Props = {
   items: PaletteItem[];
 };
 
+function norm(query: string): string {
+  return query.trim().toLowerCase();
+}
+
 // Case-insensitive subsequence match: "wsap" matches "WorkspaceApp". Good
 // enough for file paths and command names without pulling in a fuzzy library.
 // ponytail: subsequence + label-length tiebreak, no scoring lib.
@@ -48,6 +58,38 @@ function matches(query: string, hay: string): boolean {
     if (i === query.length) return true;
   }
   return false;
+}
+
+// The same walk, but reporting *where* it matched, so the row can show the
+// letters that earned it a place in the list.
+function matchIndices(query: string, text: string): number[] {
+  if (!query) return [];
+  const idx: number[] = [];
+  let i = 0;
+  for (let p = 0; p < text.length && i < query.length; p++) {
+    if (text[p].toLowerCase() === query[i]) {
+      idx.push(p);
+      i++;
+    }
+  }
+  return i === query.length ? idx : [];
+}
+
+function Highlighted({ text, marks }: { text: string; marks: Set<number> }) {
+  if (marks.size === 0) return <>{text}</>;
+  return (
+    <>
+      {Array.from(text).map((c, i) =>
+        marks.has(i) ? (
+          <Text as="span" key={i} color="accent.hi" fontWeight={700}>
+            {c}
+          </Text>
+        ) : (
+          c
+        ),
+      )}
+    </>
+  );
 }
 
 function CommandPalette({ isOpen, onClose, placeholder, items }: Props) {
@@ -63,12 +105,20 @@ function CommandPalette({ isOpen, onClose, placeholder, items }: Props) {
   }, [isOpen]);
 
   const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
+    const q = norm(query);
     return items
       .filter((it) => matches(q, (it.label + " " + (it.keywords ?? "")).toLowerCase()))
       .sort((a, b) => a.label.length - b.label.length)
       .slice(0, 200);
   }, [items, query]);
+
+  // Which letters of each visible label earned its place in the list.
+  const marks = useMemo(() => {
+    const q = norm(query);
+    const map = new Map<PaletteItem, Set<number>>();
+    for (const it of filtered) map.set(it, new Set(matchIndices(q, it.label)));
+    return map;
+  }, [filtered, query]);
 
   useEffect(() => setActive(0), [query]);
 
@@ -100,34 +150,40 @@ function CommandPalette({ isOpen, onClose, placeholder, items }: Props) {
 
   return (
     <Modal isOpen={isOpen} onClose={onClose} size="xl" scrollBehavior="inside">
-      <ModalOverlay bg="blackAlpha.600" />
-      <ModalContent
-        bg="surface.panel"
-        border="1px solid"
-        borderColor="surface.borderStrong"
-        mt="12vh"
-        mx={4}
-        overflow="hidden"
-        boxShadow="2xl"
-      >
-        <Box borderBottom="1px solid" borderColor="surface.border">
+      <ModalOverlay />
+      {/* High on the screen: a palette is something you type into, not a dialog
+          you read in the middle of. */}
+      <ModalContent mt="12vh" borderColor="surface.borderStrong" overflow="hidden">
+        <Flex
+          align="center"
+          gap={2.5}
+          px={4}
+          borderBottom="1px solid"
+          borderColor="surface.border"
+        >
+          <Icon as={VscSearch} fontSize="14px" color="ink.subtle" flexShrink={0} />
           <Input
             autoFocus
             variant="unstyled"
-            px={4}
-            py={3}
+            py={3.5}
+            px={0}
             fontSize="sm"
             placeholder={placeholder}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={onKeyDown}
+            _placeholder={{ color: "ink.subtle" }}
           />
-        </Box>
+          <KeyHint keys={["Esc"]} />
+        </Flex>
         <Box ref={listRef} maxH="min(50vh, 420px)" overflowY="auto" py={1}>
           {filtered.length === 0 ? (
-            <Text px={4} py={3} fontSize="sm" color="ink.subtle">
-              No matching results
-            </Text>
+            <Flex align="center" gap={2} px={4} py={4}>
+              <Icon as={VscSearch} fontSize="13px" color="ink.subtle" />
+              <Text fontSize="sm" color="ink.subtle">
+                {query ? `No match for “${query.trim()}”` : "Nothing here yet"}
+              </Text>
+            </Flex>
           ) : (
             filtered.map((it, i) => (
               <Flex
@@ -137,19 +193,32 @@ function CommandPalette({ isOpen, onClose, placeholder, items }: Props) {
                 px={4}
                 py={1.5}
                 cursor="pointer"
+                position="relative"
+                borderRadius="md"
+                mx={1}
                 bg={i === active ? "surface.hover" : "transparent"}
-                borderLeft="2px solid"
-                borderColor={i === active ? "brand.500" : "transparent"}
+                transition="background 0.1s var(--cx-ease-soft)"
                 onMouseEnter={() => setActive(i)}
                 onClick={() => choose(i)}
               >
+                {i === active && (
+                  <Box
+                    position="absolute"
+                    left={0}
+                    top="5px"
+                    bottom="5px"
+                    w="2px"
+                    borderRadius="full"
+                    bg="accent.base"
+                  />
+                )}
                 {it.icon && (
                   <Flex w="16px" justify="center" flexShrink={0} fontSize="sm">
                     {it.icon}
                   </Flex>
                 )}
                 <Text fontSize="sm" color="ink.base" noOfLines={1} flex={1}>
-                  {it.label}
+                  <Highlighted text={it.label} marks={marks.get(it) ?? NO_MARKS} />
                 </Text>
                 {it.hint &&
                   (it.hint.includes("+") || it.hint.length <= 4 ? (

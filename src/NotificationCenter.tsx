@@ -27,6 +27,7 @@ import { ChatTarget } from "./ChatChannels";
 import ChatAvatar from "./ChatAvatar";
 import * as api from "./api";
 import { Member } from "./api";
+import { EmptyState } from "./ui";
 
 // A single in-app notification event derived from the overview poll.
 export type NotificationEvent = {
@@ -190,6 +191,9 @@ export default function NotificationCenter({
 
   function navigateTo(evt: NotificationEvent) {
     onClose();
+    // Opening the thread resolves the row: leaving it listed reads as a
+    // notification that failed to clear.
+    setEvents((prev) => prev.filter((e) => e.id !== evt.id));
     if (evt.threadKey.startsWith("g:")) {
       onNavigate({ kind: "group" });
     } else if (evt.threadKey.startsWith("dm:")) {
@@ -215,24 +219,45 @@ export default function NotificationCenter({
           <IconButton
             aria-label="Notifications"
             icon={
-              <Icon as={totalUnread > 0 ? VscBellDot : VscBell} boxSize={5} />
+              <Box position="relative" boxSize="20px" display="flex" alignItems="center" justifyContent="center">
+                <Icon
+                  as={totalUnread > 0 ? VscBellDot : VscBell}
+                  boxSize={5}
+                  color={totalUnread > 0 ? "accent.base" : "ink.subtle"}
+                />
+                {totalUnread > 0 && (
+                  <Box
+                    position="absolute"
+                    top="-5px"
+                    right="-7px"
+                    minW="14px"
+                    h="14px"
+                    px="3px"
+                    bg="brand.500"
+                    color="white"
+                    borderRadius="full"
+                    fontSize="8.5px"
+                    fontWeight={700}
+                    lineHeight="14px"
+                    textAlign="center"
+                    pointerEvents="none"
+                    sx={{
+                      boxShadow: "0 0 0 2px var(--chakra-colors-surface-bg)",
+                    }}
+                  >
+                    {totalUnread > 9 ? "9+" : totalUnread}
+                  </Box>
+                )}
+              </Box>
             }
             variant="ghost"
             size="md"
-            color={totalUnread > 0 ? "brand.400" : "ink.subtle"}
             _hover={{ color: "ink.base", bg: "surface.hover" }}
             position="relative"
           />
         </PopoverTrigger>
       </Tooltip>
-      <PopoverContent
-        bg="surface.raised"
-        borderColor="surface.border"
-        boxShadow="pop"
-        w="380px"
-        maxH="70vh"
-        overflow="hidden"
-      >
+      <PopoverContent w="380px" maxH="70vh" overflow="hidden">
         <Flex
           align="center"
           justify="space-between"
@@ -240,11 +265,10 @@ export default function NotificationCenter({
           py={3}
           borderBottom="1px solid"
           borderColor="surface.border"
+          bg="surface.panel2"
         >
           <Flex align="center" gap={2}>
-            <Text fontSize="sm" fontWeight={700}>
-              Notifications
-            </Text>
+            <Text textStyle="eyebrow">Notifications</Text>
             {totalUnread > 0 && (
               <Badge colorScheme="brand" variant="subtle" fontSize="0.65rem">
                 {totalUnread}
@@ -258,29 +282,20 @@ export default function NotificationCenter({
               size="xs"
               variant="ghost"
               color="ink.subtle"
-              _hover={{ color: "red.400", bg: "surface.hover" }}
+              _hover={{ color: "state.bad", bg: "surface.hover" }}
               onClick={clearAll}
             />
           )}
         </Flex>
         <PopoverBody p={0} overflowY="auto" maxH="calc(70vh - 50px)">
           {events.length === 0 ? (
-            <Flex
-              flexDirection="column"
-              align="center"
-              justify="center"
-              py={12}
-              color="ink.muted"
-              gap={2}
-            >
-              <Icon as={VscMailRead} fontSize="2xl" color="ink.subtle" />
-              <Text fontSize="sm">All caught up!</Text>
-              <Text fontSize="xs" color="ink.subtle">
-                No new notifications
-              </Text>
-            </Flex>
+            <EmptyState
+              icon={<Icon as={VscMailRead} fontSize="20px" />}
+              title="All caught up"
+              hint="Mentions and new threads show up here while you are working elsewhere."
+            />
           ) : (
-            <VStack align="stretch" spacing={0}>
+            <VStack align="stretch" spacing={0} className="cx-stagger">
               {events.map((evt) => (
                 <Flex
                   key={evt.id}
@@ -291,9 +306,21 @@ export default function NotificationCenter({
                   cursor="pointer"
                   borderBottom="1px solid"
                   borderColor="surface.border"
+                  position="relative"
+                  transition="background 0.12s var(--cx-ease-soft)"
                   _hover={{ bg: "surface.hover" }}
                   onClick={() => navigateTo(evt)}
                 >
+                  {/* Unread marker: a hairline on the reading edge, not a filled row. */}
+                  <Box
+                    position="absolute"
+                    left={0}
+                    top="8px"
+                    bottom="8px"
+                    w="2px"
+                    borderRadius="full"
+                    bg="accent.base"
+                  />
                   <Box flexShrink={0} mt={0.5}>
                     <ChatAvatar name={evt.senderName} size={32} />
                   </Box>
@@ -303,17 +330,13 @@ export default function NotificationCenter({
                         {evt.senderName}
                       </Text>
                       {evt.isMention && (
-                        <Badge
-                          colorScheme="purple"
-                          fontSize="0.55rem"
-                          variant="subtle"
-                        >
+                        <Badge colorScheme="brand" fontSize="0.55rem" variant="subtle">
                           mention
                         </Badge>
                       )}
                       {evt.isGroup && (
                         <Badge
-                          colorScheme="blue"
+                          colorScheme="purple"
                           fontSize="0.55rem"
                           variant="subtle"
                         >

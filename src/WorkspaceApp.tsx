@@ -1897,14 +1897,17 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
         )}
       </Flex>
 
-      {/* Draggable edge to resize the sidebar. */}
+      {/* Draggable edge to resize the sidebar. The hairline it needs is already
+          the sidebar's own border, so the grabber stays invisible until you are
+          about to use it — a permanent grey bar reads as part of the layout. */}
       {!sidebarCollapsed && (
         <Box
           w="5px"
           flexShrink={0}
           cursor="col-resize"
-          bg="surface.border"
-          _hover={{ bg: "brand.500" }}
+          bg="transparent"
+          transition="background 0.12s var(--cx-ease-soft)"
+          _hover={{ bg: "accent.tint" }}
           onMouseDown={startSidebarDrag}
         />
       )}
@@ -2078,7 +2081,7 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
             <AlertDialogHeader fontSize="md">New group</AlertDialogHeader>
             <AlertDialogBody>
               <FormControl mb={3}>
-                <FormLabel fontSize="xs" color="ink.muted">
+                <FormLabel>
                   Name
                 </FormLabel>
                 <Input
@@ -2093,7 +2096,7 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
                   onKeyDown={(e) => e.key === "Enter" && createGroupNow()}
                 />
               </FormControl>
-              <FormLabel fontSize="xs" color="ink.muted" mb={1.5}>
+              <FormLabel mb={1.5}>
                 Who can see it?
               </FormLabel>
               <VStack spacing={1.5} align="stretch">

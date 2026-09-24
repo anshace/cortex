@@ -62,6 +62,7 @@ import { ChatTarget } from "./ChatChannels";
 import { ConfirmModal } from "./Dialogs";
 import * as api from "./api";
 import { ChatMessage, Me, Member, Presence } from "./api";
+import { KeyHint } from "./ui";
 
 // Quick-reaction palette shown in the "add reaction" menu.
 const PRESET_EMOJI = ["👍", "❤️", "😄", "🎉", "🙏", "👀"];
@@ -1307,9 +1308,9 @@ function ChatView({
                 right="-1px"
                 boxSize="11px"
                 borderRadius="full"
-                bg={peerPresence?.online ? "green.400" : "surface.borderStrong"}
+                bg={peerPresence?.online ? "state.ok" : "surface.borderStrong"}
                 border="2px solid"
-                borderColor="surface.bg"
+                borderColor="surface.panel"
               />
             </Box>
           ) : (
@@ -1334,7 +1335,7 @@ function ChatView({
             </Text>
             <Text
               fontSize="xs"
-              color={peerPresence?.online ? "green.400" : "ink.subtle"}
+              color={peerPresence?.online ? "state.ok" : "ink.subtle"}
               isTruncated
             >
               {subtitle}
@@ -1354,7 +1355,7 @@ function ChatView({
             variant="ghost"
             color="ink.muted"
             flexShrink={0}
-            _hover={{ bg: "surface.hover", color: "red.400" }}
+            _hover={{ bg: "surface.hover", color: "state.bad" }}
             visibility={canClear && messages.length > 0 ? "visible" : "hidden"}
             isDisabled={!canClear || messages.length === 0}
             onClick={() => setConfirmClear(true)}
@@ -1431,7 +1432,7 @@ function ChatView({
                           size="xs"
                           variant="ghost"
                           color="ink.subtle"
-                          _hover={{ color: "red.400", bg: "surface.hover" }}
+                          _hover={{ color: "state.bad", bg: "surface.hover" }}
                           onClick={() => setConfirmDel(m.id)}
                         />
                       </>
@@ -1802,6 +1803,7 @@ function ChatView({
               aria-label="Jump to latest message"
               icon={<VscArrowDown />}
               size="sm"
+              className="cx-pop"
               position="absolute"
               bottom="12px"
               right="16px"
@@ -1947,7 +1949,7 @@ function ChatView({
                   size="xs"
                   variant="ghost"
                   color="ink.muted"
-                  _hover={{ color: "red.400" }}
+                  _hover={{ color: "state.bad" }}
                   onClick={() =>
                     setPends((prev) => prev.filter((_, j) => j !== i))
                   }
@@ -1965,7 +1967,7 @@ function ChatView({
             w="100%"
             bg="surface.raised"
             border="1px solid"
-            borderColor="red.400"
+            borderColor="state.bad"
             borderRadius="20px"
             pl={4}
             pr={2}
@@ -1974,15 +1976,15 @@ function ChatView({
             <Box
               boxSize="10px"
               borderRadius="full"
-              bg="red.400"
+              bg="signal.bad"
               flexShrink={0}
               sx={{ animation: `${pulseKey} 1s infinite` }}
             />
             <Text
               fontSize="xl"
               fontWeight="bold"
-              color="red.400"
-              sx={{ fontVariantNumeric: "tabular-nums" }}
+              color="state.bad"
+              textStyle="num"
               flexShrink={0}
             >
               {`${Math.floor(recSeconds / 60)}:${String(recSeconds % 60).padStart(2, "0")}`}
@@ -1993,7 +1995,8 @@ function ChatView({
                   key={i}
                   w="3px"
                   borderRadius="full"
-                  bg="red.300"
+                  bg="signal.bad"
+                  opacity={0.55}
                   h={`${6 + Math.sin(i * 0.6 + recSeconds * 3) * 6}px`}
                   transition="height 0.15s ease"
                 />
@@ -2007,9 +2010,9 @@ function ChatView({
               icon={<Icon as={LuSquare} />}
               size="sm"
               borderRadius="full"
-              bg="red.400"
+              bg="signal.bad"
               color="white"
-              _hover={{ bg: "red.500" }}
+              _hover={{ bg: "signal.bad", filter: "brightness(1.12)" }}
               onClick={toggleRecording}
             />
           </Flex>
@@ -2019,7 +2022,7 @@ function ChatView({
             bg="surface.raised"
             border="1px solid"
             borderColor="surface.border"
-            _focusWithin={{ borderColor: "brand.500" }}
+            _focusWithin={{ borderColor: "accent.base", boxShadow: "0 0 0 3px var(--chakra-colors-accent-glow)" }}
             borderRadius="20px"
             pl={2}
             pr="6px"
@@ -2058,8 +2061,8 @@ function ChatView({
                 editing != null
                   ? "Edit your message…"
                   : target.kind === "group"
-                    ? `Message the group…${prefs.enterToSend ? "" : "  (Ctrl+Enter to send)"}`
-                    : `Message ${title}…${prefs.enterToSend ? "" : "  (Ctrl+Enter to send)"}`
+                    ? "Message the group…"
+                    : `Message ${title}…`
               }
               resize="none"
               rows={1}
@@ -2069,6 +2072,12 @@ function ChatView({
               flex={1}
               fontSize="sm"
             />
+            {/* Teaches the send key once, then gets out of the way. */}
+            {!prefs.enterToSend && !draft.trim() && editing == null && (
+              <Box flexShrink={0} mr={1}>
+                <KeyHint keys={["Ctrl", "↵"]} />
+              </Box>
+            )}
             <IconButton
               aria-label="Attach file or image"
               icon={<Icon as={LuPaperclip} />}

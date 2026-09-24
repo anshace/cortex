@@ -422,7 +422,7 @@ export default function Whiteboard({ file }: { file: api.FileRow }) {
   if (loadError) {
     return (
       <Center flex={1} flexDirection="column" gap={3}>
-        <Icon as={VscError} fontSize="3xl" color="red.400" />
+        <Icon as={VscError} fontSize="3xl" color="state.bad" />
         <Text fontSize="sm" color="ink.muted">
           {loadError}
         </Text>

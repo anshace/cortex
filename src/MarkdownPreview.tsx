@@ -123,7 +123,7 @@ function Mermaid({ code, dark }: { code: string; dark: boolean }) {
     return (
       <Box
         role="alert"
-        color="red.400"
+        color="state.bad"
         fontSize="sm"
         fontFamily="mono"
         whiteSpace="pre-wrap"

@@ -207,14 +207,14 @@ function SaveBadge({ status }: { status: SaveStatus }) {
     );
   if (status === "saved")
     return (
-      <HStack spacing={1} color="green.400" flexShrink={0}>
+      <HStack spacing={1} color="state.ok" flexShrink={0}>
         <Icon as={VscCheck} boxSize="13px" />
         <Text fontSize="11px">Saved</Text>
       </HStack>
     );
   if (status === "error")
     return (
-      <HStack spacing={1} color="red.400" flexShrink={0}>
+      <HStack spacing={1} color="state.bad" flexShrink={0}>
         <Icon as={VscError} boxSize="13px" />
         <Text fontSize="11px">Save failed — retry by editing</Text>
       </HStack>

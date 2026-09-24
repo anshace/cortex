@@ -6,6 +6,8 @@ import {
   FormLabel,
   Grid,
   Heading,
+  HStack,
+  Icon,
   IconButton,
   Input,
   Text,
@@ -16,6 +18,7 @@ import {
 import { motion, useReducedMotion } from "framer-motion";
 import { FormEvent, useState } from "react";
 import { FiArrowLeft, FiArrowRight, FiMoon, FiSun } from "react-icons/fi";
+import { VscError } from "react-icons/vsc";
 
 import Logo from "./Logo";
 import { BRAND } from "./brand";
@@ -240,7 +243,7 @@ function Login({ onSuccess, onBack }: LoginProps) {
             <VStack spacing={4} align="stretch">
               {mfa ? (
                 <FormControl isRequired>
-                  <FormLabel fontSize="xs" color="ink.muted" mb={1.5}>
+                  <FormLabel mb={1.5}>
                     Authentication code
                   </FormLabel>
                   <Input
@@ -261,7 +264,7 @@ function Login({ onSuccess, onBack }: LoginProps) {
               ) : (
                 <>
                   <FormControl isRequired>
-                    <FormLabel fontSize="xs" color="ink.muted" mb={1.5}>
+                    <FormLabel mb={1.5}>
                       Username
                     </FormLabel>
                     <Input
@@ -274,7 +277,7 @@ function Login({ onSuccess, onBack }: LoginProps) {
                   </FormControl>
 
                   <FormControl isRequired>
-                    <FormLabel fontSize="xs" color="ink.muted" mb={1.5}>
+                    <FormLabel mb={1.5}>
                       Password
                     </FormLabel>
                     <Input
@@ -289,9 +292,20 @@ function Login({ onSuccess, onBack }: LoginProps) {
               )}
 
               {error && (
-                <Text role="alert" color="red.400" fontSize="sm">
-                  {error}
-                </Text>
+                <HStack
+                  role="alert"
+                  spacing={2}
+                  p={2.5}
+                  bg="state.badTint"
+                  border="1px solid"
+                  borderColor="state.bad"
+                  borderRadius="lg"
+                >
+                  <Icon as={VscError} color="state.bad" boxSize="15px" flexShrink={0} />
+                  <Text fontSize="sm" color="state.bad">
+                    {error}
+                  </Text>
+                </HStack>
               )}
 
               <Button

@@ -42,10 +42,12 @@ function ContextMenu({ state, onClose }: { state: MenuState; onClose: () => void
         top={`${Math.max(4, y)}px`}
         zIndex={2000}
         minW={`${MENU_W}px`}
-        bg="surface.raised"
+        className="cx-pop"
+        bg="surface.glass"
+        backdropFilter="blur(16px) saturate(1.4)"
         border="1px solid"
         borderColor="surface.border"
-        borderRadius="8px"
+        borderRadius="lg"
         boxShadow="pop"
         py="5px"
         fontSize="13px"
@@ -55,20 +57,30 @@ function ContextMenu({ state, onClose }: { state: MenuState; onClose: () => void
       >
         {state.actions.map((a, i) => (
           <Box key={i}>
-            {a.divider && <Box h="1px" bg="surface.border" my="4px" />}
+            {a.divider && <Box h="1px" bg="surface.border" mx="8px" my="4px" />}
             <HStack
               h={`${ITEM_H}px`}
               px="12px"
               spacing="9px"
               cursor="pointer"
-              color={a.danger ? "red.400" : "ink.base"}
-              _hover={{ bg: a.danger ? "rgba(229,62,62,0.12)" : "surface.hover" }}
+              color={a.danger ? "state.bad" : "ink.base"}
+              borderRadius="md"
+              mx="4px"
+              transition="background 0.12s var(--cx-ease-soft), color 0.12s var(--cx-ease-soft)"
+              _hover={{ bg: a.danger ? "state.badTint" : "surface.hover" }}
               onClick={() => {
                 a.onClick();
                 onClose();
               }}
             >
-              {a.icon && <Icon as={a.icon} fontSize="16px" flexShrink={0} color={a.danger ? "red.400" : "ink.muted"} />}
+              {a.icon && (
+                <Icon
+                  as={a.icon}
+                  fontSize="16px"
+                  flexShrink={0}
+                  color={a.danger ? "state.bad" : "ink.muted"}
+                />
+              )}
               <Text lineHeight="1" fontWeight={500}>
                 {a.label}
               </Text>

@@ -145,32 +145,20 @@ function ActivityBar({
             _hover={{ color: "ink.base", bg: "surface.hover" }}
             onClick={(e: React.MouseEvent) => e.stopPropagation()}
           />
-          <MenuList bg="surface.raised" borderColor="surface.border" boxShadow="pop" py={1} minW="180px">
+          <MenuList minW="180px">
             {!isPersonal && (
               <MenuItem
-                bg="transparent"
-                _hover={{ bg: "surface.hover" }}
-                fontSize="sm"
                 icon={<Icon as={VscAccount} fontSize="15px" />}
                 onClick={() => onRenameGroup(g)}
               >
                 Rename
               </MenuItem>
             )}
-            <MenuItem
-              bg="transparent"
-              _hover={{ bg: "surface.hover" }}
-              fontSize="sm"
-              icon={<Icon as={VscAdd} fontSize="15px" />}
-              onClick={() => onNewWorkspace(g.id)}
-            >
+            <MenuItem icon={<Icon as={VscAdd} fontSize="15px" />} onClick={() => onNewWorkspace(g.id)}>
               New workspace
             </MenuItem>
             {!isPersonal && (
               <MenuItem
-                bg="transparent"
-                _hover={{ bg: "surface.hover" }}
-                fontSize="sm"
                 icon={<Icon as={VscAccount} fontSize="15px" />}
                 onClick={() => onManageMembers(g)}
               >
@@ -179,12 +167,11 @@ function ActivityBar({
             )}
             {!isPersonal && (
               <>
-                <MenuDivider borderColor="surface.border" />
+                <MenuDivider />
                 <MenuItem
-                  bg="transparent"
-                  _hover={{ bg: "rgba(229,62,62,0.12)" }}
-                  color="red.400"
-                  fontSize="sm"
+                  color="state.bad"
+                  _hover={{ bg: "state.badTint", color: "state.bad" }}
+                  _focus={{ bg: "state.badTint", color: "state.bad" }}
                   icon={<Icon as={VscSignOut} fontSize="15px" />}
                   onClick={() => onDeleteGroup(g)}
                 >
@@ -245,14 +232,8 @@ function ActivityBar({
             _hover={{ bg: "surface.hover" }}
           />
         </PopoverTrigger>
-        <PopoverContent
-          bg="surface.raised"
-          borderColor="surface.border"
-          boxShadow="pop"
-          w="250px"
-          maxH="70vh"
-        >
-          <PopoverBody p={1} overflowY="auto">
+        <PopoverContent w="250px" maxH="70vh">
+          <PopoverBody p={1} overflowY="auto" className="cx-stagger">
             {/** Personal first, then group-scope groups. */}
             {[...groups]
               .sort((a, b) => (a.scope === "personal" ? -1 : b.scope === "personal" ? 1 : 0))
@@ -290,7 +271,11 @@ function ActivityBar({
                 bottom="6px"
                 w="2px"
                 borderRadius="full"
-                bg={active ? "brand.400" : "transparent"}
+                bg="accent.base"
+                opacity={active ? 1 : 0}
+                transform={active ? "scaleY(1)" : "scaleY(0.4)"}
+                transition="opacity 0.16s var(--cx-ease-soft), transform 0.22s var(--cx-ease-spring)"
+                sx={active ? { boxShadow: "0 0 10px var(--chakra-colors-accent-glow)" } : undefined}
               />
               <IconButton
                 aria-label={it.label}
@@ -320,6 +305,7 @@ function ActivityBar({
                   lineHeight="15px"
                   textAlign="center"
                   pointerEvents="none"
+                  sx={{ boxShadow: "0 0 0 2px var(--chakra-colors-surface-bg)" }}
                 >
                   {it.count > 99 ? "99+" : it.count}
                 </Box>
@@ -359,7 +345,7 @@ function ActivityBar({
             _active={{ bg: "surface.hover" }}
           />
         </Tooltip>
-        <MenuList bg="surface.raised" borderColor="surface.border" boxShadow="pop" py={1} minW="240px">
+        <MenuList minW="240px">
           <Flex px={3} py={2} gap={3} align="center">
             <Avatar size="sm" name={me.name || me.email} bg="brand.600" color="white" />
             <Box minW={0} flex={1}>
@@ -385,31 +371,21 @@ function ActivityBar({
               )}
             </Box>
           </Flex>
-          <MenuDivider borderColor="surface.border" />
-          <MenuItem
-            bg="transparent"
-            _hover={{ bg: "surface.hover" }}
-            fontSize="sm"
-            icon={<Icon as={VscGear} fontSize="15px" />}
-            onClick={onProfile}
-          >
+          <MenuDivider />
+          <MenuItem icon={<Icon as={VscGear} fontSize="15px" />} onClick={onProfile}>
             Settings
           </MenuItem>
           <MenuItem
-            bg="transparent"
-            _hover={{ bg: "surface.hover" }}
-            fontSize="sm"
             icon={<Icon as={colorMode === "dark" ? FiSun : FiMoon} fontSize="15px" />}
             onClick={toggleColorMode}
           >
             {colorMode === "dark" ? "Light mode" : "Dark mode"}
           </MenuItem>
-          <MenuDivider borderColor="surface.border" />
+          <MenuDivider />
           <MenuItem
-            bg="transparent"
-            _hover={{ bg: "rgba(229,62,62,0.12)" }}
-            color="red.400"
-            fontSize="sm"
+            color="state.bad"
+            _hover={{ bg: "state.badTint", color: "state.bad" }}
+            _focus={{ bg: "state.badTint", color: "state.bad" }}
             icon={<Icon as={VscSignOut} fontSize="15px" />}
             onClick={onLogout}
           >
