@@ -155,6 +155,14 @@ fn scope_ok(scope: &str, created_by: i64, me: i64, is_member: bool) -> bool {
 
 /// Resolve a workspace the user may access, else reject with Forbidden.
 /// Visibility comes from the workspace's group.
+// A request may have authenticated *before* waiting for the access write
+// gate. Re-read its role/org after acquiring it: a concurrent demotion or
+// org move must take effect before this request changes protected content.
+async fn current_actor(db: &Database, user: &User) -> Result<User, Rejection> {
+    db.admin_target(user.id).await.ok().flatten()
+        .ok_or_else(|| warp::reject::custom(Forbidden))
+}
+
 async fn ensure_ws(db: &Database, user: &User, ws_id: i64) -> Result<Workspace, Rejection> {
     match db.get_workspace(ws_id).await.ok().flatten() {
         Some(ws) if user.role == "root" => Ok(ws),
@@ -838,7 +846,9 @@ async fn get_org(user: User, db: Database, q: OrgQuery) -> Result<impl Reply, Re
             }
             .iter()
             .any(|g| g.scope == "personal" && g.created_by == user.id);
-            if !has_personal {
+            // A root lookup can enumerate every org for transfer targets. Do
+            // not create an unused personal group in each org as a side effect.
+            if !is_owner && !has_personal {
                 let _ = db
                     .create_group(oid, "Personal", user.id, now_secs(), "personal")
                     .await;
@@ -899,6 +909,8 @@ async fn create_group(
     q: OrgQuery,
     body: CreateWorkspace,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let org_id = match acting_org(&user, &q) {
         Some(o) => o,
         None => return Ok(err(StatusCode::FORBIDDEN, "you are not assigned to an org")),
@@ -936,6 +948,8 @@ async fn rename_group(
     db: Database,
     body: RenameReq,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let g = ensure_group(&db, &user, group_id).await?;
     let name = body.name.trim();
     if name.is_empty() {
@@ -960,11 +974,12 @@ async fn delete_group(
     live: LiveDocs,
     boards: LiveBoards,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let g = ensure_group(&db, &user, group_id).await?;
     if !group_owner(&db, &user, g.id).await {
         return Ok(err(StatusCode::FORBIDDEN, "only the group owner can delete"));
     }
-    let _gate = crate::access_gate().write().await;
     if let Err(response) = disconnect_group(&db, &live, &boards, g.id).await {
         return Ok(response);
     }
@@ -986,6 +1001,8 @@ async fn create_ws_in_group(
     db: Database,
     body: CreateWsInGroup,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let g = ensure_group(&db, &user, group_id).await?;
     let name = body.name.trim();
     if name.is_empty() {
@@ -1011,6 +1028,8 @@ async fn add_member(
     db: Database,
     body: MemberReq,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let g = ensure_group(&db, &user, group_id).await?;
     if g.scope != "group" {
         return Ok(err(StatusCode::BAD_REQUEST, "only group-scope groups have members"));
@@ -1039,6 +1058,8 @@ async fn remove_member(
     live: LiveDocs,
     boards: LiveBoards,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let g = ensure_group(&db, &user, group_id).await?;
     if g.scope != "group" {
         return Ok(err(StatusCode::BAD_REQUEST, "only group-scope groups have members"));
@@ -1049,7 +1070,6 @@ async fn remove_member(
     if user_id == g.created_by {
         return Ok(err(StatusCode::CONFLICT, "transfer ownership before removing the owner"));
     }
-    let _gate = crate::access_gate().write().await;
     if let Err(response) = disconnect_group(&db, &live, &boards, g.id).await {
         return Ok(response);
     }
@@ -1068,6 +1088,8 @@ async fn rename_workspace(
     db: Database,
     body: RenameReq,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let ws = ensure_ws(&db, &user, ws_id).await?;
     let name = body.name.trim();
     if name.is_empty() {
@@ -1092,11 +1114,12 @@ async fn delete_workspace(
     live: LiveDocs,
     boards: LiveBoards,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let ws = ensure_ws(&db, &user, ws_id).await?;
     if !workspace_manager(&db, &user, &ws).await {
         return Ok(err(StatusCode::FORBIDDEN, "only a workspace manager can delete"));
     }
-    let _gate = crate::access_gate().write().await;
     let files = match db.workspace_file_ids(ws.id).await {
         Ok(ids) => ids,
         Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not list files")),
@@ -1124,6 +1147,8 @@ async fn reparent_workspace(
     boards: LiveBoards,
     body: GroupMove,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let ws = ensure_ws(&db, &user, ws_id).await?;
     let target = ensure_group(&db, &user, body.group_id).await?;
     if !workspace_manager(&db, &user, &ws).await {
@@ -1132,7 +1157,6 @@ async fn reparent_workspace(
     if ws.group_id == target.id {
         return Ok(warp::reply::json(&json!({ "workspace": ws })).into_response());
     }
-    let _gate = crate::access_gate().write().await;
     let ids = match db.workspace_doc_ids(ws.id).await {
         Ok(ids) => ids,
         Err(e) => {
@@ -1174,12 +1198,13 @@ async fn merge_workspace(
     if ws_id == body.target_workspace_id {
         return Ok(err(StatusCode::BAD_REQUEST, "choose a different destination"));
     }
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let source = ensure_ws(&db, &user, ws_id).await?;
     let target = ensure_ws(&db, &user, body.target_workspace_id).await?;
     if !workspace_manager(&db, &user, &source).await {
         return Ok(err(StatusCode::FORBIDDEN, "only a workspace manager can merge it"));
     }
-    let _gate = crate::access_gate().write().await;
     let ids = match db.workspace_doc_ids(ws_id).await {
         Ok(ids) => ids,
         Err(e) => {
@@ -1231,6 +1256,8 @@ async fn transfer_files(
     if body.items.is_empty() || body.items.len() > 5000 {
         return Ok(err(StatusCode::BAD_REQUEST, "select 1–5000 files"));
     }
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let target = ensure_ws(&db, &user, body.target_workspace_id).await?;
     let mut items = Vec::new(); // capped above; avoid user-sized reservations
     let mut snapshots = HashMap::new();
@@ -1271,7 +1298,6 @@ async fn transfer_files(
         }
         items.push((item.id, path));
     }
-    let _gate = crate::access_gate().write().await;
     if let Err(e) = flush_and_evict(&live, &db, &to_revoke).await {
         warn!("transfer flush: {e}");
         return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not save live edits"));
@@ -1301,12 +1327,13 @@ async fn delete_file_batch(
     if body.ids.is_empty() || body.ids.len() > 5000 {
         return Ok(err(StatusCode::BAD_REQUEST, "select 1–5000 files"));
     }
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     for id in &body.ids {
         if !file_allowed(&db, &user, *id).await {
             return Err(warp::reject::custom(Forbidden));
         }
     }
-    let _gate = crate::access_gate().write().await;
     match db.delete_files(&body.ids).await {
         Ok(ids) => {
             evict_documents(&live, &ids);
@@ -1831,11 +1858,12 @@ async fn archive_files(
 }
 
 async fn delete_file(file_id: i64, user: User, db: Database, live: LiveDocs, boards: LiveBoards) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     if !file_allowed(&db, &user, file_id).await {
         return Err(warp::reject::custom(Forbidden));
     }
     let path = db.get_file(file_id).await.ok().flatten().map(|f| f.path);
-    let _gate = crate::access_gate().write().await;
     match db.delete_file(file_id).await {
         Ok(doc_id) => {
             evict_documents(&live, &[doc_id]);
@@ -2645,7 +2673,8 @@ mod archive_tests {
         assert!(unpack_workspace_zip(pack(&[("../private.txt", b"leak")])).is_err());
         assert!(unpack_workspace_zip(pack(&[("/root.txt", b"leak")])).is_err());
         assert!(unpack_workspace_zip(pack(&[("safe\\..\\bad.txt", b"leak")])).is_err());
-        assert!(unpack_workspace_zip(pack(&[("a.txt", b"one"), ("a.txt", b"two")])).is_err());
+        // Distinct ZIP entry names can collide after separator normalization.
+        assert!(unpack_workspace_zip(pack(&[("a\\b.txt", b"one"), ("a/b.txt", b"two")])).is_err());
         assert!(unpack_workspace_zip(pack(&[("./docs/a.txt", b"safe")])).is_ok());
     }
 }
