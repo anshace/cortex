@@ -2589,3 +2589,57 @@ async fn get_chat_image(id: i64, user: User, db: Database) -> Result<impl Reply,
         None => Ok(err(StatusCode::NOT_FOUND, "no such image")),
     }
 }
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn workspace_zip_roundtrip_preserves_text_binary_and_empty_folders() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(&format!("sqlite://{}", tmp.path().display())).await.unwrap();
+        db.create_user_if_absent("owner", "Owner", "hash", "root", None).await.unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let org = db.create_org("Org", "org", 1).await.unwrap();
+        let group = db.create_group(org.id, "Group", owner.id, 1, "group").await.unwrap();
+        let ws = db.create_workspace(group.id, "Source", owner.id, 1).await.unwrap();
+        let other = db.create_workspace(group.id, "Destination", owner.id, 1).await.unwrap();
+        db.create_uploaded_file(ws.id, "docs/hello.txt", "doc-a", None, Some("Unicode ✓"), "Unicode ✓".as_bytes(), 1).await.unwrap();
+        db.create_uploaded_file(ws.id, "images/a.png", "doc-b", Some("image/png"), None, &[0, 2, 255], 1).await.unwrap();
+        db.create_file(ws.id, "empty/.keep", "doc-c", "text", None, 1).await.unwrap();
+        let live: LiveDocs = Default::default();
+        let bytes = make_archive(&db.list_files(ws.id).await.unwrap(), &db, &live).await.unwrap();
+        let files = unpack_workspace_zip(bytes::Bytes::from(bytes)).unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files.iter().find(|f| f.path == "docs/hello.txt").unwrap().bytes, "Unicode ✓".as_bytes());
+        assert_eq!(files.iter().find(|f| f.path == "images/a.png").unwrap().bytes, vec![0, 2, 255]);
+        assert!(files.iter().any(|f| f.path == "empty/.keep"));
+        let imported = db.import_files(other.id, &files, 1).await.unwrap();
+        assert_eq!(imported.len(), 3);
+        assert_eq!(db.load(&imported.iter().find(|f| f.path == "docs/hello.txt").unwrap().doc_id).await.unwrap().text, "Unicode ✓");
+        assert_eq!(db.load_blob(imported.iter().find(|f| f.path == "images/a.png").unwrap().id).await.unwrap().unwrap(), vec![0, 2, 255]);
+    }
+
+    #[test]
+    fn zip_import_rejects_traversal_and_duplicate_names() {
+        fn pack(entries: &[(&str, &[u8])]) -> bytes::Bytes {
+            let mut buf = Vec::new();
+            {
+                let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+                let options = zip::write::SimpleFileOptions::default();
+                for (name, data) in entries {
+                    zip.start_file(*name, options).unwrap();
+                    zip.write_all(data).unwrap();
+                }
+                zip.finish().unwrap();
+            }
+            bytes::Bytes::from(buf)
+        }
+        assert!(unpack_workspace_zip(pack(&[("../private.txt", b"leak")])).is_err());
+        assert!(unpack_workspace_zip(pack(&[("/root.txt", b"leak")])).is_err());
+        assert!(unpack_workspace_zip(pack(&[("safe\\..\\bad.txt", b"leak")])).is_err());
+        assert!(unpack_workspace_zip(pack(&[("a.txt", b"one"), ("a.txt", b"two")])).is_err());
+        assert!(unpack_workspace_zip(pack(&[("./docs/a.txt", b"safe")])).is_ok());
+    }
+}

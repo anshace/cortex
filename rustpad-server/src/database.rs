@@ -2828,6 +2828,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whole_instance_export_import_keeps_audit_and_forgets_sessions() {
+        let (_tmp, db) = test_database().await;
+        db.create_user_if_absent("owner", "Owner", "hash", "root", None).await.unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let org = db.create_org("Example", "example", 1).await.unwrap();
+        let group = db.create_group(org.id, "Team", owner.id, 1, "group").await.unwrap();
+        let ws = db.create_workspace(group.id, "Project", owner.id, 1).await.unwrap();
+        let file = db.create_uploaded_file(ws.id, "icon.png", "icon-doc", Some("image/png"), None, &[0, 255, 2], 1).await.unwrap();
+        db.audit(Some(org.id), Some(owner.id), "backup-test", Some("retained"), 1).await.unwrap();
+        db.create_session("old-login", owner.id, 999999).await.unwrap();
+        let snapshot = db.export_snapshot().await.unwrap();
+        assert!(snapshot.contains_key("audit"));
+        assert!(!snapshot.contains_key("session"));
+        db.delete_org(org.id).await.unwrap();
+        let data: Vec<(String, Vec<serde_json::Value>)> = super::Database::MIGRATE_TABLES.iter()
+            .map(|t| (t.to_string(), snapshot[t].as_array().unwrap().clone())).collect();
+        db.import_replace_all(&data).await.unwrap();
+        assert_eq!(db.load_blob(file.id).await.unwrap().unwrap(), vec![0, 255, 2]);
+        assert_eq!(db.get_workspace(ws.id).await.unwrap().unwrap().group_id, group.id);
+        assert_eq!(db.table_rows("audit").await.unwrap(), 1);
+        assert!(db.get_session_user("old-login", 1).await.unwrap().is_none());
+        assert_no_bad_foreign_keys(&db).await;
+    }
+
+    #[tokio::test]
     async fn migrations_remove_ai_schema() {
         let file = tempfile::NamedTempFile::new().expect("create temporary database");
         let uri = format!(
