@@ -22,3 +22,6 @@ archive/
 # Local tool state (SQLite DB + sessions) — never commit
 .freebuff/
 *.db-shm
+
+# Local UI mockup scratch (Vite scaffolds) — never commit
+REASERCH/
