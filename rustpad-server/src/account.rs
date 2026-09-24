@@ -45,6 +45,13 @@ fn manager_scope(user: &User) -> Result<Option<i64>, Rejection> {
     }
 }
 
+/// Refresh a role/org after acquiring the access gate. Request authentication
+/// may have run before a concurrent owner/admin changed the actor's scope.
+async fn current_actor(db: &Database, user: &User) -> Result<User, Rejection> {
+    db.admin_target(user.id).await.ok().flatten()
+        .ok_or_else(|| warp::reject::custom(Forbidden))
+}
+
 /// Read authorization first for a clear error; scoped DB writes check again
 /// inside their transaction so reassignment cannot race this check.
 async fn checked_target(db: &Database, actor: &User, target: i64) -> Result<User, Rejection> {
@@ -420,9 +427,10 @@ async fn disable_2fa(user: User, db: Database, body: DisableReq) -> Result<impl 
 async fn admin_reset_2fa(
     target: i64, user: User, db: Database, live: LiveDocs, boards: LiveBoards,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let other = checked_target(&db, &user, target).await?;
     let scope = manager_scope(&user)?;
-    let _gate = crate::access_gate().write().await;
     if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
     match db.admin_reset_credentials(target, None, scope).await {
         Ok(true) => {
@@ -435,6 +443,8 @@ async fn admin_reset_2fa(
 }
 
 async fn admin_list(user: User, db: Database) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     let scope = manager_scope(&user)?;
     let result = match scope {
         Some(org_id) => db.admin_list_users_in_org(org_id).await,
@@ -447,13 +457,7 @@ async fn admin_list(user: User, db: Database) -> Result<impl Reply, Rejection> {
 }
 
 async fn admin_create(user: User, db: Database, body: NewUserReq) -> Result<impl Reply, Rejection> {
-    let scope = manager_scope(&user)?;
-    if let Some(org_id) = scope {
-        if body.org_id.is_some_and(|id| id != org_id) {
-            return Ok(err(StatusCode::FORBIDDEN, "cannot create users in another org"));
-        }
-    }
-    let org_id = scope.or(body.org_id);
+    manager_scope(&user)?; // reject non-admins before hashing
     let email = body.email.trim().to_lowercase();
     let role = match body.role.as_str() {
         "user" | "admin" => body.role.as_str(),
@@ -469,6 +473,13 @@ async fn admin_create(user: User, db: Database, body: NewUserReq) -> Result<impl
         Ok(h) => h,
         Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not hash")),
     };
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
+    let scope = manager_scope(&user)?;
+    if scope.is_some_and(|id| body.org_id.is_some_and(|requested| requested != id)) {
+        return Ok(err(StatusCode::FORBIDDEN, "cannot create users in another org"));
+    }
+    let org_id = scope.or(body.org_id);
     match db.create_user_if_absent(&email, name, &hash, role, org_id).await {
         Ok(true) => {
             let _ = db.audit(org_id, Some(user.id), "admin_create_user", Some(&email), now_secs()).await;
@@ -482,8 +493,7 @@ async fn admin_create(user: User, db: Database, body: NewUserReq) -> Result<impl
 async fn admin_reset_password(
     target: i64, user: User, db: Database, live: LiveDocs, boards: LiveBoards, body: AdminPasswordReq,
 ) -> Result<impl Reply, Rejection> {
-    let other = checked_target(&db, &user, target).await?;
-    let scope = manager_scope(&user)?;
+    checked_target(&db, &user, target).await?; // reject before password hashing
     if body.password.len() < 8 {
         return Ok(err(StatusCode::BAD_REQUEST, "password must be at least 8 characters"));
     }
@@ -492,6 +502,9 @@ async fn admin_reset_password(
         Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not hash")),
     };
     let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
+    let other = checked_target(&db, &user, target).await?;
+    let scope = manager_scope(&user)?;
     if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
     match db.admin_reset_credentials(target, Some(&hash), scope).await {
         Ok(true) => {
@@ -506,7 +519,7 @@ async fn admin_reset_password(
 async fn admin_update_user(
     target: i64, user: User, db: Database, live: LiveDocs, boards: LiveBoards, body: AdminUserUpdate,
 ) -> Result<impl Reply, Rejection> {
-    let other = checked_target(&db, &user, target).await?;
+    checked_target(&db, &user, target).await?;
     let scope = manager_scope(&user)?;
     if scope.is_some() && body.org_id.is_some() {
         return Ok(err(StatusCode::FORBIDDEN, "only the owner can assign orgs"));
@@ -522,13 +535,16 @@ async fn admin_update_user(
     if email.as_deref().is_some_and(|value| value.is_empty() || value.len() > 120 || value.chars().any(char::is_whitespace)) {
         return Ok(err(StatusCode::BAD_REQUEST, "username must be 1–120 characters with no spaces"));
     }
-    let _gate = if body.role.is_some() || body.org_id.is_some() || email.is_some() {
-        let guard = crate::access_gate().write().await;
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
+    let other = checked_target(&db, &user, target).await?;
+    let scope = manager_scope(&user)?;
+    if scope.is_some() && body.org_id.is_some() {
+        return Ok(err(StatusCode::FORBIDDEN, "only the owner can assign orgs"));
+    }
+    if body.role.is_some() || body.org_id.is_some() || email.is_some() {
         if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
-        Some(guard)
-    } else {
-        None
-    };
+    }
     match db.admin_update_user(target, email.as_deref(), name, body.role.as_deref(), body.org_id, scope).await {
         Ok(true) => {
             let _ = db.audit(other.org_id, Some(user.id), "admin_update_user", Some(&other.email), now_secs()).await;
@@ -542,9 +558,10 @@ async fn admin_update_user(
 async fn admin_delete(
     target: i64, user: User, db: Database, live: LiveDocs, boards: LiveBoards,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     let other = checked_target(&db, &user, target).await?;
     let scope = manager_scope(&user)?;
-    let _gate = crate::access_gate().write().await;
     if let Err(response) = disconnect_org(&db, &live, &boards, other.org_id).await { return Ok(response); }
     let ids = match db.admin_delete_user(target, scope).await {
         Ok(ids) => ids,
