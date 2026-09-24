@@ -269,7 +269,7 @@ export async function downloadFile(file: FileRow): Promise<void> {
   const res = await fetch(`/api/files/${file.id}/download`, {
     credentials: "include",
   });
-  if (!res.ok) throw new Error("download failed");
+  if (!res.ok) await json(res);
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -631,7 +631,7 @@ export async function downloadChatAttachment(
   name: string,
 ): Promise<void> {
   const res = await fetch(url, { credentials: "include" });
-  if (!res.ok) throw new Error("download failed");
+  if (!res.ok) await json(res);
   const blob = await res.blob();
   const objectUrl = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -640,7 +640,7 @@ export async function downloadChatAttachment(
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(objectUrl);
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 30_000);
 }
 
 // ----- users: owner across orgs, org admins within their own org -----
