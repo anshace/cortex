@@ -29,7 +29,9 @@ const HKDF_INFO: &[u8] = b"cortex-payload-v1";
 /// An encrypted payload: base64 nonce + base64 ciphertext(||GCM tag).
 #[derive(Serialize, Deserialize)]
 pub struct Envelope {
+    /// Base64 AES-GCM nonce.
     pub iv: String,
+    /// Base64 ciphertext with the trailing GCM tag.
     pub ct: String,
 }
 

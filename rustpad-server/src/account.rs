@@ -9,6 +9,7 @@ use warp::{http::StatusCode, reply::Reply, Filter, Rejection};
 
 use crate::auth::{
     hash_password, provision_totp, verify_password, verify_totp, with_auth, Forbidden,
+    SESSION_COOKIE,
 };
 use crate::database::{Database, User};
 use crate::{evict_documents, evict_org_boards, flush_and_evict, LiveBoards, LiveDocs};
@@ -174,6 +175,7 @@ pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl F
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
         .and(warp::body::json())
+        .and(warp::cookie::optional(SESSION_COOKIE))
         .and_then(change_password);
 
     let tfa_setup = warp::path!("2fa" / "setup")
@@ -346,6 +348,7 @@ async fn change_password(
     user: User,
     db: Database,
     body: PasswordReq,
+    session: Option<String>,
 ) -> Result<impl Reply, Rejection> {
     if !verify_password(&body.current, &user.password_hash) {
         return Ok(err(
@@ -363,7 +366,11 @@ async fn change_password(
         Ok(h) => h,
         Err(_) => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not hash")),
     };
-    if db.update_password(user.id, &hash).await.is_err() {
+    if db
+        .update_password(user.id, &hash, session.as_deref())
+        .await
+        .is_err()
+    {
         return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not update"));
     }
     Ok(warp::reply::json(&json!({ "ok": true })).into_response())
@@ -613,8 +620,11 @@ async fn org_rename(
     if name.is_empty() {
         return Ok(err(StatusCode::BAD_REQUEST, "name cannot be empty"));
     }
-    let _ = db.rename_org(target, name).await;
-    Ok(warp::reply::json(&json!({ "ok": true })).into_response())
+    match db.rename_org(target, name).await {
+        Ok(true) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
+        Ok(false) => Ok(err(StatusCode::NOT_FOUND, "no such org")),
+        Err(_) => Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not rename org")),
+    }
 }
 
 async fn org_delete(
@@ -720,5 +730,30 @@ mod account_routes_tests {
             .reply(&api).await;
         assert_eq!(created.status(), StatusCode::OK);
         assert_eq!(db.get_user_by_email("colleague").await.unwrap().unwrap().org_id, Some(first.id));
+    }
+
+    #[tokio::test]
+    async fn changing_your_password_drops_every_other_session() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(&format!("sqlite://{}", tmp.path().display())).await.unwrap();
+        db.create_user_if_absent("owner", "Owner", "hash", "root", None).await.unwrap();
+        let org = db.create_org("Org", "org", 1).await.unwrap();
+        let hash = hash_password("old-password-123").unwrap();
+        db.create_user_if_absent("member", "Member", &hash, "user", Some(org.id)).await.unwrap();
+        let member = db.get_user_by_email("member").await.unwrap().unwrap();
+        // Two live sessions: the one making the request and one to be revoked.
+        db.create_session("current", member.id, now_secs() + 3600).await.unwrap();
+        db.create_session("elsewhere", member.id, now_secs() + 3600).await.unwrap();
+        let live: LiveDocs = Default::default();
+        let boards: LiveBoards = Default::default();
+        let api = routes(db.clone(), live, boards).recover(crate::auth::handle_rejection);
+
+        let changed = warp::test::request().method("POST").path("/profile/password")
+            .header("cookie", "authpad_session=current")
+            .json(&json!({ "current": "old-password-123", "new": "new-password-456" }))
+            .reply(&api).await;
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert!(db.get_session_user("current", now_secs()).await.unwrap().is_some());
+        assert!(db.get_session_user("elsewhere", now_secs()).await.unwrap().is_none());
     }
 }

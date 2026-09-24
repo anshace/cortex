@@ -435,7 +435,18 @@ async fn socket_handler(id: String, ws: Ws, state: ServerState) -> Result<impl R
         Entry::Occupied(e) => e.into_ref(),
         Entry::Vacant(e) => {
             let rustpad = Arc::new(match &state.database {
-                Some(db) => db.load(&id).await.map(Rustpad::from).unwrap_or_default(),
+                Some(db) => match db.load(&id).await {
+                    Ok(document) => Rustpad::from(document),
+                    // No row yet means a genuinely new file. Any *other* load
+                    // failure must not be mistaken for one, or the persister
+                    // would flush edits made against a blank document over the
+                    // real content once the database answers again.
+                    Err(err) if Database::is_missing_document(&err) => Rustpad::default(),
+                    Err(err) => {
+                        error!("socket {id}: could not load document: {err}");
+                        return Err(warp::reject::custom(CustomReject(err)));
+                    }
+                },
                 None => Rustpad::default(),
             });
             let task = state.database.as_ref().map(|db| {

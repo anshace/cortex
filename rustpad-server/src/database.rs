@@ -455,6 +455,16 @@ impl Database {
             .map_err(|e| e.into())
     }
 
+    /// True when a [`Self::load`] failure means the document has no row yet, as
+    /// opposed to the database being temporarily unavailable. Only the first is
+    /// safe to treat as an empty document.
+    pub fn is_missing_document(err: &anyhow::Error) -> bool {
+        matches!(
+            err.downcast_ref::<sqlx::Error>(),
+            Some(sqlx::Error::RowNotFound)
+        )
+    }
+
     /// Write text directly, bypassing OT. Never recreate a deleted document:
     /// the file must still exist, and creation seeds the row in the same tx.
     pub async fn store_document_text(&self, document_id: &str, text: &str) -> Result<()> {
@@ -572,13 +582,28 @@ impl Database {
         Ok(true)
     }
 
-    /// Update a user's password hash.
-    pub async fn update_password(&self, user_id: i64, password_hash: &str) -> Result<()> {
+    /// Update a user's password hash and revoke their other sessions. Only the
+    /// session that just proved the old password survives, so a stolen cookie
+    /// stops working the moment the owner changes their password. `None` keeps
+    /// nothing and signs the user out everywhere.
+    pub async fn update_password(
+        &self,
+        user_id: i64,
+        password_hash: &str,
+        keep_token: Option<&str>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(r#"UPDATE users SET password_hash = $1 WHERE id = $2"#)
             .bind(password_hash)
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query(r#"DELETE FROM session WHERE user_id = $1 AND token IS NOT $2"#)
+            .bind(user_id)
+            .bind(keep_token)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -890,13 +915,13 @@ impl Database {
     }
 
     /// Rename an org.
-    pub async fn rename_org(&self, id: i64, name: &str) -> Result<()> {
-        sqlx::query(r#"UPDATE org SET name = $1 WHERE id = $2"#)
+    pub async fn rename_org(&self, id: i64, name: &str) -> Result<bool> {
+        let r = sqlx::query(r#"UPDATE org SET name = $1 WHERE id = $2"#)
             .bind(name)
             .bind(id)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(r.rows_affected() == 1)
     }
 
     /// Remove all org data and unassign its users in one transaction. Returns
@@ -976,6 +1001,7 @@ impl Database {
         now: i64,
         scope: &str,
     ) -> Result<Group> {
+        let mut tx = self.pool.begin().await?;
         let row: (i64,) = sqlx::query_as(
             r#"INSERT INTO groups (org_id, name, scope, created_by, created_at)
                VALUES ($1, $2, $3, $4, $5) RETURNING id"#,
@@ -985,11 +1011,21 @@ impl Database {
         .bind(scope)
         .bind(created_by)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        // Without this row the creator could not see the group they just made,
+        // so it is part of the creation, not a follow-up best effort.
         if scope == "group" {
-            let _ = self.add_group_member(row.0, created_by, "owner").await;
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO group_member (group_id, user_id, role)
+                   VALUES ($1, $2, 'owner')"#,
+            )
+            .bind(row.0)
+            .bind(created_by)
+            .execute(&mut *tx)
+            .await?;
         }
+        tx.commit().await?;
         Ok(Group {
             id: row.0,
             org_id,
@@ -2607,7 +2643,7 @@ impl Database {
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
-                sql.push_str(")");
+                sql.push(')');
                 let mut q = sqlx::query(&sql);
                 for name in &names {
                     let v = map
@@ -2672,6 +2708,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn creating_a_group_enrolls_its_creator() {
+        let (_tmp, db) = test_database().await;
+        db.create_user_if_absent("owner", "Owner", "test", "root", None).await.unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let org = db.create_org("Org", "org", 1).await.unwrap();
+        let group = db.create_group(org.id, "Team", owner.id, 1, "group").await.unwrap();
+        // Without this membership the creator cannot see the group they made.
+        assert!(db.is_group_member(group.id, owner.id).await.unwrap());
+        assert_eq!(db.group_member_ids(group.id).await.unwrap(), vec![owner.id]);
     }
 
     #[tokio::test]

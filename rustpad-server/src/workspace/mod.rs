@@ -264,8 +264,6 @@ struct OrgQuery {
 #[derive(Deserialize)]
 struct WsUpload {
     workspace_id: i64,
-    #[serde(default)]
-    org: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1892,6 +1890,10 @@ async fn put_file_text(
     db: Database,
     live: LiveDocs,
 ) -> Result<impl Reply, Rejection> {
+    // The gate keeps a collaborative session from opening between the live
+    // check below and the overwrite, which would lose that editor's work.
+    let _gate = crate::access_gate().write().await;
+    let user = current_actor(&db, &user).await?;
     if !file_allowed(&db, &user, file_id).await {
         return Err(warp::reject::custom(Forbidden));
     }

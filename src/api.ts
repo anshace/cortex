@@ -10,8 +10,8 @@ export type Group = {
   id: number;
   org_id: number;
   name: string;
-  // Visibility layer: just the creator / the group's members.
-  scope: "group" | "personal";
+  // Visibility layer: the whole org / the group's members / just the creator.
+  scope: "org" | "group" | "personal";
   created_by: number;
   // Real member count (group scope only) — populated by the org endpoint.
   member_count?: number;
@@ -385,8 +385,20 @@ export async function saveFileBlob(
 export async function deleteFile(id: number): Promise<void> {
   await json(await fetch(`/api/files/${id}`, opts("DELETE")));
 }
+// The server caps each batch request at 5000 ids; larger folders are split
+// into sequential batches so a whole-folder action still completes.
+const BATCH_LIMIT = 5000;
+function batches<T>(items: T[]): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += BATCH_LIMIT) {
+    out.push(items.slice(i, i + BATCH_LIMIT));
+  }
+  return out.length ? out : [[]];
+}
 export async function deleteFiles(ids: number[]): Promise<void> {
-  await json(await fetch("/api/files/delete-batch", opts("POST", { ids })));
+  for (const batch of batches(ids)) {
+    await json(await fetch("/api/files/delete-batch", opts("POST", { ids: batch })));
+  }
 }
 export type TransferItem = { id: number; path: string };
 export async function transferFiles(
@@ -395,17 +407,22 @@ export async function transferFiles(
   mode: "copy" | "move",
   onConflict: "error" | "rename" = "error",
 ): Promise<{ files: FileRow[] }> {
-  return json(
-    await fetch(
-      "/api/files/transfer",
-      opts("POST", {
-        target_workspace_id: targetWorkspaceId,
-        items,
-        mode,
-        on_conflict: onConflict,
-      }),
-    ),
-  );
+  const files: FileRow[] = [];
+  for (const batch of batches(items)) {
+    const result = await json<{ files: FileRow[] }>(
+      await fetch(
+        "/api/files/transfer",
+        opts("POST", {
+          target_workspace_id: targetWorkspaceId,
+          items: batch,
+          mode,
+          on_conflict: onConflict,
+        }),
+      ),
+    );
+    files.push(...result.files);
+  }
+  return { files };
 }
 
 export async function moveFile(id: number, path: string): Promise<void> {

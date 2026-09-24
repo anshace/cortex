@@ -21,3 +21,4 @@ archive/
 
 # Local tool state (SQLite DB + sessions) — never commit
 .freebuff/
+*.db-shm

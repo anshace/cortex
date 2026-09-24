@@ -20,7 +20,7 @@ use warp::{http::StatusCode, reject::Reject, reply::Reply, Filter, Rejection};
 use crate::database::{Database, User};
 
 /// Name of the HttpOnly session cookie.
-const SESSION_COOKIE: &str = "authpad_session";
+pub(crate) const SESSION_COOKIE: &str = "authpad_session";
 /// Session lifetime in seconds (7 days).
 const SESSION_MAX_AGE: i64 = 7 * 24 * 3600;
 /// The owner is the master key — its sessions live 12h, not 7 days, to shrink

@@ -94,14 +94,16 @@ function OwnerApp({
     });
 
   const load = useCallback(() => {
+    // A failed refresh must say so: an empty grid otherwise looks like an
+    // empty instance.
     api
       .adminListOrgs()
       .then((r) => setOrgs(r.orgs))
-      .catch(() => {});
+      .catch((e) => fail(e));
     api
       .adminListUsers()
       .then((r) => setUsers(r.users))
-      .catch(() => {});
+      .catch((e) => fail(e));
   }, []);
   useEffect(load, [load]);
 
@@ -590,9 +592,17 @@ function OwnerApp({
                                   const username = window.prompt(`Login username for ${u.email}:`, u.email);
                                   if (username === null) return;
                                   const name = window.prompt(`Display name for ${username}:`, u.name);
-                                  if (name !== null) run(
-                                    () => api.adminUpdateUser(u.id, { email: username, name }),
-                                    "Account updated; user signed out",
+                                  if (name === null) return;
+                                  // Sending `email` at all revokes the user's
+                                  // sessions, so only include it when it changed.
+                                  const trimmed = username.trim().toLowerCase();
+                                  const patch: { name: string; email?: string } = { name };
+                                  if (trimmed && trimmed !== u.email) patch.email = trimmed;
+                                  run(
+                                    () => api.adminUpdateUser(u.id, patch),
+                                    patch.email
+                                      ? "Account updated; user signed out"
+                                      : "Account updated",
                                   );
                                 }}
                               />

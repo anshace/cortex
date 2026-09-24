@@ -46,7 +46,13 @@ export type ExplorerDrag = {
   kind: "cortex-files";
   sourceWsId: number;
   entries: { id: number; rel: string }[];
+  /** Set when the drag carries a whole folder: the folder's own path, so a
+   *  drop inside that same folder can be rejected instead of self-nesting it. */
+  rootPath?: string;
 };
+// A drag payload is split into server-sized batches by the API client, so
+// this only has to bound absurd JSON in the data transfer, not one request.
+const MAX_DRAG_ENTRIES = 20000;
 export function parseExplorerDrag(raw: string): ExplorerDrag | null {
   try {
     const v = JSON.parse(raw) as ExplorerDrag;
@@ -55,7 +61,8 @@ export function parseExplorerDrag(raw: string): ExplorerDrag | null {
       !Number.isSafeInteger(v.sourceWsId) ||
       !Array.isArray(v.entries) ||
       !v.entries.length ||
-      v.entries.length > 1000 ||
+      v.entries.length > MAX_DRAG_ENTRIES ||
+      (v.rootPath !== undefined && typeof v.rootPath !== "string") ||
       !v.entries.every(
         (e) => Number.isSafeInteger(e.id) && typeof e.rel === "string",
       )
@@ -299,11 +306,12 @@ const FileTree = memo(
     // A hard delete, move or merge can remove selected IDs in the current
     // workspace. Don't leave a phantom selection in the context menu.
     useEffect(() => {
+      if (lastClick.current != null && !byId.has(lastClick.current)) {
+        lastClick.current = null;
+      }
       setSelected((prev) => {
         const remaining = Array.from(prev).filter((id) => byId.has(id));
-        if (remaining.length === prev.size) return prev;
-        if (lastClick.current != null && !byId.has(lastClick.current)) lastClick.current = null;
-        return new Set(remaining);
+        return remaining.length === prev.size ? prev : new Set(remaining);
       });
     }, [byId]);
 
@@ -685,6 +693,16 @@ const FileTree = memo(
     function drop(targetPath: string, raw: string, copy = false) {
       const payload = parseExplorerDrag(raw);
       if (!payload) return;
+      if (payload.rootPath) {
+        const root = payload.rootPath;
+        // Dropping a folder onto itself or into anything inside it would nest
+        // the folder under its own path.
+        if (targetPath === root || targetPath.startsWith(`${root}/`)) return;
+        const landing = targetPath
+          ? `${targetPath}/${root.split("/").pop()}`
+          : root.split("/").pop()!;
+        if (landing === root) return;
+      }
       const items = payload.entries.map(({ id, rel }) => ({
         id,
         path: targetPath ? `${targetPath}/${rel}` : rel,
@@ -1020,6 +1038,7 @@ function TreeItem(
               const payload: ExplorerDrag = {
                 kind: "cortex-files",
                 sourceWsId: props.workspaceId,
+                rootPath: folderPath,
                 entries: props.filesInFolder(folderPath).map((f) => ({
                   id: f.id,
                   rel: `${baseName(folderPath)}/${f.path.slice(folderPath.length + 1)}`,

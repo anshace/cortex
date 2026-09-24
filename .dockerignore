@@ -17,3 +17,4 @@ seed_users.json
 *.db
 *.db-journal
 *.db-wal
+*.db-shm

@@ -1128,6 +1128,8 @@ function OrgMembersPanel({ me }: { me: Me }) {
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(() => {
+    // Braced body: an arrow returning the promise would make useEffect see a
+    // non-function return value and warn in dev.
     api.adminListUsers().then((r) => setMembers(r.users)).catch((e) => fail(toast, e));
   }, [toast]);
   useEffect(refresh, [refresh]);

@@ -7,7 +7,7 @@ use common::*;
 use operational_transform::OperationSeq;
 use rustpad_server::{
     database::{Database, PersistedDocument},
-    server, ServerConfig,
+    server,
 };
 use serde_json::json;
 use tempfile::NamedTempFile;

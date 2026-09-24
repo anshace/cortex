@@ -385,7 +385,7 @@ impl Rustpad {
         if self.killed() {
             bail!("document is closed");
         }
-        for (_, data) in state.cursors.iter_mut() {
+        for data in state.cursors.values_mut() {
             for cursor in data.cursors.iter_mut() {
                 *cursor = transform_index(&operation, *cursor);
             }
