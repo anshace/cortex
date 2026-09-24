@@ -1962,7 +1962,7 @@ impl Database {
         .await?
         .rows_affected();
         let pruned_audit = sqlx::query("DELETE FROM audit WHERE created_at < $1")
-            .bind(now - retention_days.max(1) * 86400)
+            .bind(now - retention_days.clamp(1, 36_500) * 86400)
             .execute(&mut tx)
             .await?
             .rows_affected();

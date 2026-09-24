@@ -1225,6 +1225,10 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
   async function pasteIntoWorkspace(wsId: number) {
     if (!fileClipboard) return;
     const { mode, items } = fileClipboard;
+    if (mode === "cut" && items.every((it) => it.file.workspace_id === wsId && it.file.path === it.rel)) {
+      setFileClipboard(null); // cutting and pasting in place is a no-op
+      return;
+    }
     await transferInto(
       wsId,
       mode === "cut" ? "move" : "copy",
@@ -1855,7 +1859,9 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
                   }
                 />
                 <Box px={2}>
+                  {/* Selection and context menus belong to one workspace. */}
                   <FileTree
+                    key={activeWs.id}
                     ref={treeRef}
                     files={allFiles}
                     workspaceId={activeWs.id}

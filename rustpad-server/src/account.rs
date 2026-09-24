@@ -645,6 +645,23 @@ mod account_routes_tests {
     use warp::http::StatusCode;
 
     #[tokio::test]
+    async fn admin_create_rejects_an_actor_demoted_after_authentication() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(&format!("sqlite://{}", tmp.path().display())).await.unwrap();
+        db.create_user_if_absent("owner", "Owner", "hash", "root", None).await.unwrap();
+        let org = db.create_org("Org", "org", 1).await.unwrap();
+        db.create_user_if_absent("admin", "Admin", "hash", "admin", Some(org.id)).await.unwrap();
+        let stale_actor = db.get_user_by_email("admin").await.unwrap().unwrap();
+        db.admin_update_user(stale_actor.id, None, None, Some("user"), None, None).await.unwrap();
+        let result = admin_create(stale_actor, db.clone(), NewUserReq {
+            email: "should-not-exist".into(), password: "password123".into(),
+            name: "Unwanted".into(), role: "user".into(), org_id: None,
+        }).await;
+        assert!(result.err().unwrap().find::<Forbidden>().is_some());
+        assert!(db.get_user_by_email("should-not-exist").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn org_admin_endpoints_are_scoped_and_owner_sees_all() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db = Database::new(&format!("sqlite://{}", tmp.path().display())).await.unwrap();

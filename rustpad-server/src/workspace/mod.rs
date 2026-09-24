@@ -835,23 +835,18 @@ async fn get_org(user: User, db: Database, q: OrgQuery) -> Result<impl Reply, Re
     let org_id = acting_org(&user, &q);
     let (org, groups, workspaces, members) = match org_id {
         Some(oid) => {
-            // Every person gets their own private "Personal" group — create it
-            // on first access so each user always has a personal space.
-            let has_personal = if is_owner || user.role == "admin" {
-                db.list_groups(oid).await.unwrap_or_default()
-            } else {
-                db.list_groups_for_user(oid, user.id)
-                    .await
-                    .unwrap_or_default()
-            }
-            .iter()
-            .any(|g| g.scope == "personal" && g.created_by == user.id);
-            // A root lookup can enumerate every org for transfer targets. Do
-            // not create an unused personal group in each org as a side effect.
-            if !is_owner && !has_personal {
-                let _ = db
-                    .create_group(oid, "Personal", user.id, now_secs(), "personal")
-                    .await;
+            // Give org members their own Personal group on first access. Root
+            // enumerates orgs for transfer targets; don't create an unused
+            // private group in every org just by inspecting it.
+            if !is_owner {
+                let existing = if user.role == "admin" {
+                    db.list_groups(oid).await.unwrap_or_default()
+                } else {
+                    db.list_groups_for_user(oid, user.id).await.unwrap_or_default()
+                };
+                if !existing.iter().any(|g| g.scope == "personal" && g.created_by == user.id) {
+                    let _ = db.create_group(oid, "Personal", user.id, now_secs(), "personal").await;
+                }
             }
             let groups = if is_owner || user.role == "admin" {
                 db.list_groups(oid).await.unwrap_or_default()

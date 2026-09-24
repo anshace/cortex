@@ -296,6 +296,17 @@ const FileTree = memo(
       lastClick.current = null;
     }, [props.workspaceId]);
 
+    // A hard delete, move or merge can remove selected IDs in the current
+    // workspace. Don't leave a phantom selection in the context menu.
+    useEffect(() => {
+      setSelected((prev) => {
+        const remaining = Array.from(prev).filter((id) => byId.has(id));
+        if (remaining.length === prev.size) return prev;
+        if (lastClick.current != null && !byId.has(lastClick.current)) lastClick.current = null;
+        return new Set(remaining);
+      });
+    }, [byId]);
+
     useImperativeHandle(ref, () => ({
       startCreate: (kind: "file" | "folder" | "board") => {
         setEditing(null);
