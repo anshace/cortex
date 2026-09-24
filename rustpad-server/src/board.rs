@@ -1,14 +1,14 @@
 //! Ephemeral presence and pointer relay for collaborative whiteboards.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use futures::prelude::*;
 use log::{info, warn};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use warp::ws::{Message, WebSocket};
 
 use crate::crypto;
@@ -77,22 +77,34 @@ pub struct BoardHub {
     state: RwLock<State>,
     next_id: AtomicU64,
     updates: broadcast::Sender<ServerMsg>,
+    closed: AtomicBool,
+    stop: watch::Sender<bool>,
 }
 
 impl Default for BoardHub {
     fn default() -> Self {
         let (updates, _) = broadcast::channel(128);
+        let (stop, _) = watch::channel(false);
         Self {
             state: RwLock::new(State::default()),
             next_id: AtomicU64::new(1),
             updates,
+            closed: AtomicBool::new(false),
+            stop,
         }
     }
 }
 
 impl BoardHub {
+    /// Close every connected board socket after deletion or a permission change.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let _ = self.stop.send(true);
+    }
+
     /// Relay one authenticated browser connection until it disconnects.
     pub async fn on_connection(&self, socket: WebSocket, name: String) {
+        if self.closed.load(Ordering::SeqCst) { return; }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         info!("board connection! id = {}", id);
         if let Err(error) = self.handle_connection(id, socket, name).await {
@@ -110,16 +122,21 @@ impl BoardHub {
         mut socket: WebSocket,
         name: String,
     ) -> Result<()> {
+        let mut stop = self.stop.subscribe();
+        if *stop.borrow() { return Ok(()); }
         let epk = loop {
-            match socket.next().await {
-                Some(Ok(message)) if message.is_text() => {
-                    match serde_json::from_str::<EpkFrame>(message.to_str().unwrap_or("")) {
-                        Ok(frame) => break frame.epk,
-                        Err(_) => return Ok(()),
+            tokio::select! {
+                _ = stop.changed() => return Ok(()),
+                message = socket.next() => match message {
+                    Some(Ok(message)) if message.is_text() => {
+                        match serde_json::from_str::<EpkFrame>(message.to_str().unwrap_or("")) {
+                            Ok(frame) => break frame.epk,
+                            Err(_) => return Ok(()),
+                        }
                     }
+                    Some(Ok(_)) => continue,
+                    _ => return Ok(()),
                 }
-                Some(Ok(_)) => continue,
-                _ => return Ok(()),
             }
         };
         if crypto::keys().seal(&epk, b"ping").is_none() {
@@ -143,6 +160,7 @@ impl BoardHub {
 
         loop {
             tokio::select! {
+                _ = stop.changed() => break,
                 update = updates.recv() => match update {
                     Ok(message) => socket.send(encrypted(&epk, message)).await?,
                     Err(broadcast::error::RecvError::Lagged(_)) => {

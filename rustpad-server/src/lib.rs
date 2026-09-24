@@ -32,10 +32,36 @@ pub mod workspace;
 pub(crate) struct Document {
     last_accessed: Instant,
     rustpad: Arc<Rustpad>,
+    persister: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Shared live editor registry. Dropping a cached document closes its sockets.
 pub(crate) type LiveDocs = Arc<DashMap<String, Document>>;
+/// Connected whiteboard presence relays, keyed by file ID.
+pub(crate) type LiveBoards = Arc<DashMap<i64, Arc<BoardHub>>>;
+
+pub(crate) fn evict_boards(boards: &LiveBoards, ids: &[i64]) {
+    for id in ids {
+        if let Some((_, hub)) = boards.remove(id) { hub.close(); }
+    }
+}
+
+pub(crate) async fn evict_org_boards(
+    boards: &LiveBoards, db: &Database, org_id: i64,
+) -> anyhow::Result<()> {
+    let ids: Vec<i64> = boards.iter().map(|entry| *entry.key()).collect();
+    let mut owned = Vec::new();
+    for id in ids {
+        if db.file_org(id).await? == Some(org_id) { owned.push(id); }
+    }
+    evict_boards(boards, &owned);
+    Ok(())
+}
+
+pub(crate) fn evict_all_boards(boards: &LiveBoards) {
+    let ids: Vec<i64> = boards.iter().map(|entry| *entry.key()).collect();
+    evict_boards(boards, &ids);
+}
 
 pub(crate) fn evict_documents(live: &LiveDocs, ids: &[String]) {
     for id in ids {
@@ -43,9 +69,31 @@ pub(crate) fn evict_documents(live: &LiveDocs, ids: &[String]) {
     }
 }
 
-pub(crate) fn evict_all_documents(live: &LiveDocs) {
-    let ids: Vec<String> = live.iter().map(|item| item.key().clone()).collect();
-    evict_documents(live, &ids);
+/// Before moving a document to a different access scope, stop its persister,
+/// wait for any in-flight write, then save its final OT snapshot. If this fails
+/// the caller must abort the move (the client can reconnect to the old scope).
+pub(crate) async fn flush_and_evict(
+    live: &LiveDocs,
+    db: &Database,
+    ids: &[String],
+) -> anyhow::Result<()> {
+    let mut stopped = Vec::new();
+    for id in ids {
+        if let Some((_, entry)) = live.remove(id) {
+            entry.rustpad.kill();
+            stopped.push((id.clone(), entry));
+        }
+    }
+    // Wait together, not one sleep interval per document; a persister already
+    // writing will finish before the final snapshot below is written.
+    let tasks: Vec<_> = stopped.iter_mut().filter_map(|(_, doc)| doc.persister.take()).collect();
+    for result in futures::future::join_all(tasks).await {
+        result?;
+    }
+    for (id, doc) in &stopped {
+        db.store(id, &doc.rustpad.snapshot()).await?;
+    }
+    Ok(())
 }
 
 /// Prefer the current OT snapshot over the last periodic DB flush for
@@ -62,10 +110,11 @@ pub(crate) async fn current_document(
 }
 
 impl Document {
-    fn new(rustpad: Arc<Rustpad>) -> Self {
+    fn new(rustpad: Arc<Rustpad>, persister: Option<tokio::task::JoinHandle<()>>) -> Self {
         Self {
             last_accessed: Instant::now(),
             rustpad,
+            persister,
         }
     }
 }
@@ -73,6 +122,9 @@ impl Document {
 impl Drop for Document {
     fn drop(&mut self) {
         self.rustpad.kill();
+        if let Some(task) = self.persister.take() {
+            task.abort();
+        }
     }
 }
 
@@ -88,7 +140,7 @@ struct ServerState {
     /// Concurrent map storing in-memory documents.
     documents: Arc<DashMap<String, Document>>,
     /// Ephemeral presence relays keyed by whiteboard file id.
-    boards: Arc<DashMap<i64, Arc<BoardHub>>>,
+    boards: LiveBoards,
     /// Connection to the database pool, if persistence is enabled.
     database: Option<Database>,
 }
@@ -196,14 +248,16 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
     tokio::spawn(cleaner(state.clone(), config.expiry_days));
     tokio::spawn(scheduled_maintenance(db.clone()));
 
+    let live = state.documents.clone();
+    let boards = state.boards.clone();
     let state_filter = warp::any().map(move || state.clone());
 
     // Public auth endpoints (login / logout / me).
     let auth_routes = auth::routes(db.clone());
     // Handlers share the live editor registry so hard deletes can disconnect
     // editors and downloads/copies can read unsaved OT snapshots.
-    let workspace_routes = workspace::routes(db.clone(), state.documents.clone());
-    let account_routes = account::routes(db.clone(), state.documents.clone());
+    let workspace_routes = workspace::routes(db.clone(), live.clone(), boards.clone());
+    let account_routes = account::routes(db.clone(), live, boards);
 
     // A plain db filter used by the document access checks below.
     let db_for_docs = db.clone();
@@ -365,10 +419,10 @@ async fn socket_handler(id: String, ws: Ws, state: ServerState) -> Result<impl R
                 Some(db) => db.load(&id).await.map(Rustpad::from).unwrap_or_default(),
                 None => Rustpad::default(),
             });
-            if let Some(db) = &state.database {
-                tokio::spawn(persister(id, Arc::clone(&rustpad), db.clone()));
-            }
-            e.insert(Document::new(rustpad))
+            let task = state.database.as_ref().map(|db| {
+                tokio::spawn(persister(id, Arc::clone(&rustpad), db.clone()))
+            });
+            e.insert(Document::new(rustpad, task))
         }
     };
 
@@ -449,13 +503,21 @@ async fn cleaner(state: ServerState, expiry_days: u32) {
         time::sleep(HOUR).await;
         let mut keys = Vec::new();
         for entry in &*state.documents {
-            if entry.last_accessed.elapsed() > HOUR * 24 * expiry_days {
+            if entry.last_accessed.elapsed() > HOUR * 24 * expiry_days
+                && !entry.rustpad.has_users()
+            {
                 keys.push(entry.key().clone());
             }
         }
-        info!("cleaner removing keys: {:?}", keys);
-        for key in keys {
-            state.documents.remove(&key);
+        if !keys.is_empty() {
+            info!("cleaner evicting {} idle documents", keys.len());
+            if let Some(db) = &state.database {
+                if let Err(e) = flush_and_evict(&state.documents, db, &keys).await {
+                    error!("when flushing idle documents: {e}");
+                }
+            } else {
+                evict_documents(&state.documents, &keys);
+            }
         }
     }
 }

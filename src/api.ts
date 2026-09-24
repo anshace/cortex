@@ -210,6 +210,25 @@ export async function renameWorkspace(id: number, name: string): Promise<void> {
 export async function deleteWorkspace(id: number): Promise<void> {
   await json(await fetch(`/api/workspaces/${id}`, opts("DELETE")));
 }
+export async function moveWorkspaceToGroup(
+  id: number,
+  groupId: number,
+): Promise<{ workspace: Workspace }> {
+  return json(
+    await fetch(`/api/workspaces/${id}/group`, opts("PUT", { group_id: groupId })),
+  );
+}
+export async function mergeWorkspaces(
+  sourceId: number,
+  targetId: number,
+): Promise<{ ok: boolean; moved: number }> {
+  return json(
+    await fetch(
+      `/api/workspaces/${sourceId}/merge`,
+      opts("POST", { target_workspace_id: targetId }),
+    ),
+  );
+}
 
 // ----- files -----
 export async function createFile(
@@ -243,15 +262,6 @@ export async function uploadFile(
     }),
   );
 }
-// Fetch a file's bytes without triggering the browser download (used by
-// Duplicate / Copy-paste to re-upload it under a new name).
-export async function fetchFileBlob(file: FileRow): Promise<Blob> {
-  const res = await fetch(`/api/files/${file.id}/download`, {
-    credentials: "include",
-  });
-  if (!res.ok) throw new Error("download failed");
-  return res.blob();
-}
 export function rawUrl(file: FileRow): string {
   return `/api/files/${file.id}/raw`;
 }
@@ -268,9 +278,18 @@ export async function downloadFile(file: FileRow): Promise<void> {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 // Download the entire workspace as a single zip archive.
+export async function importWorkspaceZip(wsId: number, file: File): Promise<{ files: FileRow[] }> {
+  const res = await fetch(`/api/workspaces/${wsId}/import`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/zip" },
+    body: file,
+  });
+  return json(res);
+}
 export async function downloadWorkspaceZip(
   wsId: number,
   fallbackName: string,
@@ -279,15 +298,25 @@ export async function downloadWorkspaceZip(
     credentials: "include",
   });
   if (!res.ok) throw new Error("export failed");
-  const blob = await res.blob();
+  saveZip(await res.blob(), fallbackName);
+}
+export async function downloadFilesZip(
+  ids: number[],
+  fallbackName: string,
+): Promise<void> {
+  const res = await fetch("/api/files/archive", opts("POST", { ids }));
+  if (!res.ok) await json(res);
+  saveZip(await res.blob(), fallbackName);
+}
+function saveZip(blob: Blob, name: string) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `${fallbackName}.zip`;
+  a.download = `${name}.zip`;
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
 // ----- whiteboards (.board files; Excalidraw scene stored as a binary blob) -----
@@ -355,6 +384,28 @@ export async function saveFileBlob(
 }
 export async function deleteFile(id: number): Promise<void> {
   await json(await fetch(`/api/files/${id}`, opts("DELETE")));
+}
+export async function deleteFiles(ids: number[]): Promise<void> {
+  await json(await fetch("/api/files/delete-batch", opts("POST", { ids })));
+}
+export type TransferItem = { id: number; path: string };
+export async function transferFiles(
+  targetWorkspaceId: number,
+  items: TransferItem[],
+  mode: "copy" | "move",
+  onConflict: "error" | "rename" = "error",
+): Promise<{ files: FileRow[] }> {
+  return json(
+    await fetch(
+      "/api/files/transfer",
+      opts("POST", {
+        target_workspace_id: targetWorkspaceId,
+        items,
+        mode,
+        on_conflict: onConflict,
+      }),
+    ),
+  );
 }
 
 export async function moveFile(id: number, path: string): Promise<void> {
@@ -481,11 +532,28 @@ export async function toggleReaction(
 // ----- storage stats (owner / admin) -----
 export type StorageStats = {
   db_bytes: number;
+  free_bytes: number;
   blob_bytes: number;
   tables: { name: string; rows: number }[];
 };
+export type MaintenanceReport = {
+  db_bytes_before: number;
+  db_bytes_after: number;
+  free_bytes_before: number;
+  vacuumed: boolean;
+  checkpoint_busy: number;
+  expired_sessions: number;
+  orphan_documents: number;
+  orphan_blobs: number;
+  orphan_reactions: number;
+  orphan_chat_images: number;
+  pruned_audit: number;
+};
 export async function getStorage(): Promise<StorageStats> {
   return json(await fetch("/api/admin/storage", { credentials: "include" }));
+}
+export async function compactNow(): Promise<MaintenanceReport> {
+  return json(await fetch("/api/admin/compact", opts("POST")));
 }
 
 // ----- unread overview (per-thread summary for the sidebar) -----
@@ -575,7 +643,7 @@ export async function downloadChatAttachment(
   URL.revokeObjectURL(objectUrl);
 }
 
-// ----- root owner: users -----
+// ----- users: owner across orgs, org admins within their own org -----
 export async function adminListUsers(): Promise<{ users: AdminUser[] }> {
   return json(await fetch("/api/admin/users", { credentials: "include" }));
 }
@@ -590,7 +658,7 @@ export async function adminCreateUser(u: {
 }
 export async function adminUpdateUser(
   id: number,
-  patch: { name?: string; role?: string; org_id?: number },
+  patch: { name?: string; role?: string; org_id?: number | null },
 ): Promise<void> {
   await json(await fetch(`/api/admin/users/${id}`, opts("POST", patch)));
 }

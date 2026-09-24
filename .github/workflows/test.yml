@@ -32,10 +32,15 @@ jobs:
             cat /tmp/cortex-test.log
             python3 - <<'PY'
           from pathlib import Path
+          import re
           lines = Path('/tmp/cortex-test.log').read_text(errors='replace').splitlines()
+          lines = [re.sub(r'\x1b\[[0-9;]*m', '', line) for line in lines]
+          lines = [line for line in lines if not line.lstrip().startswith('Compiling ')]
           # GitHub command protocol: escape newlines so the error is one annotation.
-          excerpt = '\n'.join(lines[-100:]).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-          print(f'::error title=Rust tests failed::{excerpt[:16000]}')
+          excerpt = '\n'.join(lines[-120:])
+          for i in range(0, min(len(excerpt), 24000), 3000):
+              part = excerpt[i:i+3000].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print(f'::error title=Rust tests failed ({i//3000+1})::{part}')
           PY
             exit 1
           fi

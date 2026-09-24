@@ -177,6 +177,11 @@ impl Rustpad {
         }
     }
 
+    /// Whether any connected editor has announced its presence.
+    pub fn has_users(&self) -> bool {
+        !self.state.read().users.is_empty()
+    }
+
     /// Returns the current revision.
     pub fn revision(&self) -> usize {
         let state = self.state.read();
@@ -347,6 +352,9 @@ impl Rustpad {
     }
 
     fn apply_edit(&self, id: u64, revision: usize, mut operation: OperationSeq) -> Result<()> {
+        if self.killed() {
+            bail!("document is closed");
+        }
         info!(
             "edit: id = {}, revision = {}, base_len = {}, target_len = {}",
             id,
@@ -370,6 +378,9 @@ impl Rustpad {
         }
         let new_text = operation.apply(&state.text)?;
         let mut state = RwLockUpgradableReadGuard::upgrade(state);
+        if self.killed() {
+            bail!("document is closed");
+        }
         for (_, data) in state.cursors.iter_mut() {
             for cursor in data.cursors.iter_mut() {
                 *cursor = transform_index(&operation, *cursor);

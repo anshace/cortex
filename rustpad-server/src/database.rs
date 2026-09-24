@@ -11,10 +11,11 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use rand::RngCore;
 use serde::Serialize;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-    Column, ConnectOptions, Sqlite, SqlitePool, Transaction,
+    Column, Sqlite, SqlitePool, Transaction,
 };
 
 /// Represents a document persisted in database storage.
@@ -164,6 +165,18 @@ pub struct FileRow {
     pub size: i64,
 }
 
+/// A validated entry extracted from a ZIP workspace import.
+pub struct ImportedFile {
+    /// Normalized virtual path, already checked for traversal.
+    pub path: String,
+    /// MIME type inferred from the filename (never trusted from ZIP metadata).
+    pub mime: Option<String>,
+    /// The uncompressed contents.
+    pub bytes: Vec<u8>,
+    /// Whether the bytes are valid, small UTF-8 and not a whiteboard scene.
+    pub is_text: bool,
+}
+
 /// A chat message with its author's name/email.
 #[derive(sqlx::FromRow, Serialize, PartialEq, Eq, Clone, Debug)]
 pub struct ChatMessage {
@@ -248,6 +261,12 @@ fn paths_overlap(a: &str, b: &str) -> bool {
 }
 
 /// Choose a non-conflicting name without overwriting existing files/folders.
+fn random_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn available_path(existing: &HashSet<String>, requested: &str) -> Result<String> {
     if existing.iter().any(|p| requested.starts_with(&format!("{p}/"))) {
         bail!("destination folder is a file");
@@ -269,6 +288,38 @@ fn available_path(existing: &HashSet<String>, requested: &str) -> Result<String>
         }
     }
     unreachable!()
+}
+
+/// Resolve a batch path without splitting up its folder. When a destination
+/// already has a *file* at a parent path, rename that whole incoming folder
+/// consistently for all files in the batch (e.g. `docs/a` + `docs/b` become
+/// `docs (1)/a` + `docs (1)/b`). Leaf collisions are numbered individually.
+fn available_tree_path(
+    occupied: &HashSet<String>,
+    requested: &str,
+    folders: &mut HashMap<String, String>,
+) -> Result<String> {
+    let segments: Vec<&str> = requested.split('/').collect();
+    let mut original = String::new();
+    let mut parent = String::new();
+    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+        original = if original.is_empty() { (*segment).into() } else { format!("{original}/{segment}") };
+        if let Some(mapped) = folders.get(&original) {
+            parent = mapped.clone();
+            continue;
+        }
+        let candidate = if parent.is_empty() { (*segment).into() } else { format!("{parent}/{segment}") };
+        if occupied.contains(&candidate) {
+            let renamed = available_path(occupied, &candidate)?;
+            folders.insert(original.clone(), renamed.clone());
+            parent = renamed;
+        } else {
+            parent = candidate;
+        }
+    }
+    let leaf = segments.last().ok_or_else(|| anyhow::anyhow!("invalid path"))?;
+    let path = if parent.is_empty() { (*leaf).into() } else { format!("{parent}/{leaf}") };
+    available_path(occupied, &path)
 }
 
 /// Result of one scheduled or owner-requested maintenance run.
@@ -374,15 +425,16 @@ impl Database {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(10));
-        {
-            let mut conn = options.clone().connect().await?;
-            sqlx::migrate!().run(&mut conn).await?;
-        }
+        // Migrate through the same pool that will serve requests. Opening a
+        // second WAL-enabled connection while the migrator's worker is still
+        // closing can yield SQLITE_BUSY on fresh databases (notably in tests).
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await?;
+        sqlx::migrate!().run(&pool).await?;
         Ok(Database {
-            pool: SqlitePoolOptions::new()
-                .max_connections(5)
-                .connect_with(options)
-                .await?,
+            pool,
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
@@ -620,39 +672,115 @@ impl Database {
         .map_err(|e| e.into())
     }
 
-    /// Change a user's role (never touches root accounts).
-    pub async fn admin_set_role(&self, id: i64, role: &str) -> Result<()> {
-        sqlx::query(r#"UPDATE users SET role = $1 WHERE id = $2 AND role != 'root'"#)
-            .bind(role)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    /// List only the members of the admin's own org; never include root.
+    pub async fn admin_list_users_in_org(&self, org_id: i64) -> Result<Vec<AdminUser>> {
+        Ok(sqlx::query_as(
+            r#"SELECT u.id, u.email, u.name, u.role, u.org_id, o.name AS org_name
+               FROM users u JOIN org o ON o.id = u.org_id
+               WHERE u.org_id = $1 AND u.role != 'root' ORDER BY u.email"#,
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
-    /// Assign a user to an org (or None to unassign). Never touches root.
-    pub async fn admin_set_org(&self, id: i64, org_id: Option<i64>) -> Result<()> {
-        sqlx::query(r#"UPDATE users SET org_id = $1 WHERE id = $2 AND role != 'root'"#)
-            .bind(org_id)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    /// Fetch a target for an authorization decision (never expose its hash).
+    pub async fn admin_target(&self, id: i64) -> Result<Option<User>> {
+        Ok(sqlx::query_as(
+            "SELECT id, email, name, password_hash, role, org_id, totp_secret, totp_enabled FROM users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// One scoped update: no partially-applied name/role/org changes. A scope
+    /// is required for org admins; SQL checks it at write time, not only in
+    /// the handler, to prevent an admin racing an owner reassigning the user.
+    pub async fn admin_update_user(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        role: Option<&str>,
+        new_org: Option<Option<i64>>,
+        scope: Option<i64>,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let r = sqlx::query(
+            "UPDATE users SET name = COALESCE($1, name), role = COALESCE($2, role), \
+             org_id = CASE WHEN $3 THEN $4 ELSE org_id END \
+             WHERE id = $5 AND role != 'root' AND ($6 IS NULL OR org_id = $6)",
+        )
+        .bind(name)
+        .bind(role)
+        .bind(new_org.is_some())
+        .bind(new_org.flatten())
+        .bind(id)
+        .bind(scope)
+        .execute(&mut tx)
+        .await?;
+        if r.rows_affected() == 0 { return Ok(false); }
+        // Reauth after permission changes (name-only edits keep sessions).
+        if role.is_some() || new_org.is_some() {
+            sqlx::query("DELETE FROM session WHERE user_id = $1")
+                .bind(id).execute(&mut tx).await?;
+        }
+        // Immediately drop memberships from an org the user just left.
+        if new_org.is_some() {
+            sqlx::query("DELETE FROM group_member WHERE user_id = $1 AND group_id IN (SELECT id FROM groups WHERE org_id != (SELECT org_id FROM users WHERE id = $1) OR (SELECT org_id FROM users WHERE id = $1) IS NULL)")
+                .bind(id).execute(&mut tx).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Reset a non-owner password/2FA and revoke all sessions in one
+    /// transaction. Scoped writes also guard against cross-org races.
+    pub async fn admin_reset_credentials(
+        &self,
+        id: i64,
+        password_hash: Option<&str>,
+        scope: Option<i64>,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let r = if let Some(hash) = password_hash {
+            sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2 AND role != 'root' AND ($3 IS NULL OR org_id = $3)")
+                .bind(hash).bind(id).bind(scope).execute(&mut tx).await?
+        } else {
+            sqlx::query("UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE id = $1 AND role != 'root' AND ($2 IS NULL OR org_id = $2)")
+                .bind(id).bind(scope).execute(&mut tx).await?
+        };
+        if r.rows_affected() == 0 { return Ok(false); }
+        sqlx::query("DELETE FROM session WHERE user_id = $1")
+            .bind(id).execute(&mut tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// All collaborative docs in one org, for closing existing sockets when
+    /// an org member is removed, reassigned or changes privilege.
+    pub async fn org_doc_ids(&self, org_id: i64) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT f.doc_id FROM file f JOIN workspace w ON w.id = f.workspace_id JOIN groups g ON g.id = w.group_id WHERE g.org_id = $1 AND f.kind = 'text'",
+        )
+        .bind(org_id).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// Delete a non-owner account without leaving FK references or unreachable
     /// personal files. Shared groups/workspaces keep their data and get the
     /// root owner as their custodian; their chat/DM history by this user is
     /// erased. Return deleted personal document IDs for live eviction.
-    pub async fn admin_delete_user(&self, id: i64) -> Result<Vec<String>> {
+    pub async fn admin_delete_user(&self, id: i64, scope: Option<i64>) -> Result<Vec<String>> {
         let mut tx = self.pool.begin().await?;
-        let target: Option<(String,)> =
-            sqlx::query_as("SELECT role FROM users WHERE id = $1")
+        let target: Option<(String, Option<i64>)> =
+            sqlx::query_as("SELECT role, org_id FROM users WHERE id = $1")
                 .bind(id)
                 .fetch_optional(&mut tx)
                 .await?;
-        match target.as_ref().map(|(role,)| role.as_str()) {
-            Some("root") => bail!("owner accounts cannot be deleted"),
+        match target.as_ref() {
+            Some((role, _)) if role == "root" => bail!("owner accounts cannot be deleted"),
+            Some((_, org_id)) if scope.is_some() && *org_id != scope => bail!("user is outside this org"),
             None => bail!("user not found"),
             _ => {}
         }
@@ -1074,6 +1202,126 @@ impl Database {
         Ok(docs)
     }
 
+    /// Move all source files into the target and remove the empty source
+    /// workspace in one transaction. Preserve file/document IDs (and blobs),
+    /// auto-rename conflicts rather than overwriting target data.
+    pub async fn merge_workspaces(&self, source: i64, target: i64) -> Result<(usize, Vec<String>)> {
+        if source == target {
+            bail!("cannot merge a workspace with itself");
+        }
+        let mut tx = self.pool.begin().await?;
+        let source_files: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT id, path, doc_id FROM file WHERE workspace_id = $1 ORDER BY path")
+                .bind(source)
+                .fetch_all(&mut tx)
+                .await?;
+        let target_paths: Vec<(String,)> =
+            sqlx::query_as("SELECT path FROM file WHERE workspace_id = $1")
+                .bind(target)
+                .fetch_all(&mut tx)
+                .await?;
+        let mut occupied: HashSet<String> = target_paths.into_iter().map(|(p,)| p).collect();
+        let mut docs = Vec::with_capacity(source_files.len());
+        let mut folders = HashMap::new();
+        for (id, path, doc_id) in &source_files {
+            let final_path = available_tree_path(&occupied, path, &mut folders)?;
+            if final_path.len() > 512 {
+                bail!("destination path is too long");
+            }
+            sqlx::query("UPDATE file SET workspace_id = $1, path = $2 WHERE id = $3")
+                .bind(target)
+                .bind(&final_path)
+                .bind(id)
+                .execute(&mut tx)
+                .await?;
+            occupied.insert(final_path);
+            docs.push(doc_id.clone());
+        }
+        // Only delete the emptied workspace row, not its moved files.
+        sqlx::query("UPDATE message SET workspace_id = NULL WHERE workspace_id = $1")
+            .bind(source)
+            .execute(&mut tx)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM workspace WHERE id = $1")
+            .bind(source)
+            .execute(&mut tx)
+            .await?;
+        if deleted.rows_affected() != 1 {
+            bail!("source workspace not found");
+        }
+        tx.commit().await?;
+        Ok((source_files.len(), docs))
+    }
+
+    /// Reparent a workspace inside a different group without changing any
+    /// file IDs. Ensure the slug stays unique within its new group.
+    pub async fn move_workspace_to_group(&self, ws: &Workspace, group_id: i64) -> Result<Workspace> {
+        let mut tx = self.pool.begin().await?;
+        let existing: Vec<(String,)> =
+            sqlx::query_as("SELECT slug FROM workspace WHERE group_id = $1 AND id != $2")
+                .bind(group_id)
+                .bind(ws.id)
+                .fetch_all(&mut tx)
+                .await?;
+        let taken: HashSet<String> = existing.into_iter().map(|(slug,)| slug).collect();
+        let base = slugify(&ws.name);
+        let mut slug = base.clone();
+        let mut n = 2;
+        while taken.contains(&slug) {
+            slug = format!("{base}-{n}");
+            n += 1;
+        }
+        sqlx::query("UPDATE workspace SET group_id = $1, slug = $2 WHERE id = $3")
+            .bind(group_id)
+            .bind(&slug)
+            .bind(ws.id)
+            .execute(&mut tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Workspace {
+            id: ws.id,
+            group_id,
+            name: ws.name.clone(),
+            slug,
+            created_by: ws.created_by,
+        })
+    }
+
+    /// File IDs under one workspace, for disconnecting board relays.
+    pub async fn workspace_file_ids(&self, ws_id: i64) -> Result<Vec<i64>> {
+        let rows: Vec<(i64,)> = sqlx::query_as("SELECT id FROM file WHERE workspace_id = $1")
+            .bind(ws_id).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// File IDs under one group, for disconnecting board relays.
+    pub async fn group_file_ids(&self, group_id: i64) -> Result<Vec<i64>> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT f.id FROM file f JOIN workspace w ON w.id = f.workspace_id WHERE w.group_id = $1",
+        )
+        .bind(group_id).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Text document IDs under one group for revoking prior membership.
+    pub async fn group_doc_ids(&self, group_id: i64) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT f.doc_id FROM file f JOIN workspace w ON w.id = f.workspace_id WHERE w.group_id = $1 AND f.kind = 'text'",
+        )
+        .bind(group_id).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// All document IDs in a workspace (used to revoke sockets after a move).
+    pub async fn workspace_doc_ids(&self, ws_id: i64) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT doc_id FROM file WHERE workspace_id = $1")
+                .bind(ws_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     /// The org that owns the group containing a workspace, if it exists.
     pub async fn workspace_org(&self, workspace_id: i64) -> Result<Option<i64>> {
         let row: Option<(i64,)> = sqlx::query_as(
@@ -1254,12 +1502,81 @@ impl Database {
         })
     }
 
+    /// Import a validated ZIP as a single unit. Collisions get a numbered
+    /// suffix; any missing content/invalid parent leaves the DB untouched.
+    pub async fn import_files(
+        &self,
+        workspace_id: i64,
+        files: &[ImportedFile],
+        now: i64,
+    ) -> Result<Vec<FileRow>> {
+        let mut tx = self.pool.begin().await?;
+        let paths: Vec<(String,)> =
+            sqlx::query_as("SELECT path FROM file WHERE workspace_id = $1")
+                .bind(workspace_id)
+                .fetch_all(&mut tx)
+                .await?;
+        let mut occupied: HashSet<String> = paths.into_iter().map(|(p,)| p).collect();
+        let mut added = Vec::with_capacity(files.len());
+        let mut folders = HashMap::new();
+        for entry in files {
+            if let Some(dir) = entry.path.strip_suffix("/.keep") {
+                // Existing content already creates the folder implicitly.
+                if occupied.iter().any(|p| p.starts_with(&format!("{dir}/"))) {
+                    continue;
+                }
+            }
+            let path = available_tree_path(&occupied, &entry.path, &mut folders)?;
+            if path.len() > 512 {
+                bail!("import path is too long");
+            }
+            let doc_id = random_id();
+            let kind = if entry.is_text { "text" } else { "binary" };
+            let (id,): (i64,) = sqlx::query_as(
+                "INSERT INTO file (workspace_id, path, doc_id, kind, mime, created_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            )
+            .bind(workspace_id)
+            .bind(&path)
+            .bind(&doc_id)
+            .bind(kind)
+            .bind(&entry.mime)
+            .bind(now)
+            .fetch_one(&mut tx)
+            .await?;
+            if entry.is_text {
+                sqlx::query("INSERT INTO document (id, text, language) VALUES ($1, $2, NULL)")
+                    .bind(&doc_id)
+                    .bind(std::str::from_utf8(&entry.bytes)?)
+                    .execute(&mut tx)
+                    .await?;
+            } else {
+                sqlx::query("INSERT INTO file_blob (file_id, data) VALUES ($1, $2)")
+                    .bind(id)
+                    .bind(&entry.bytes)
+                    .execute(&mut tx)
+                    .await?;
+            }
+            occupied.insert(path.clone());
+            added.push(FileRow {
+                id,
+                workspace_id,
+                path,
+                doc_id,
+                kind: kind.into(),
+                mime: entry.mime.clone(),
+                size: entry.bytes.len() as i64,
+            });
+        }
+        tx.commit().await?;
+        Ok(added)
+    }
+
     /// List files in a workspace, ordered by path.
     pub async fn list_files(&self, workspace_id: i64) -> Result<Vec<FileRow>> {
         sqlx::query_as(
             r#"SELECT f.id, f.workspace_id, f.path, f.doc_id, f.kind, f.mime,
                       COALESCE((SELECT LENGTH(fb.data) FROM file_blob fb WHERE fb.file_id = f.id),
-                               (SELECT LENGTH(d.text) FROM document d WHERE d.id = f.doc_id), 0) AS size
+                               (SELECT LENGTH(CAST(d.text AS BLOB)) FROM document d WHERE d.id = f.doc_id), 0) AS size
                FROM file f
                WHERE f.workspace_id = $1 ORDER BY f.path"#,
         )
@@ -1274,7 +1591,7 @@ impl Database {
         sqlx::query_as(
             r#"SELECT f.id, f.workspace_id, f.path, f.doc_id, f.kind, f.mime,
                       COALESCE((SELECT LENGTH(fb.data) FROM file_blob fb WHERE fb.file_id = f.id),
-                               (SELECT LENGTH(d.text) FROM document d WHERE d.id = f.doc_id), 0) AS size
+                               (SELECT LENGTH(CAST(d.text AS BLOB)) FROM document d WHERE d.id = f.doc_id), 0) AS size
                FROM file f WHERE f.id = $1"#,
         )
         .bind(id)
@@ -1307,6 +1624,156 @@ impl Database {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Transactional file/folder transfer. Paths are explicit so the client
+    /// can move a whole folder in one request. Source IDs, target workspace and
+    /// desired paths are pre-authorized by the HTTP handler. A copy gets fresh
+    /// file/document IDs and exact blob bytes; a move preserves IDs. No partial
+    /// results when any input, content or destination conflicts.
+    pub async fn transfer_files(
+        &self,
+        target_workspace: i64,
+        items: &[(i64, String)],
+        copy: bool,
+        rename_conflicts: bool,
+        snapshots: &HashMap<String, PersistedDocument>,
+        now: i64,
+    ) -> Result<Vec<FileRow>> {
+        if items.is_empty() || items.len() > 1000 {
+            bail!("select 1–1000 files");
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut seen = HashSet::new();
+        let mut sources = Vec::with_capacity(items.len());
+        for (id, path) in items {
+            if !seen.insert(*id) || path.is_empty() || path.len() > 512 {
+                bail!("invalid transfer item");
+            }
+            let file: Option<FileRow> = sqlx::query_as(
+                r#"SELECT f.id, f.workspace_id, f.path, f.doc_id, f.kind, f.mime,
+                         COALESCE((SELECT LENGTH(fb.data) FROM file_blob fb WHERE fb.file_id = f.id),
+                                  (SELECT LENGTH(CAST(d.text AS BLOB)) FROM document d WHERE d.id = f.doc_id), 0) AS size
+                   FROM file f WHERE f.id = $1"#,
+            )
+            .bind(id)
+            .fetch_optional(&mut tx)
+            .await?;
+            sources.push(file.ok_or_else(|| anyhow::anyhow!("source file not found"))?);
+        }
+        let dest_rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, path FROM file WHERE workspace_id = $1")
+                .bind(target_workspace)
+                .fetch_all(&mut tx)
+                .await?;
+        let moving_here: HashSet<i64> = if copy {
+            HashSet::new()
+        } else {
+            sources.iter().filter(|f| f.workspace_id == target_workspace)
+                .map(|f| f.id).collect()
+        };
+        let mut occupied: HashSet<String> = dest_rows.iter()
+            .filter(|(id, _)| !moving_here.contains(id))
+            .map(|(_, path)| path.clone())
+            .collect();
+        let mut destinations = Vec::with_capacity(items.len());
+        let mut folders = HashMap::new();
+        for (_, requested) in items {
+            let path = if rename_conflicts {
+                available_tree_path(&occupied, requested, &mut folders)?
+            } else {
+                if occupied.iter().any(|p| paths_overlap(p, requested)) {
+                    bail!("a file or folder already exists at the destination");
+                }
+                requested.to_string()
+            };
+            if path.len() > 512 {
+                bail!("destination path is too long");
+            }
+            occupied.insert(path.clone());
+            destinations.push(path);
+        }
+
+        if !copy {
+            // Free ALL original paths first. A file/folder swap or two files
+            // exchanging names should not fail the unique(workspace_id,path)
+            // constraint halfway through the transaction.
+            let mut reserved: HashSet<String> = dest_rows.into_iter().map(|(_, p)| p).collect();
+            reserved.extend(destinations.iter().cloned());
+            for src in &sources {
+                if src.workspace_id == target_workspace {
+                    let temp = loop {
+                        let candidate = format!(".cortex-transfer-{}", random_id());
+                        if !reserved.iter().any(|p| paths_overlap(p, &candidate)) {
+                            break candidate;
+                        }
+                    };
+                    reserved.insert(temp.clone());
+                    sqlx::query("UPDATE file SET path = $1 WHERE id = $2")
+                        .bind(temp)
+                        .bind(src.id)
+                        .execute(&mut tx)
+                        .await?;
+                }
+            }
+        }
+
+        let mut result = Vec::with_capacity(items.len());
+        for (mut src, path) in sources.into_iter().zip(destinations) {
+            if copy {
+                let doc_id = random_id();
+                let (id,): (i64,) = sqlx::query_as(
+                    "INSERT INTO file (workspace_id, path, doc_id, kind, mime, created_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+                )
+                .bind(target_workspace)
+                .bind(&path)
+                .bind(&doc_id)
+                .bind(&src.kind)
+                .bind(&src.mime)
+                .bind(now)
+                .fetch_one(&mut tx)
+                .await?;
+                if src.kind == "text" {
+                    let rows = if let Some(snapshot) = snapshots.get(&src.doc_id) {
+                        src.size = snapshot.text.len() as i64;
+                        sqlx::query("INSERT INTO document (id, text, language) VALUES ($1, $2, $3)")
+                            .bind(&doc_id)
+                            .bind(&snapshot.text)
+                            .bind(&snapshot.language)
+                            .execute(&mut tx)
+                            .await?.rows_affected()
+                    } else {
+                        sqlx::query("INSERT INTO document (id, text, language) SELECT $1, text, language FROM document WHERE id = $2")
+                            .bind(&doc_id)
+                            .bind(&src.doc_id)
+                            .execute(&mut tx)
+                            .await?.rows_affected()
+                    };
+                    if rows != 1 { bail!("source text content missing"); }
+                } else {
+                    let rows = sqlx::query("INSERT INTO file_blob (file_id, data) SELECT $1, data FROM file_blob WHERE file_id = $2")
+                        .bind(id)
+                        .bind(src.id)
+                        .execute(&mut tx)
+                        .await?.rows_affected();
+                    if rows != 1 { bail!("source blob content missing"); }
+                }
+                src.id = id;
+                src.doc_id = doc_id;
+            } else {
+                sqlx::query("UPDATE file SET workspace_id = $1, path = $2 WHERE id = $3")
+                    .bind(target_workspace)
+                    .bind(&path)
+                    .bind(src.id)
+                    .execute(&mut tx)
+                    .await?;
+            }
+            src.workspace_id = target_workspace;
+            src.path = path;
+            result.push(src);
+        }
+        tx.commit().await?;
+        Ok(result)
     }
 
     /// Store raw bytes for a binary file.
@@ -2237,7 +2704,7 @@ mod tests {
         db.create_message(shared.id, alice.id, "hello", 1).await.unwrap();
         db.create_dm(org.id, alice.id, bob.id, "hi", 1).await.unwrap();
         db.create_chat_image(org.id, Some("image/png"), b"img", 1).await.unwrap();
-        let docs = db.admin_delete_user(alice.id).await.unwrap();
+        let docs = db.admin_delete_user(alice.id, None).await.unwrap();
         assert!(docs.contains(&private_file.doc_id));
         assert!(db.get_group(personal.id).await.unwrap().is_none());
         assert_eq!(db.get_group(shared.id).await.unwrap().unwrap().created_by, owner.id);
@@ -2264,6 +2731,86 @@ mod tests {
         assert_eq!(report.pruned_audit, 1);
         assert!(report.vacuumed);
         assert_eq!(db.table_rows("document").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_transfer_merge_and_zip_import_are_atomic() {
+        use std::collections::HashMap;
+        let (_tmp, db) = test_database().await;
+        db.create_user_if_absent("owner", "Owner", "hash", "root", None).await.unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let org = db.create_org("Org", "org", 1).await.unwrap();
+        let g1 = db.create_group(org.id, "Source", owner.id, 1, "group").await.unwrap();
+        let g2 = db.create_group(org.id, "Other", owner.id, 1, "group").await.unwrap();
+        let src = db.create_workspace(g1.id, "Project", owner.id, 1).await.unwrap();
+        let dst = db.create_workspace(g1.id, "Destination", owner.id, 1).await.unwrap();
+        let text = db.create_file(src.id, "docs/note.txt", "source-note", "text", None, 1).await.unwrap();
+        let binary = db.create_uploaded_file(src.id, "docs/logo.png", "source-logo", Some("image/png"), None, &[0, 7, 255], 1).await.unwrap();
+        let original = db.create_file(dst.id, "folder", "target-file", "text", None, 1).await.unwrap();
+        let mut snapshots = HashMap::new();
+        snapshots.insert(text.doc_id.clone(), super::PersistedDocument { text: "unflushed OT edit".into(), language: Some("markdown".into()) });
+        let copied = db.transfer_files(dst.id, &[(text.id, "folder/note.txt".into()), (binary.id, "folder/logo.png".into())], true, true, &snapshots, 1).await.unwrap();
+        assert_eq!(copied[0].path, "folder (1)/note.txt");
+        assert_eq!(copied[1].path, "folder (1)/logo.png");
+        assert_eq!(db.load(&copied[0].doc_id).await.unwrap(), snapshots[&text.doc_id]);
+        assert_eq!(db.load_blob(copied[1].id).await.unwrap().unwrap(), vec![0, 7, 255]);
+        assert_eq!(db.load(&text.doc_id).await.unwrap().text, "");
+        assert_eq!(db.get_file(original.id).await.unwrap().unwrap().path, "folder");
+        // A missing id aborts the entire batch, even though the first is valid.
+        assert!(db.transfer_files(dst.id, &[(text.id, "moved.txt".into()), (-99, "missing.txt".into())], false, true, &HashMap::new(), 1).await.is_err());
+        assert_eq!(db.get_file(text.id).await.unwrap().unwrap().workspace_id, src.id);
+        assert!(db.delete_files(&[copied[0].id, -99]).await.is_err());
+        assert!(db.get_file(copied[0].id).await.unwrap().is_some());
+        let removed = db.delete_files(&[copied[0].id, copied[1].id]).await.unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(db.load(&copied[0].doc_id).await.is_err());
+        // Merge must rename an entire folder if the destination already has
+        // a file at its parent path, and keep the file/blob IDs intact.
+        db.create_file(dst.id, "docs", "target-docs", "text", None, 1).await.unwrap();
+        let (moved, _) = db.merge_workspaces(src.id, dst.id).await.unwrap();
+        assert_eq!(moved, 2);
+        assert!(db.get_workspace(src.id).await.unwrap().is_none());
+        assert_eq!(db.get_file(text.id).await.unwrap().unwrap().path, "docs (1)/note.txt");
+        assert_eq!(db.get_file(binary.id).await.unwrap().unwrap().path, "docs (1)/logo.png");
+        assert_eq!(db.load_blob(binary.id).await.unwrap().unwrap(), vec![0, 7, 255]);
+        let relocated = db.move_workspace_to_group(&dst, g2.id).await.unwrap();
+        assert_eq!(relocated.group_id, g2.id);
+        assert_eq!(db.get_file(text.id).await.unwrap().unwrap().workspace_id, dst.id);
+        // Invalid UTF-8 in a text import rolls the entire import back.
+        let invalid = [
+            super::ImportedFile { path: "new.txt".into(), mime: None, bytes: b"new".to_vec(), is_text: true },
+            super::ImportedFile { path: "bad.txt".into(), mime: None, bytes: vec![255], is_text: true },
+        ];
+        assert!(db.import_files(dst.id, &invalid, 1).await.is_err());
+        assert!(db.list_files(dst.id).await.unwrap().iter().all(|f| f.path != "new.txt"));
+        assert_no_bad_foreign_keys(&db).await;
+    }
+
+    #[tokio::test]
+    async fn admin_mutations_reject_other_orgs_and_revoke_sessions() {
+        let (_tmp, db) = test_database().await;
+        db.create_user_if_absent("owner", "Owner", "hash", "root", None).await.unwrap();
+        let first = db.create_org("First", "first", 1).await.unwrap();
+        let second = db.create_org("Second", "second", 1).await.unwrap();
+        db.create_user_if_absent("alice", "Alice", "hash", "user", Some(first.id)).await.unwrap();
+        db.create_user_if_absent("bob", "Bob", "hash", "user", Some(second.id)).await.unwrap();
+        let alice = db.get_user_by_email("alice").await.unwrap().unwrap();
+        let bob = db.get_user_by_email("bob").await.unwrap().unwrap();
+        assert_eq!(db.admin_list_users_in_org(first.id).await.unwrap().iter().map(|u| u.email.as_str()).collect::<Vec<_>>(), vec!["alice"]);
+        assert!(!db.admin_update_user(bob.id, None, Some("admin"), None, Some(first.id)).await.unwrap());
+        assert!(!db.admin_reset_credentials(bob.id, Some("newhash"), Some(first.id)).await.unwrap());
+        assert!(db.admin_delete_user(bob.id, Some(first.id)).await.is_err());
+        assert_eq!(db.admin_target(bob.id).await.unwrap().unwrap().role, "user");
+        db.create_session("old-session", alice.id, 999).await.unwrap();
+        assert!(db.admin_update_user(alice.id, None, Some("admin"), None, Some(first.id)).await.unwrap());
+        assert_eq!(db.admin_target(alice.id).await.unwrap().unwrap().role, "admin");
+        assert!(db.get_session_user("old-session", 1).await.unwrap().is_none());
+        db.create_session("another-session", alice.id, 999).await.unwrap();
+        assert!(db.admin_reset_credentials(alice.id, None, Some(first.id)).await.unwrap());
+        assert!(db.get_session_user("another-session", 1).await.unwrap().is_none());
+        assert!(db.admin_update_user(alice.id, None, None, Some(Some(second.id)), None).await.unwrap());
+        assert_eq!(db.admin_target(alice.id).await.unwrap().unwrap().org_id, Some(second.id));
+        assert_no_bad_foreign_keys(&db).await;
     }
 
     #[tokio::test]
