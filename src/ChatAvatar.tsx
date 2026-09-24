@@ -1,4 +1,4 @@
-import { Box, Center } from "@chakra-ui/react";
+import { Box, Center, useColorMode } from "@chakra-ui/react";
 import { memo } from "react";
 
 // Stable hue for a name/email so each person keeps the same colour everywhere.
@@ -8,52 +8,62 @@ function hueOf(s: string) {
   return h;
 }
 
-// A vivid two-stop diagonal gradient derived from the author's hue. High
-// saturation + a bright-to-deep ramp keeps every avatar colourful yet
-// readable with white initials, and no two adjacent hues look muddy.
-export function authorGradient(key: string): string {
-  const h = hueOf(key || "?");
-  const h2 = (h + 48) % 360;
-  return `linear-gradient(135deg, hsl(${h}, 78%, 60%) 0%, hsl(${h2}, 72%, 44%) 100%)`;
+/** Initials: first and last name starts, falling back to the first two letters
+ *  of a single token. Two characters identify far better than one at 28px. */
+function initialsOf(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 2)
+    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+  return (name.trim().slice(0, 2) || "?").toUpperCase();
 }
 
 type ChatAvatarProps = {
   name: string;
   /** Pixel size of the square avatar. */
   size?: number;
-  /** Corner radius override (e.g. "lg" for the sidebar tiles). */
+  /** Corner radius override (e.g. "lg" for square tiles). */
   radius?: string;
 };
 
 /**
- * Colourful identity chip used across chat: message rows, headers, sidebar
- * tiles and notifications. Shows the person's first initial on a personalised
- * gradient with a soft inner highlight so it feels glossy, not flat-black.
+ * Identity chip used across chat: message rows, headers, sidebar tiles and
+ * notifications. A flat, saturated disc of the person's own hue with their
+ * initials in a near-black of the same hue — vivid enough to scan a list by
+ * colour, calm enough not to fight the bubbles around it.
  */
 const ChatAvatar = memo(function ChatAvatar({
   name,
   size = 28,
   radius = "full",
 }: ChatAvatarProps) {
-  const label = (name || "?").trim().charAt(0).toUpperCase();
+  const { colorMode } = useColorMode();
+  const dark = colorMode === "dark";
+  const h = hueOf((name || "?").trim().toLowerCase());
+  // The fill has to move with the theme: on the dark graphite a bright disc
+  // with near-black letters reads best, on paper the same disc goes deeper and
+  // the letters flip to white. Same hue either way, so a person keeps their
+  // colour across modes.
+  const fill = dark ? `hsl(${h}, 74%, 60%)` : `hsl(${h}, 68%, 44%)`;
+  const ink = dark ? `hsl(${h}, 90%, 12%)` : "#ffffff";
   return (
     <Center
       flexShrink={0}
       boxSize={`${size}px`}
       borderRadius={radius}
-      bg={authorGradient(name)}
-      color="white"
+      bg={fill}
+      color={ink}
       fontWeight={700}
-      fontSize={`${Math.max(10, Math.round(size * 0.42))}px`}
-      letterSpacing="0.02em"
+      fontSize={`${Math.max(9.5, Math.round(size * 0.36))}px`}
+      letterSpacing="0.01em"
+      lineHeight={1}
       userSelect="none"
-      // Glossy top-light + a faint coloured glow so it pops off dark bubbles.
-      boxShadow={`inset 0 1px 0 rgba(255,255,255,0.35), inset 0 -6px 12px rgba(0,0,0,0.18), 0 0 ${Math.round(
-        size / 3,
-      )}px rgba(91,110,245,0.18)`}
-      textShadow="0 1px 2px rgba(0,0,0,0.25)"
+      sx={{
+        boxShadow: dark
+          ? `inset 0 0 0 1px hsl(${h} 80% 80% / 0.45), inset 0 -1px 0 hsl(${h} 70% 40% / 0.5)`
+          : `inset 0 0 0 1px hsl(${h} 70% 30% / 0.3), 0 1px 2px hsl(${h} 50% 30% / 0.25)`,
+      }}
     >
-      {label}
+      {initialsOf(name)}
     </Center>
   );
 });
@@ -73,7 +83,7 @@ export function PresenceDot({
       right="-1px"
       boxSize="11px"
       borderRadius="full"
-      bg={online ? "signal.ok" : "surface.borderStrong"}
+      bg={online ? "state.ok" : "ink.subtle"}
       border="2px solid"
       borderColor={panel}
       title={online ? "Online" : "Offline"}

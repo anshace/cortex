@@ -79,6 +79,16 @@ body {
   }
 }
 
+@keyframes cx-drift {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(2%, -3%, 0) scale(1.06);
+  }
+}
+
 /* Popovers, menus and dialogs all enter the same way (see theme.ts recipes). */
 .chakra-menu__menu-list,
 .chakra-popover__content,
@@ -127,6 +137,46 @@ body {
 
 .cx-live {
   animation: cx-pulse 2.4s var(--cx-ease-soft) infinite;
+}
+
+/* Scrollable rows that must not show a bar — a header tab strip that happens
+   to overflow on a narrow window should still read as one clean line. */
+.cx-noscroll {
+  scrollbar-width: none;
+}
+.cx-noscroll::-webkit-scrollbar {
+  height: 0px;
+  width: 0px;
+}
+
+/* Landing-page decoration. The grid is engineering paper, not texture: the
+   caller always masks it so it fades out instead of ending on a hard edge. */
+.cx-gridpaper {
+  background-image: linear-gradient(
+      to right,
+      rgba(139, 123, 255, 0.11) 1px,
+      transparent 1px
+    ),
+    linear-gradient(to bottom, rgba(139, 123, 255, 0.11) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+.cx-drift {
+  animation: cx-drift 22s var(--cx-ease-soft) infinite;
+}
+
+/* Slow bob for the cards floating over the hero mock. */
+@keyframes cx-float {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  50% {
+    transform: translate3d(0, -7px, 0);
+  }
+}
+.cx-float {
+  animation: cx-float 6s ease-in-out infinite;
 }
 
 .cx-skeleton {

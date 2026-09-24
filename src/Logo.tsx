@@ -1,5 +1,19 @@
-// The Cortex brand mark — a small neural-node glyph, matching the favicon.
-function Logo({ size = 24 }: { size?: number }) {
+import { useId } from "react";
+
+// The Cortex brand mark: a synapse — two nodes exchanging a signal across a
+// shared core. The rounded accent→cyan tile and the S-curve come from the v2
+// exploration; the satellite nodes and hairline strands are the v1
+// constellation, kept as background detail so the glyph still reads at 22px.
+// Gradient ids are per-instance: the mark renders twice on some screens
+// (top bar + empty editor) and shared ids would let the first definition win.
+function Logo({ size = 24, glow = true }: { size?: number; glow?: boolean }) {
+  const raw = useId().replace(/[^a-zA-Z0-9]/g, "");
+  const id = {
+    tile: `cx-tile-${raw}`,
+    sheen: `cx-sheen-${raw}`,
+    halo: `cx-halo-${raw}`,
+  };
+
   return (
     <svg
       width={size}
@@ -7,70 +21,72 @@ function Logo({ size = 24 }: { size?: number }) {
       viewBox="0 0 64 64"
       role="img"
       aria-label="Cortex"
+      style={
+        glow
+          ? { filter: "drop-shadow(0 2px 10px rgba(107,91,255,0.45))" }
+          : undefined
+      }
     >
       <defs>
-        <linearGradient id="cortex-logo-bg" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stopColor="#201d36" />
-          <stop offset="1" stopColor="#0c0a1a" />
+        <linearGradient id={id.tile} x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stopColor="#a294ff" />
+          <stop offset="0.52" stopColor="#6b5bff" />
+          <stop offset="1" stopColor="#1fb6d8" />
         </linearGradient>
-        <radialGradient id="cortex-logo-glow" cx="0.5" cy="0.5" r="0.5">
-          <stop offset="0" stopColor="#5b6ef5" stopOpacity="0.38" />
-          <stop offset="1" stopColor="#5b6ef5" stopOpacity="0" />
+        <radialGradient id={id.sheen} cx="0.28" cy="0.18" r="0.72">
+          <stop offset="0" stopColor="#ffffff" stopOpacity="0.3" />
+          <stop offset="1" stopColor="#ffffff" stopOpacity="0" />
         </radialGradient>
-        <linearGradient id="cortex-logo-strand" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stopColor="#5b6ef5" />
-          <stop offset="1" stopColor="#8b7cf8" />
-        </linearGradient>
-        <radialGradient id="cortex-logo-node" cx="0.35" cy="0.3" r="1">
-          <stop offset="0" stopColor="#f0ebff" />
-          <stop offset="1" stopColor="#b2a5f2" />
-        </radialGradient>
-        <radialGradient id="cortex-logo-core" cx="0.35" cy="0.3" r="1">
-          <stop offset="0" stopColor="#a99cff" />
-          <stop offset="1" stopColor="#5a4ed6" />
+        <radialGradient id={id.halo} cx="0.5" cy="0.5" r="0.5">
+          <stop offset="0.4" stopColor="#ffffff" stopOpacity="0" />
+          <stop offset="1" stopColor="#ffffff" stopOpacity="0.16" />
         </radialGradient>
       </defs>
-      <rect width="64" height="64" rx="14" fill="url(#cortex-logo-bg)" />
+
+      <rect width="64" height="64" rx="17" fill={`url(#${id.tile})`} />
+      <rect width="64" height="64" rx="17" fill={`url(#${id.sheen})`} />
       <rect
-        x="1"
-        y="1"
-        width="62"
-        height="62"
-        rx="13"
+        x="0.85"
+        y="0.85"
+        width="62.3"
+        height="62.3"
+        rx="16.3"
         fill="none"
         stroke="#ffffff"
-        strokeOpacity="0.07"
-        strokeWidth="1.5"
+        strokeOpacity="0.28"
+        strokeWidth="1.7"
       />
-      {/* Soft halo behind the network */}
-      <circle cx="32" cy="32" r="24" fill="url(#cortex-logo-glow)" />
-      <circle
-        cx="32"
-        cy="32"
-        r="12"
+      <circle cx="32" cy="32" r="28" fill={`url(#${id.halo})`} />
+
+      {/* Satellite nodes, echoing the v1 pentagon ring */}
+      <g
+        stroke="#ffffff"
+        strokeOpacity="0.34"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      >
+        <line x1="46" y1="18" x2="46" y2="38" />
+        <line x1="18" y1="26" x2="18" y2="46" />
+      </g>
+      <g fill="#ffffff" fillOpacity="0.62">
+        <circle cx="46" cy="18" r="2.6" />
+        <circle cx="18" cy="46" r="2.6" />
+      </g>
+
+      {/* The signal path between the two peers */}
+      <path
+        d="M18 23c0-4 3.2-7 7-7s7 3 7 7v18c0 4 3.2 7 7 7s7-3 7-7"
         fill="none"
-        stroke="#8b7cf8"
-        strokeOpacity="0.22"
-        strokeWidth="1"
+        stroke="#ffffff"
+        strokeOpacity="0.95"
+        strokeWidth="4"
+        strokeLinecap="round"
       />
-      {/* 5 strands from the core to the outer nodes (pentagon) */}
-      <g stroke="url(#cortex-logo-strand)" strokeWidth="2.5" strokeLinecap="round">
-        <line x1="32" y1="32" x2="32" y2="14" />
-        <line x1="32" y1="32" x2="49" y2="26" />
-        <line x1="32" y1="32" x2="43" y2="47" />
-        <line x1="32" y1="32" x2="21" y2="47" />
-        <line x1="32" y1="32" x2="15" y2="26" />
+      <g fill="#ffffff">
+        <circle cx="18" cy="23" r="5.2" />
+        <circle cx="46" cy="41" r="5.2" />
       </g>
-      {/* Outer nodes: dimensional orbs */}
-      <g fill="url(#cortex-logo-node)">
-        <circle cx="32" cy="14" r="4.2" />
-        <circle cx="49" cy="26" r="4.2" />
-        <circle cx="43" cy="47" r="4.2" />
-        <circle cx="21" cy="47" r="4.2" />
-        <circle cx="15" cy="26" r="4.2" />
-      </g>
-      {/* Core node */}
-      <circle cx="32" cy="32" r="7.5" fill="url(#cortex-logo-core)" />
+      <circle cx="32" cy="32" r="3.6" fill="#ffffff" fillOpacity="0.72" />
     </svg>
   );
 }

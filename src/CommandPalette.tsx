@@ -32,9 +32,17 @@ export type PaletteItem = {
   label: string; // primary text (a file path, or a command name)
   hint?: string; // dimmed right-hand text (a category, or a shortcut)
   icon?: ReactNode;
+  /** Hue for the row's icon tile and category chip. A palette is scanned by
+   *  eye, so a file, a person and a command must not all be the same grey. */
+  hue?: string;
   keywords?: string; // extra text to match against, not shown
   run: () => void;
 };
+
+const hueVar = (hue: string) =>
+  hue.startsWith("#") || hue.includes("(")
+    ? hue
+    : `var(--chakra-colors-${hue.replace(".", "-")})`;
 
 type Props = {
   isOpen: boolean;
@@ -209,11 +217,31 @@ function CommandPalette({ isOpen, onClose, placeholder, items }: Props) {
                     bottom="5px"
                     w="2px"
                     borderRadius="full"
-                    bg="accent.base"
+                    bg={it.hue ?? "accent.base"}
+                    sx={
+                      it.hue
+                        ? {
+                            boxShadow: `0 0 8px color-mix(in oklab, ${hueVar(it.hue)} 65%, transparent)`,
+                          }
+                        : undefined
+                    }
                   />
                 )}
                 {it.icon && (
-                  <Flex w="16px" justify="center" flexShrink={0} fontSize="sm">
+                  <Flex
+                    boxSize="20px"
+                    borderRadius="sm"
+                    align="center"
+                    justify="center"
+                    flexShrink={0}
+                    fontSize="sm"
+                    color={it.hue ?? "ink.subtle"}
+                    sx={{
+                      background: it.hue
+                        ? `color-mix(in oklab, ${hueVar(it.hue)} 16%, transparent)`
+                        : undefined,
+                    }}
+                  >
                     {it.icon}
                   </Flex>
                 )}
@@ -224,7 +252,23 @@ function CommandPalette({ isOpen, onClose, placeholder, items }: Props) {
                   (it.hint.includes("+") || it.hint.length <= 4 ? (
                     <Kbd fontSize="0.65rem">{it.hint}</Kbd>
                   ) : (
-                    <Text fontSize="xs" color="ink.subtle" flexShrink={0}>
+                    <Text
+                      fontSize="9.5px"
+                      fontWeight={700}
+                      letterSpacing="0.07em"
+                      textTransform="uppercase"
+                      fontFamily="mono"
+                      px={1.5}
+                      py="2px"
+                      borderRadius="sm"
+                      flexShrink={0}
+                      color={it.hue ?? "ink.subtle"}
+                      sx={{
+                        background: it.hue
+                          ? `color-mix(in oklab, ${hueVar(it.hue)} 13%, transparent)`
+                          : undefined,
+                      }}
+                    >
                       {it.hint}
                     </Text>
                   ))}

@@ -1,11 +1,16 @@
 import {
+  Box,
+  Center,
   Flex,
+  Icon,
   IconButton,
   IconButtonProps,
   Kbd as ChakraKbd,
   Text,
 } from "@chakra-ui/react";
-import { CSSProperties, forwardRef, ReactNode } from "react";
+import { CSSProperties, ElementType, forwardRef, ReactNode } from "react";
+
+import ChatAvatar from "./ChatAvatar";
 
 // Shared workbench chrome primitives, so panel headers and their actions are
 // sized and spaced consistently everywhere (one design system, not one-offs).
@@ -39,23 +44,50 @@ export const PanelIconButton = forwardRef<HTMLButtonElement, IconButtonProps>(fu
   );
 });
 
-/** A panel section header: fixed height, uppercase label, right-aligned actions. */
-export function PanelHeader({ title, actions }: { title: string; actions?: ReactNode }) {
+/** A panel section header: fixed height, a hue-tinted identity chip, uppercase
+ *  label, right-aligned actions. The chip is what lets you tell Explorer from
+ *  Chat from People at a glance without reading any of them. */
+export function PanelHeader({
+  title,
+  actions,
+  icon,
+  hue = "brand.400",
+}: {
+  title: string;
+  actions?: ReactNode;
+  icon?: ElementType;
+  hue?: string;
+}) {
+  const cv = `var(--chakra-colors-${hue.replace(".", "-")})`;
   return (
     <Flex
       align="center"
       justify="space-between"
       h="35px"
-      pl={4}
+      pl={2.5}
       pr={2}
       flexShrink={0}
       borderBottom="1px solid"
       borderColor="surface.border"
       bg="surface.panel2"
     >
-      <Text textStyle="eyebrow" isTruncated>
-        {title}
-      </Text>
+      <Flex align="center" gap={2} minW={0}>
+        {icon && (
+          <Flex
+            boxSize="18px"
+            borderRadius="sm"
+            align="center"
+            justify="center"
+            flexShrink={0}
+            sx={{ background: `color-mix(in oklab, ${cv} 18%, transparent)` }}
+          >
+            <Icon as={icon} boxSize="11px" color={hue} />
+          </Flex>
+        )}
+        <Text textStyle="eyebrow" isTruncated>
+          {title}
+        </Text>
+      </Flex>
       {actions && (
         <Flex align="center" gap="1px">
           {actions}
@@ -243,6 +275,51 @@ export function EmptyState({
         </Text>
       )}
       {action && <Flex mt={2}>{action}</Flex>}
+    </Flex>
+  );
+}
+
+/** Overlapping identity chips — a crowd reads at a glance where a list of
+ *  names doesn't. Capped at `max`, with the remainder as a +N chip. */
+export function AvatarStack({
+  people,
+  size = 24,
+  max = 4,
+  ring = "surface.panel",
+}: {
+  people: { id: number; name: string }[];
+  size?: number;
+  max?: number;
+  ring?: string;
+}) {
+  const shown = people.slice(0, max);
+  const rest = people.length - shown.length;
+  const overlap = Math.round(size * 0.32);
+  const chip = (i: number) => ({
+    ml: i === 0 ? 0 : `-${overlap}px`,
+    zIndex: people.length - i,
+    borderRadius: "full",
+    sx: { boxShadow: `0 0 0 2px var(--chakra-colors-${ring.replace(".", "-")})` },
+  });
+  return (
+    <Flex align="center" flexShrink={0}>
+      {shown.map((p, i) => (
+        <Box key={p.id} {...chip(i)}>
+          <ChatAvatar name={p.name} size={size} />
+        </Box>
+      ))}
+      {rest > 0 && (
+        <Center
+          {...chip(shown.length)}
+          boxSize={`${size}px`}
+          bg="surface.sunken"
+          color="ink.muted"
+          fontSize={`${Math.max(9, Math.round(size * 0.36))}px`}
+          fontWeight={700}
+        >
+          +{rest}
+        </Center>
+      )}
     </Flex>
   );
 }
