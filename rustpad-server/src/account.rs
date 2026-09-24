@@ -653,8 +653,9 @@ mod account_routes_tests {
         db.create_user_if_absent("admin", "Admin", "hash", "admin", Some(org.id)).await.unwrap();
         let stale_actor = db.get_user_by_email("admin").await.unwrap().unwrap();
         db.admin_update_user(stale_actor.id, None, None, Some("user"), None, None).await.unwrap();
+        let test_password = format!("test-{:032x}", rand::random::<u128>());
         let result = admin_create(stale_actor, db.clone(), NewUserReq {
-            email: "should-not-exist".into(), password: "password123".into(),
+            email: "should-not-exist".into(), password: test_password,
             name: "Unwanted".into(), role: "user".into(), org_id: None,
         }).await;
         assert!(result.err().unwrap().find::<Forbidden>().is_some());
@@ -676,6 +677,7 @@ mod account_routes_tests {
             db.create_session(token, user.id, now_secs() + 3600).await.unwrap();
         }
         let member2 = db.get_user_by_email("member2").await.unwrap().unwrap();
+        let test_password = format!("test-{:032x}", rand::random::<u128>());
         let live: LiveDocs = Default::default();
         let boards: LiveBoards = Default::default();
         let api = routes(db.clone(), live, boards).recover(crate::auth::handle_rejection);
@@ -702,7 +704,7 @@ mod account_routes_tests {
         assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
         let forbidden = warp::test::request().method("POST").path("/admin/users")
             .header("cookie", "authpad_session=admin-token")
-            .json(&json!({"email":"outsider", "name":"Outsider", "password":"password123", "role":"user", "org_id":second.id}))
+            .json(&json!({"email":"outsider", "name":"Outsider", "password":&test_password, "role":"user", "org_id":second.id}))
             .reply(&api).await;
         assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
         assert!(db.get_user_by_email("outsider").await.unwrap().is_none());
@@ -714,7 +716,7 @@ mod account_routes_tests {
         assert_eq!(data["users"].as_array().unwrap().len(), 3);
         let created = warp::test::request().method("POST").path("/admin/users")
             .header("cookie", "authpad_session=admin-token")
-            .json(&json!({"email":"colleague", "name":"Colleague", "password":"password123", "role":"user"}))
+            .json(&json!({"email":"colleague", "name":"Colleague", "password":&test_password, "role":"user"}))
             .reply(&api).await;
         assert_eq!(created.status(), StatusCode::OK);
         assert_eq!(db.get_user_by_email("colleague").await.unwrap().unwrap().org_id, Some(first.id));
