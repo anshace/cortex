@@ -13,12 +13,24 @@ file upload/download added on top.
   run and provisions every other account from the owner console. Every data
   route (documents, the collaborative socket, stats) requires a valid session;
   nothing is reachable anonymously.
-- **Roles.** `admin` owns a workspace, adds members, and is the only role that
-  can upload/download files. Regular `user`s can open and edit files
-  collaboratively.
+- **Roles and scope.** The owner (`root`) can manage all orgs, accounts,
+  groups, workspaces and chat. Org admins manage accounts, memberships and
+  moderation **only within their own org**; they cannot assign users to another
+  org or change the owner account. Members can create, edit, upload and download
+  files in workspaces they can access; only a workspace/group manager can delete,
+  merge or move a workspace.
+- **Files and backups.** Download one file, a selected set or a folder as a ZIP,
+  or export/import a whole workspace. Cut/copy/paste and drag files or folders
+  between accessible workspaces; conflicts are numbered, never overwritten.
+  Merge workspaces atomically, retaining files and their collaborative content.
+  The owner can export/import the whole instance from the Data tab.
 - **Multi-file, multi-user.** Each file is its own OT document; many users edit
   the same file in real time with live cursors.
-- **SQLite** for users, sessions, workspaces, files, and document content.
+- **SQLite** for users, sessions, workspaces, files and document content. Hard
+  deletes remove the content and its dependents atomically. The Rust app does
+  daily housekeeping (session/orphan/audit pruning, WAL checkpointing and
+  conditional VACUUM) in Docker or a bare-metal installation. The owner can
+  run **Settings → Storage → Compact now** at any time.
 
 ## Prerequisites
 
@@ -60,7 +72,8 @@ docker run -d -p 3030:3030 -v cortex-data:/data ghcr.io/anshace/cortex:latest
 Everything (users, sessions, workspaces, files, chat) lives in SQLite inside the
 `cortex-data` volume, so your data survives restarts and upgrades. Sign in as the
 default owner; the owner creates orgs, workspaces, and accounts from the owner
-console; an admin adds members and manages files; members join and edit.
+console; org admins manage their own org's users, groups and chat; members
+join, edit and download in the workspaces they can access.
 
 ### With your own domain + automatic HTTPS (optional)
 
@@ -106,10 +119,16 @@ target.
 
 ## Tests
 
+Backend unit tests cover hard-delete integrity, SQLite maintenance, transfers,
+imports and org-scoped account mutations. Older Rustpad integration tests under
+`rustpad-server/tests/` predate authentication and are not part of CI.
+
 ```bash
-cargo test --manifest-path rustpad-server/Cargo.toml auth   # auth unit tests
+cargo test --lib --manifest-path rustpad-server/Cargo.toml
+npm run check
 ```
 
-> Note: the original Rustpad integration tests under `rustpad-server/tests/`
-> predate authentication and assume open access; they need updating for the
-> locked model.
+**Backups:** never copy a live SQLite `.db` alone in WAL mode. The owner console
+has **Data → Export everything** (includes password hashes and 2FA secrets; keep
+it encrypted). For a consistent online `.db` backup or restore instructions,
+see [DEPLOY.md](DEPLOY.md). The built-in daily maintenance is not a backup.

@@ -621,3 +621,68 @@ async fn org_delete(
         }
     }
 }
+
+#[cfg(test)]
+mod account_routes_tests {
+    use super::*;
+    use warp::http::StatusCode;
+
+    #[tokio::test]
+    async fn org_admin_endpoints_are_scoped_and_owner_sees_all() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(&format!("sqlite://{}", tmp.path().display())).await.unwrap();
+        db.create_user_if_absent("owner", "Owner", "hash", "root", None).await.unwrap();
+        let first = db.create_org("First", "first", 1).await.unwrap();
+        let second = db.create_org("Second", "second", 1).await.unwrap();
+        db.create_user_if_absent("admin1", "Admin", "hash", "admin", Some(first.id)).await.unwrap();
+        db.create_user_if_absent("member1", "Member", "hash", "user", Some(first.id)).await.unwrap();
+        db.create_user_if_absent("member2", "Member", "hash", "user", Some(second.id)).await.unwrap();
+        for (email, token) in [("owner", "owner-token"), ("admin1", "admin-token"), ("member1", "member-token")] {
+            let user = db.get_user_by_email(email).await.unwrap().unwrap();
+            db.create_session(token, user.id, now_secs() + 3600).await.unwrap();
+        }
+        let member2 = db.get_user_by_email("member2").await.unwrap().unwrap();
+        let live: LiveDocs = Default::default();
+        let boards: LiveBoards = Default::default();
+        let api = routes(db.clone(), live, boards).recover(crate::auth::handle_rejection);
+
+        let list = warp::test::request().method("GET").path("/admin/users")
+            .header("cookie", "authpad_session=admin-token").reply(&api).await;
+        assert_eq!(list.status(), StatusCode::OK);
+        let data: serde_json::Value = serde_json::from_slice(list.body()).unwrap();
+        assert_eq!(data["users"].as_array().unwrap().len(), 2);
+        assert!(!data.to_string().contains("member2"));
+        assert!(!data.to_string().contains("owner"));
+
+        let forbidden = warp::test::request().method("GET").path("/admin/users")
+            .header("cookie", "authpad_session=member-token").reply(&api).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let forbidden = warp::test::request().method("GET").path("/admin/orgs")
+            .header("cookie", "authpad_session=admin-token").reply(&api).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let forbidden = warp::test::request().method("POST").path(&format!("/admin/users/{}", member2.id))
+            .header("cookie", "authpad_session=admin-token").json(&json!({"role":"admin"})).reply(&api).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let forbidden = warp::test::request().method("DELETE").path(&format!("/admin/users/{}", member2.id))
+            .header("cookie", "authpad_session=admin-token").reply(&api).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        let forbidden = warp::test::request().method("POST").path("/admin/users")
+            .header("cookie", "authpad_session=admin-token")
+            .json(&json!({"email":"outsider", "name":"Outsider", "password":"password123", "role":"user", "org_id":second.id}))
+            .reply(&api).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert!(db.get_user_by_email("outsider").await.unwrap().is_none());
+
+        let owner_list = warp::test::request().method("GET").path("/admin/users")
+            .header("cookie", "authpad_session=owner-token").reply(&api).await;
+        assert_eq!(owner_list.status(), StatusCode::OK);
+        let data: serde_json::Value = serde_json::from_slice(owner_list.body()).unwrap();
+        assert_eq!(data["users"].as_array().unwrap().len(), 3);
+        let created = warp::test::request().method("POST").path("/admin/users")
+            .header("cookie", "authpad_session=admin-token")
+            .json(&json!({"email":"colleague", "name":"Colleague", "password":"password123", "role":"user"}))
+            .reply(&api).await;
+        assert_eq!(created.status(), StatusCode::OK);
+        assert_eq!(db.get_user_by_email("colleague").await.unwrap().unwrap().org_id, Some(first.id));
+    }
+}
