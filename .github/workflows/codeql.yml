@@ -13,7 +13,7 @@ on:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       security-events: write
       actions: read
@@ -27,7 +27,7 @@ jobs:
 
       - uses: github/codeql-action/init@v4.37.6
         with:
-          language: ${{ matrix.language }}
+          languages: ${{ matrix.language }}
       - uses: github/codeql-action/analyze@v4.37.6
         with:
           category: "/language:${{ matrix.language }}"

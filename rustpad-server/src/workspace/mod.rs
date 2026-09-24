@@ -2043,6 +2043,8 @@ async fn get_chat(
     q: ChatQuery,
     epk: Option<String>,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     ensure_group(&db, &user, q.group_id).await?;
     let messages = db
         .list_messages(q.group_id, 300)
@@ -2067,6 +2069,8 @@ async fn post_chat(
     epk: Option<String>,
     raw: bytes::Bytes,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     ensure_group(&db, &user, q.group_id).await?;
     let body: ChatPost =
         match crypto::open_request(&epk, &raw).and_then(|b| serde_json::from_slice(&b).ok()) {
@@ -2095,6 +2099,8 @@ async fn post_chat(
 
 /// Clear a group's chat. Admin, root, or the group owner.
 async fn clear_chat(user: User, db: Database, q: ChatQuery) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     let g = ensure_group(&db, &user, q.group_id).await?;
     if user.role != "admin" && user.role != "root" && !group_owner(&db, &user, g.id).await {
         return Err(warp::reject::custom(Forbidden));
@@ -2127,6 +2133,8 @@ async fn get_dm(
     q: DmQuery,
     epk: Option<String>,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     let org = dm_ctx(&db, &user, &q).await?;
     let messages = db
         .list_dm(org, user.id, q.with, 300)
@@ -2151,6 +2159,8 @@ async fn post_dm(
     epk: Option<String>,
     raw: bytes::Bytes,
 ) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     let org = dm_ctx(&db, &user, &q).await?;
     let body: ChatPost =
         match crypto::open_request(&epk, &raw).and_then(|b| serde_json::from_slice(&b).ok()) {
@@ -2179,6 +2189,8 @@ async fn post_dm(
 
 /// Clear a 1:1 conversation. Either participant may do this (clears for both).
 async fn clear_dm(user: User, db: Database, q: DmQuery) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     let org = dm_ctx(&db, &user, &q).await?;
     match db.clear_dm(org, user.id, q.with).await {
         Ok(()) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
@@ -2217,6 +2229,11 @@ async fn edit_chat(
         Some(t) => t,
         None => return Ok(err(StatusCode::BAD_REQUEST, "empty or oversized message")),
     };
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
+    let group_id = db.message_group(id).await.ok().flatten()
+        .ok_or_else(|| warp::reject::custom(Forbidden))?;
+    ensure_group(&db, &user, group_id).await?;
     match db.edit_message(id, user.id, text, now_secs()).await {
         Ok(true) => Ok(crypto::seal_reply(&epk, &json!({ "ok": true }))),
         _ => Ok(err(StatusCode::FORBIDDEN, "cannot edit this message")),
@@ -2226,6 +2243,8 @@ async fn edit_chat(
 /// Authors can delete their own messages. Group managers can moderate any
 /// message in their group; they still cannot read/moderate private DMs.
 async fn delete_chat_msg(id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
     let group_id = match db.message_group(id).await {
         Ok(Some(id)) => id,
         Ok(None) => return Ok(err(StatusCode::NOT_FOUND, "message not found")),
@@ -2240,6 +2259,19 @@ async fn delete_chat_msg(id: i64, user: User, db: Database) -> Result<impl Reply
             warn!("delete_chat_msg {id}: {e}");
             Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "could not delete message"))
         }
+    }
+}
+
+/// The author/recipient may act on a DM only while they still have access to
+/// its org. The UPDATE/DELETE additionally requires the author in SQL.
+async fn dm_message_allowed(db: &Database, user: &User, id: i64) -> Result<(), Rejection> {
+    let (sender, org, recipient) = db.reaction_context("dm", id).await.ok().flatten()
+        .ok_or_else(|| warp::reject::custom(Forbidden))?;
+    if (user.id == sender || user.id == recipient)
+        && (user.role == "root" || user.org_id == Some(org)) {
+        Ok(())
+    } else {
+        Err(warp::reject::custom(Forbidden))
     }
 }
 
@@ -2260,6 +2292,9 @@ async fn edit_dm(
         Some(t) => t,
         None => return Ok(err(StatusCode::BAD_REQUEST, "empty or oversized message")),
     };
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
+    dm_message_allowed(&db, &user, id).await?;
     match db.edit_dm(id, user.id, text, now_secs()).await {
         Ok(true) => Ok(crypto::seal_reply(&epk, &json!({ "ok": true }))),
         _ => Ok(err(StatusCode::FORBIDDEN, "cannot edit this message")),
@@ -2268,6 +2303,9 @@ async fn edit_dm(
 
 /// Delete one of your own direct messages.
 async fn delete_dm_msg(id: i64, user: User, db: Database) -> Result<impl Reply, Rejection> {
+    let _gate = crate::access_gate().read().await;
+    let user = current_actor(&db, &user).await?;
+    dm_message_allowed(&db, &user, id).await?;
     match db.delete_dm_message(id, user.id).await {
         Ok(true) => Ok(warp::reply::json(&json!({ "ok": true })).into_response()),
         _ => Ok(err(StatusCode::FORBIDDEN, "cannot delete this message")),
@@ -2671,5 +2709,59 @@ mod archive_tests {
         // Distinct ZIP entry names can collide after separator normalization.
         assert!(unpack_workspace_zip(pack(&[("a\\b.txt", b"one"), ("a/b.txt", b"two")])).is_err());
         assert!(unpack_workspace_zip(pack(&[("./docs/a.txt", b"safe")])).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+    use warp::Filter;
+
+    #[tokio::test]
+    async fn org_admin_moderates_only_own_org_and_owner_can_transfer_across_orgs() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(&format!("sqlite://{}", tmp.path().display())).await.unwrap();
+        db.create_user_if_absent("owner", "Owner", "hash", "root", None).await.unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let first = db.create_org("First", "first", 1).await.unwrap();
+        let second = db.create_org("Second", "second", 1).await.unwrap();
+        db.create_user_if_absent("admin1", "Admin 1", "hash", "admin", Some(first.id)).await.unwrap();
+        db.create_user_if_absent("admin2", "Admin 2", "hash", "admin", Some(second.id)).await.unwrap();
+        let admin1 = db.get_user_by_email("admin1").await.unwrap().unwrap();
+        let group1 = db.create_group(first.id, "First group", owner.id, 1, "group").await.unwrap();
+        let group2 = db.create_group(second.id, "Second group", owner.id, 1, "group").await.unwrap();
+        let ws1 = db.create_workspace(group1.id, "Source", owner.id, 1).await.unwrap();
+        let ws2 = db.create_workspace(group2.id, "Target", owner.id, 1).await.unwrap();
+        let file = db.create_file(ws1.id, "docs/start.txt", "original-doc", "text", None, 1).await.unwrap();
+        db.create_message(group1.id, owner.id, "Keep me", 1).await.unwrap();
+        let msg = db.group_last_msg(group1.id).await.unwrap().unwrap().0;
+        for (email, token) in [("owner", "owner-token"), ("admin1", "first-token"), ("admin2", "second-token")] {
+            let user = db.get_user_by_email(email).await.unwrap().unwrap();
+            db.create_session(token, user.id, now_secs() + 3600).await.unwrap();
+        }
+        let api = routes(db.clone(), Default::default(), Default::default())
+            .recover(crate::auth::handle_rejection);
+        let forbidden = warp::test::request().method("DELETE").path(&format!("/chat/{msg}"))
+            .header("cookie", "authpad_session=second-token").reply(&api).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert!(db.group_last_msg(group1.id).await.unwrap().is_some());
+        let moderated = warp::test::request().method("DELETE").path(&format!("/chat/{msg}"))
+            .header("cookie", "authpad_session=first-token").reply(&api).await;
+        assert_eq!(moderated.status(), StatusCode::OK);
+        assert!(db.group_last_msg(group1.id).await.unwrap().is_none());
+
+        let body = json!({
+            "target_workspace_id": ws2.id, "mode": "move", "on_conflict": "rename",
+            "items": [{"id": file.id, "path": "docs/start.txt"}],
+        });
+        let forbidden = warp::test::request().method("POST").path("/files/transfer")
+            .header("cookie", "authpad_session=first-token").json(&body).reply(&api).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert_eq!(db.get_file(file.id).await.unwrap().unwrap().workspace_id, ws1.id);
+        let moved = warp::test::request().method("POST").path("/files/transfer")
+            .header("cookie", "authpad_session=owner-token").json(&body).reply(&api).await;
+        assert_eq!(moved.status(), StatusCode::OK);
+        assert_eq!(db.get_file(file.id).await.unwrap().unwrap().workspace_id, ws2.id);
+        assert!(ensure_ws(&db, &admin1, ws2.id).await.is_err());
     }
 }
