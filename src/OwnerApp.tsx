@@ -50,6 +50,7 @@ import {
 import PasswordResetDialog from "./PasswordResetDialog";
 import Settings from "./Settings";
 import WorkspaceApp from "./WorkspaceApp";
+import type { ClipboardState } from "./FileTree";
 import * as api from "./api";
 import { AdminOrg, AdminUser, Me } from "./api";
 
@@ -71,6 +72,8 @@ function OwnerApp({
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [resetTarget, setResetTarget] = useState<AdminUser | null>(null);
   const [browse, setBrowse] = useState<number | null>(null);
+  const [browseWorkspace, setBrowseWorkspace] = useState<number | null>(null);
+  const [fileClipboard, setFileClipboard] = useState<ClipboardState>(null);
   const importInput = useRef<HTMLInputElement>(null);
 
   // org form
@@ -146,9 +149,14 @@ function OwnerApp({
   if (browse != null) {
     return (
       <WorkspaceApp
+        key={browse}
         me={me}
         orgId={browse}
-        onExit={() => setBrowse(null)}
+        initialWorkspaceId={browseWorkspace ?? undefined}
+        fileClipboard={fileClipboard}
+        onFileClipboardChange={setFileClipboard}
+        onExit={() => { setBrowse(null); setBrowseWorkspace(null); }}
+        onNavigateOrg={(id, workspaceId) => { setBrowseWorkspace(workspaceId); setBrowse(id); }}
         onLogout={onLogout}
       />
     );
@@ -245,6 +253,14 @@ function OwnerApp({
         display={settingsOpen ? "none" : "block"}
       >
         <Box maxW="880px" mx="auto">
+          {fileClipboard && (
+            <Flex align="center" gap={3} mb={4} px={4} py={2} bg="surface.panel" border="1px solid" borderColor="brand.500" borderRadius="md">
+              <Text flex={1} fontSize="sm">
+                {fileClipboard.mode === "cut" ? "Moving" : "Copying"} {fileClipboard.items.length} files. Open the destination org and paste into a workspace.
+              </Text>
+              <Button size="xs" variant="ghost" onClick={() => setFileClipboard(null)}>Cancel</Button>
+            </Flex>
+          )}
           <Tabs colorScheme="brand" isLazy>
             <TabList mb={6} borderColor={border}>
               <Tab fontSize="sm">Orgs</Tab>
@@ -345,7 +361,7 @@ function OwnerApp({
                             <Button
                               size="xs"
                               colorScheme="brand"
-                              onClick={() => setBrowse(o.id)}
+                              onClick={() => { setBrowseWorkspace(null); setBrowse(o.id); }}
                             >
                               Open
                             </Button>

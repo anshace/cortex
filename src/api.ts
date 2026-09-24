@@ -297,7 +297,7 @@ export async function downloadWorkspaceZip(
   const res = await fetch(`/api/workspaces/${wsId}/export`, {
     credentials: "include",
   });
-  if (!res.ok) throw new Error("export failed");
+  if (!res.ok) await json(res);
   saveZip(await res.blob(), fallbackName);
 }
 export async function downloadFilesZip(
@@ -697,7 +697,7 @@ export async function adminDeleteOrg(id: number): Promise<void> {
 // out (sessions belong to the old instance).
 export async function adminExportAll(): Promise<void> {
   const res = await fetch("/api/admin/export-all", { credentials: "include" });
-  if (!res.ok) throw new Error("export failed");
+  if (!res.ok) await json(res);
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -707,7 +707,7 @@ export async function adminExportAll(): Promise<void> {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 export async function adminImportAll(file: File): Promise<void> {
   const res = await fetch("/api/admin/import-all", {

@@ -70,8 +70,8 @@ and protect it, and test restoring it on a separate installation.
 
 For a scheduled *database* backup, use SQLite's online backup API instead of
 copying the live file. With the compose stack, run this from the project dir
-(the volume name is resolved by compose; replace `cortex_cortex-data` below if
-your compose project name differs):
+(the volume name normally includes the compose project prefix; check `docker
+volume ls` and replace `cortex_cortex-data` below if yours differs):
 
 ```sh
 mkdir -p "$HOME/backups" && chmod 700 "$HOME/backups"
