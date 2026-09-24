@@ -96,7 +96,11 @@ import { PanelHeader, PanelIconButton } from "./ui";
 type Props = {
   me: Me;
   orgId?: number; // set when the owner is browsing a specific org
+  initialWorkspaceId?: number; // owner cross-org merge/move destination
+  fileClipboard?: ClipboardState;
+  onFileClipboardChange?: (clipboard: ClipboardState) => void;
   onExit?: () => void; // back to the owner console
+  onNavigateOrg?: (orgId: number, workspaceId: number) => void; // owner cross-org merge/move
   onLogout: () => void;
   onUpdated?: () => void; // refresh `me` after a profile/2FA change
 };
@@ -146,7 +150,7 @@ function pruneGroups(gs: GroupState[], exist: Set<number>): GroupState[] {
   return pruned.length ? pruned : [{ fileIds: [], activeId: null }];
 }
 
-function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
+function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalClipboard, onFileClipboardChange, onExit, onNavigateOrg, onLogout, onUpdated }: Props) {
   const toast = useToast();
   const { colorMode, toggleColorMode } = useColorMode();
   const [org, setOrg] = useState<OrgData | null>(null);
@@ -176,12 +180,16 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
   const [confirm, setConfirm] = useState<ConfirmCfg | null>(null);
   const [wsMenu, setWsMenu] = useState<MenuState>(null);
   // Clipboard belongs to the shell, not the tree: switching workspaces must
-  // not turn Cut + Paste into a rename inside the old workspace.
-  const [fileClipboard, setFileClipboard] = useState<ClipboardState>(null);
+  // not turn Cut + Paste into a rename inside the old workspace. The owner
+  // carries it across the org browser/console as well for cross-org transfers.
+  const [localClipboard, setLocalClipboard] = useState<ClipboardState>(null);
+  const fileClipboard = externalClipboard === undefined ? localClipboard : externalClipboard;
+  const setFileClipboard = onFileClipboardChange ?? setLocalClipboard;
   const [workspaceAction, setWorkspaceAction] = useState<{
     kind: "merge" | "group";
     source: Workspace;
     targetId: number;
+    options: { id: number; label: string; orgId: number; groupId: number }[];
   } | null>(null);
   // Whether the "Workspaces" section in the Explorer panel is collapsed.
   const [wsSectionOpen, setWsSectionOpen] = useState(true);
@@ -563,6 +571,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     wsRef.current = data.workspaces;
     setActiveWsId((cur) => {
       if (cur && data.workspaces.some((w) => w.id === cur)) return cur;
+      if (initialWorkspaceId && data.workspaces.some((w) => w.id === initialWorkspaceId)) return initialWorkspaceId;
       if (orgId == null) {
         const slug = window.location.pathname.replace(/^\/+/, "").split("/")[0];
         const bySlug = data.workspaces.find((w) => w.slug === slug);
@@ -571,7 +580,7 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
       return data.workspaces[0]?.id ?? null;
     });
     return data;
-  }, [orgId]);
+  }, [orgId, initialWorkspaceId]);
 
   // The active group follows the active workspace (a workspace lives inside
   // one group), unless the user explicitly picked an empty group.
@@ -1004,43 +1013,83 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
     });
   }
 
-  function chooseWorkspaceAction(kind: "merge" | "group", source: Workspace) {
-    const options =
-      kind === "merge"
-        ? org?.workspaces.filter((w) => w.id !== source.id)
-        : org?.groups.filter((g) => g.id !== source.group_id);
-    if (!options?.length) {
-      toast({ title: "Create another workspace or group first", status: "info" });
-      return;
+  async function chooseWorkspaceAction(kind: "merge" | "group", source: Workspace) {
+    if (!org) return;
+    const currentOrgId = org.org?.id ?? orgId;
+    if (currentOrgId == null) return;
+    try {
+      // The owner can select a group/workspace in any org. Org admins can only
+      // select targets in their own org (enforced again by the API).
+      const all: { name: string; id: number; data: OrgData }[] = me.role === "root"
+        ? await Promise.all((await api.adminListOrgs()).orgs.map(async (entry) => ({
+            name: entry.name,
+            id: entry.id,
+            data: await api.getOrg(entry.id),
+          })))
+        : [{ name: org.org?.name ?? "Org", id: currentOrgId, data: org }];
+      const options = all.flatMap(({ name, id, data }) =>
+        kind === "merge"
+          ? data.workspaces.filter((w) => w.id !== source.id).map((w) => ({
+              id: w.id,
+              orgId: id,
+              groupId: w.group_id,
+              label: `${name} / ${data.groups.find((g) => g.id === w.group_id)?.name ?? "Group"} / ${w.name}`,
+            }))
+          : data.groups.filter((g) => g.id !== source.group_id).map((g) => ({
+              id: g.id,
+              orgId: id,
+              groupId: g.id,
+              label: `${name} / ${g.name}`,
+            })),
+      );
+      if (!options.length) {
+        toast({ title: "Create another workspace or group first", status: "info" });
+        return;
+      }
+      setWorkspaceAction({ kind, source, targetId: options[0].id, options });
+    } catch (e) {
+      fail(e);
     }
-    setWorkspaceAction({ kind, source, targetId: options[0].id });
   }
 
   function confirmWorkspaceAction() {
     if (!workspaceAction) return;
-    const { kind, source, targetId } = workspaceAction;
+    const { kind, source, targetId, options } = workspaceAction;
+    const target = options.find((o) => o.id === targetId);
+    if (!target) return;
     setWorkspaceAction(null);
+    // Switching orgs remounts the explorer, so clipboard state lives in the
+    // owner console. Same-org operations just refresh the current explorer.
+    const after = () => {
+      if (target.orgId !== org?.org?.id && onNavigateOrg) {
+        onNavigateOrg(target.orgId, kind === "merge" ? targetId : source.id);
+      } else {
+        setActiveGroupId(target.groupId);
+        if (kind === "merge" || source.id === activeWsId) {
+          setActiveWsId(kind === "merge" ? targetId : source.id);
+        }
+        loadOrg();
+      }
+    };
     if (kind === "merge") {
-      const name = org?.workspaces.find((w) => w.id === targetId)?.name ?? "destination";
       setConfirm({
         title: "Merge workspaces",
-        body: `Move every file from "${source.name}" into "${name}", numbering conflicts, then permanently remove "${source.name}"? Open editors will reconnect. This cannot be undone.`,
+        body: `Move every file from "${source.name}" into "${target.label}", numbering conflicts, then permanently remove "${source.name}"? Open editors will reconnect. This cannot be undone.`,
         cta: "Merge",
         onConfirm: () => run(
           () => api.mergeWorkspaces(source.id, targetId),
-          () => { setActiveWsId(targetId); loadOrg(); },
+          after,
           "Workspaces merged",
         ),
       });
     } else {
-      const name = org?.groups.find((g) => g.id === targetId)?.name ?? "destination";
       setConfirm({
         title: "Move workspace",
-        body: `Move "${source.name}" to group "${name}"? Its members may gain or lose access; open editors will reconnect.`,
+        body: `Move "${source.name}" to "${target.label}"? Its members may gain or lose access; open editors will reconnect.`,
         cta: "Move",
         onConfirm: () => run(
           () => api.moveWorkspaceToGroup(source.id, targetId),
-          loadOrg,
+          after,
           "Workspace moved",
         ),
       });
@@ -1985,11 +2034,8 @@ function WorkspaceApp({ me, orgId, onExit, onLogout, onUpdated }: Props) {
                 onChange={(e) => setWorkspaceAction((a) => a && ({ ...a, targetId: Number(e.target.value) }))}
                 bg="surface.raised"
               >
-                {(workspaceAction?.kind === "merge"
-                  ? org.workspaces.filter((w) => w.id !== workspaceAction.source.id)
-                  : org.groups.filter((g) => g.id !== workspaceAction?.source.group_id)
-                ).map((target) => (
-                  <option key={target.id} value={target.id}>{target.name}</option>
+                {workspaceAction?.options.map((target) => (
+                  <option key={target.id} value={target.id}>{target.label}</option>
                 ))}
               </Select>
             </AlertDialogBody>

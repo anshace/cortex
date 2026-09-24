@@ -1647,8 +1647,8 @@ impl Database {
         snapshots: &HashMap<String, PersistedDocument>,
         now: i64,
     ) -> Result<Vec<FileRow>> {
-        if items.is_empty() || items.len() > 1000 {
-            bail!("select 1–1000 files");
+        if items.is_empty() || items.len() > 5000 {
+            bail!("select 1–5000 files");
         }
         let mut tx = self.pool.begin().await?;
         let mut seen = HashSet::new();
@@ -2843,7 +2843,7 @@ mod tests {
         assert!(!snapshot.contains_key("session"));
         db.delete_org(org.id).await.unwrap();
         let data: Vec<(String, Vec<serde_json::Value>)> = super::Database::MIGRATE_TABLES.iter()
-            .map(|t| (t.to_string(), snapshot[t].as_array().unwrap().clone())).collect();
+            .map(|t| (t.to_string(), snapshot[*t].as_array().unwrap().clone())).collect();
         db.import_replace_all(&data).await.unwrap();
         assert_eq!(db.load_blob(file.id).await.unwrap().unwrap(), vec![0, 255, 2]);
         assert_eq!(db.get_workspace(ws.id).await.unwrap().unwrap().group_id, group.id);

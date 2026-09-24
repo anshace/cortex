@@ -528,7 +528,7 @@ pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl F
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
         .and(with_docs(live.clone()))
-        .and(warp::body::content_length_limit(32 * 1024))
+        .and(warp::body::content_length_limit(128 * 1024))
         .and(warp::body::json())
         .and_then(archive_files);
 
@@ -571,7 +571,7 @@ pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl F
         .and(with_db(db.clone()))
         .and(with_docs(live.clone()))
         .and(with_boards(boards.clone()))
-        .and(warp::body::content_length_limit(1024 * 1024))
+        .and(warp::body::content_length_limit(4 * 1024 * 1024))
         .and(warp::body::json())
         .and_then(transfer_files);
 
@@ -581,7 +581,7 @@ pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl F
         .and(with_db(db.clone()))
         .and(with_docs(live.clone()))
         .and(with_boards(boards.clone()))
-        .and(warp::body::content_length_limit(32 * 1024))
+        .and(warp::body::content_length_limit(128 * 1024))
         .and(warp::body::json())
         .and_then(delete_file_batch);
 
@@ -1228,20 +1228,23 @@ async fn transfer_files(
         "error" => false,
         _ => return Ok(err(StatusCode::BAD_REQUEST, "invalid conflict policy")),
     };
-    if body.items.is_empty() || body.items.len() > 1000 {
-        return Ok(err(StatusCode::BAD_REQUEST, "select 1–1000 files"));
+    if body.items.is_empty() || body.items.len() > 5000 {
+        return Ok(err(StatusCode::BAD_REQUEST, "select 1–5000 files"));
     }
     let target = ensure_ws(&db, &user, body.target_workspace_id).await?;
-    let mut items = Vec::with_capacity(body.items.len());
+    let mut items = Vec::new(); // capped above; avoid user-sized reservations
     let mut snapshots = HashMap::new();
     let mut to_revoke = Vec::new();
     let mut boards_to_revoke = Vec::new();
-    let mut seen = std::collections::HashSet::new();
     let mut size: i64 = 0;
-    for item in body.items {
-        if !seen.insert(item.id) {
+    let mut incoming = body.items;
+    incoming.sort_unstable_by_key(|item| item.id);
+    let mut last_id = None;
+    for item in incoming {
+        if last_id == Some(item.id) {
             return Ok(err(StatusCode::BAD_REQUEST, "duplicate file id"));
         }
+        last_id = Some(item.id);
         let path = match clean_path(&item.path) {
             Some(p) => p,
             None => return Ok(err(StatusCode::BAD_REQUEST, "invalid destination path")),
@@ -1295,8 +1298,8 @@ async fn delete_file_batch(
     boards: LiveBoards,
     body: FileBatch,
 ) -> Result<impl Reply, Rejection> {
-    if body.ids.is_empty() || body.ids.len() > 1000 {
-        return Ok(err(StatusCode::BAD_REQUEST, "select 1–1000 files"));
+    if body.ids.is_empty() || body.ids.len() > 5000 {
+        return Ok(err(StatusCode::BAD_REQUEST, "select 1–5000 files"));
     }
     for id in &body.ids {
         if !file_allowed(&db, &user, *id).await {
@@ -1376,7 +1379,7 @@ fn unpack_workspace_zip(body: bytes::Bytes) -> anyhow::Result<Vec<ImportedFile>>
     const MAX_FILE: u64 = 32 * 1024 * 1024;
     const MAX_TOTAL: u64 = 128 * 1024 * 1024;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(body))?;
-    if archive.len() > 2000 {
+    if archive.len() > 6000 {
         anyhow::bail!("too many ZIP entries");
     }
     let mut entries = Vec::new();
@@ -1432,8 +1435,8 @@ fn unpack_workspace_zip(body: bytes::Bytes) -> anyhow::Result<Vec<ImportedFile>>
             entries.push(ImportedFile { path, mime: None, bytes: Vec::new(), is_text: true });
         }
     }
-    if entries.len() > 1000 {
-        anyhow::bail!("ZIP has more than 1000 files");
+    if entries.len() > 5000 {
+        anyhow::bail!("ZIP has more than 5000 files");
     }
     Ok(entries)
 }
@@ -1671,14 +1674,10 @@ async fn download_file(file_id: i64, user: User, db: Database, live: LiveDocs) -
         }
     };
     // Keep the header well-formed regardless of what the path contains.
-    let filename: String = file
-        .path
-        .rsplit('/')
-        .next()
-        .unwrap_or("download")
-        .chars()
-        .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
-        .collect();
+    let filename = safe_download_filename(
+        file.path.rsplit('/').next().unwrap_or("download"),
+        "download",
+    );
     let resp = warp::http::Response::builder()
         .header(
             "content-disposition",
@@ -1689,25 +1688,23 @@ async fn download_file(file_id: i64, user: User, db: Database, live: LiveDocs) -
     Ok(resp)
 }
 
-/// Sanitize a workspace name into a safe zip filename (no path separators,
-/// quotes, backslashes, or control chars).
+/// The HTTP header must be ASCII, bounded and free of quotes/separators. The
+/// client saves the requested Unicode name from its download attribute; this
+/// ASCII fallback also works when downloading directly without the UI.
+fn safe_download_filename(name: &str, fallback: &str) -> String {
+    let s: String = name.chars().take(180).map(|c| {
+        if c.is_ascii() && (c.is_ascii_alphanumeric() || " ._-()[]".contains(c)) {
+            c
+        } else {
+            '_'
+        }
+    }).collect();
+    let s = s.trim_matches(|c: char| c == ' ' || c == '.').to_string();
+    if s.is_empty() { fallback.to_string() } else { s }
+}
+
 fn zip_filename(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| {
-            if c.is_control() || c == '"' || c == '\\' || c == '/' {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let s = s.trim().to_string();
-    if s.is_empty() {
-        "workspace".to_string()
-    } else {
-        s
-    }
+    safe_download_filename(name, "workspace")
 }
 
 /// Build a bounded archive. Both selected-file and full-workspace downloads
@@ -1778,7 +1775,9 @@ async fn export_workspace(
         }
         Err(e) => {
             warn!("export_workspace {ws_id}: {e}");
-            Ok(err(StatusCode::PAYLOAD_TOO_LARGE, "archive too large or file content missing"))
+            let too_large = e.to_string().contains("archive exceeds") || e.to_string().contains("too many files");
+            Ok(err(if too_large { StatusCode::PAYLOAD_TOO_LARGE } else { StatusCode::INTERNAL_SERVER_ERROR },
+                if too_large { "archive exceeds the download limit" } else { "file content missing; archive could not be built" }))
         }
     }
 }
@@ -1794,13 +1793,18 @@ async fn archive_files(
     if body.ids.is_empty() || body.ids.len() > 5000 {
         return Ok(err(StatusCode::BAD_REQUEST, "select 1–5000 files"));
     }
-    let mut files = Vec::with_capacity(body.ids.len());
-    let mut seen = std::collections::HashSet::new();
+    // Sorting/deduplicating the already bounded request avoids a second
+    // user-sized hash-table allocation. The ZIP does not depend on ID order.
+    let mut ids = body.ids;
+    ids.sort_unstable();
+    let requested = ids.len();
+    ids.dedup();
+    if ids.len() != requested {
+        return Ok(err(StatusCode::BAD_REQUEST, "duplicate file id"));
+    }
+    let mut files = Vec::new();
     let mut workspace_id = None;
-    for id in body.ids {
-        if !seen.insert(id) {
-            return Ok(err(StatusCode::BAD_REQUEST, "duplicate file id"));
-        }
+    for id in ids {
         let file = match db.get_file(id).await {
             Ok(Some(f)) => f,
             _ => return Ok(err(StatusCode::NOT_FOUND, "file not found")),
@@ -1819,7 +1823,9 @@ async fn archive_files(
         }
         Err(e) => {
             warn!("archive_files: {e}");
-            Ok(err(StatusCode::PAYLOAD_TOO_LARGE, "archive too large or file content missing"))
+            let too_large = e.to_string().contains("archive exceeds") || e.to_string().contains("too many files");
+            Ok(err(if too_large { StatusCode::PAYLOAD_TOO_LARGE } else { StatusCode::INTERNAL_SERVER_ERROR },
+                if too_large { "archive exceeds the download limit" } else { "file content missing; archive could not be built" }))
         }
     }
 }
