@@ -48,11 +48,14 @@ import {
   VscCloudDownload,
   VscCloudUpload,
   VscCollapseAll,
+  VscComment,
   VscEdit,
   VscEllipsis,
   VscFiles,
+  VscFoldDown,
   VscFolderOpened,
   VscGlobe,
+  VscLayoutSidebarLeft,
   VscLock,
   VscNewFile,
   VscNewFolder,
@@ -61,6 +64,7 @@ import {
   VscSearch,
   VscSettingsGear,
   VscSignOut,
+  VscSplitHorizontal,
   VscTrash,
 } from "react-icons/vsc";
 import useLocalStorageState from "use-local-storage-state";
@@ -74,21 +78,20 @@ import ChatView, {
   WallpaperId,
 } from "./ChatView";
 import CommandPalette, { PaletteItem } from "./CommandPalette";
-import ContextMenu, { MenuState } from "./ContextMenu";
 import { ConfirmModal, PromptModal } from "./Dialogs";
 import EditorPane from "./EditorPane";
 import FileTree, {
-  CORTEX_DRAG_MIME,
   ClipboardState,
   FileTreeHandle,
   allFolderPaths,
-  parseExplorerDrag,
 } from "./FileTree";
 import Loader from "./Loader";
+import Logo from "./Logo";
 import { DEFAULT_NOTIF_PREFS, NotifPrefs } from "./Settings";
 import Settings from "./Settings";
 import * as api from "./api";
 import { FileRow, Group, Me, OrgData, Workspace, WorkspaceDetail } from "./api";
+import { ChromeProps, ContextHeader, RailActions } from "./AppChrome";
 import { fileIcon } from "./fileIcon";
 import { playNotifSound } from "./notifSound";
 import { PanelHeader, PanelIconButton } from "./ui";
@@ -170,15 +173,22 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
   const [chatTarget, setChatTarget] = useState<ChatTarget>({ kind: "group" });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [palette, setPalette] = useState<null | "files" | "commands">(null);
+  const [palette, setPalette] = useState<
+    null | "files" | "commands" | "all"
+  >(null);
   const [sidebarW, setSidebarW] = useLocalStorageState<number>(
     "cortex-sidebar-w",
     { defaultValue: 260 },
   );
+  // Per-workspace open history, newest first — what the empty editor offers
+  // back to you.
+  const [recents, setRecents] = useLocalStorageState<Record<number, number[]>>(
+    "cortex-recent-files",
+    { defaultValue: {} },
+  );
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [prompt, setPrompt] = useState<PromptCfg | null>(null);
   const [confirm, setConfirm] = useState<ConfirmCfg | null>(null);
-  const [wsMenu, setWsMenu] = useState<MenuState>(null);
   // Clipboard belongs to the shell, not the tree: switching workspaces must
   // not turn Cut + Paste into a rename inside the old workspace. The owner
   // carries it across the org browser/console as well for cross-org transfers.
@@ -191,8 +201,6 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
     targetId: number;
     options: { id: number; label: string; orgId: number; groupId: number }[];
   } | null>(null);
-  // Whether the "Workspaces" section in the Explorer panel is collapsed.
-  const [wsSectionOpen, setWsSectionOpen] = useState(true);
   // New-group dialog (name + visibility layer) and group-members dialog.
   const [groupDraft, setGroupDraft] = useState<{
     name: string;
@@ -275,6 +283,9 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
       } else if (k === "b") {
         e.preventDefault();
         setSidebarCollapsed((c) => !c);
+      } else if (k === "k") {
+        e.preventDefault();
+        setPalette("all");
       } else if (k === "s") {
         // Everything syncs live; swallow the browser's "save page" dialog.
         e.preventDefault();
@@ -376,6 +387,22 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
       window.clearInterval(id);
     };
   }, [orgId]);
+
+  // The file you land on is the file you were looking for: keep a short
+  // per-workspace history for the empty state and the dock's Recent list.
+  useEffect(() => {
+    const g = groups[Math.min(focused, groups.length - 1)];
+    const id = g?.activeId;
+    if (id == null || activeWsId == null) return;
+    setRecents((prev) => {
+      const list = prev[activeWsId] ?? [];
+      if (list[0] === id) return prev;
+      return {
+        ...prev,
+        [activeWsId]: [id, ...list.filter((x) => x !== id)].slice(0, 12),
+      };
+    });
+  }, [groups, focused, activeWsId, setRecents]);
 
   // Ask once for permission to show desktop notifications.
   useEffect(() => {
@@ -1384,6 +1411,36 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
     ? (groups[focusedIdx]?.activeId ?? null)
     : null;
 
+  // One ChatView element, used by whichever slot shows the conversation: the
+  // full-width main pane (Chat section) or the collaboration dock. Never both,
+  // so only one socket and one typing session are ever live.
+  const chatPane = (
+    <ChatView
+      me={me}
+      orgId={orgId}
+      groupId={activeGroupId}
+      members={org.members}
+      isAdmin={me.role === "admin" || me.role === "root"}
+      target={chatTarget}
+      groupName={activeGroup ? groupLabel(activeGroup) : undefined}
+      groupMemberCount={
+        activeGroup?.scope === "group" ? memberIds.length : undefined
+      }
+      canClearGroup={
+        me.role === "admin" ||
+        me.role === "root" ||
+        activeGroup?.created_by === myId
+      }
+      prefs={chatPrefs}
+      onPrefsChange={setRawChatPrefs}
+    />
+  );
+
+  const recentFiles = (recents[activeWsId ?? -1] ?? [])
+    .map((id) => filesById.get(id))
+    .filter((f): f is FileRow => !!f)
+    .slice(0, 8);
+
   // Quick Open (Ctrl+P): every real file in the workspace, openable by name.
   const fileItems: PaletteItem[] = allFiles
     .filter((f) => !f.path.endsWith("/.keep") && f.path !== ".keep")
@@ -1393,9 +1450,28 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
         id: f.id,
         label: f.path,
         icon: <Icon as={spec.icon} color={spec.color} />,
+        hue: spec.color,
         run: () => openFile(f),
       };
     });
+
+  // People are addressable from the same field as files: picking one opens the
+  // direct message with them.
+  const peopleItems: PaletteItem[] = org.members
+    .filter((m) => m.id !== myId)
+    .map((m) => ({
+      id: `dm-${m.id}`,
+      label: m.name || m.email,
+      hint: "person",
+      keywords: `dm message ${m.email}`,
+      icon: <Icon as={VscAccount} />,
+      hue: "accent.cyan",
+      run: () => {
+        setSidebarCollapsed(false);
+        setChatTarget({ kind: "dm", userId: m.id });
+        setSection("chat");
+      },
+    }));
 
   // Command Palette (Ctrl+Shift+P): app actions. New file/folder need the
   // Explorer mounted, so switch to it first, then act on the next tick.
@@ -1410,12 +1486,16 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
     setSidebarCollapsed(false);
     setSection(s);
   };
+  // Every command is colour-coded by what it touches, so the palette can be
+  // scanned without reading it: violet for the workbench, cyan for people and
+  // chat, green for transfers, amber for appearance, blue for settings.
   const commandItems: PaletteItem[] = [
     {
       id: "goto",
       label: "Go to File…",
       hint: "Ctrl+P",
       icon: <Icon as={VscSearch} />,
+      hue: "brand.400",
       run: () => setPalette("files"),
     },
     {
@@ -1423,6 +1503,7 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
       label: "Open Settings",
       hint: "Ctrl+,",
       icon: <Icon as={VscSettingsGear} />,
+      hue: "state.info",
       run: () => setSettingsOpen(true),
     },
     {
@@ -1430,24 +1511,29 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
       label: `Switch to ${colorMode === "dark" ? "light" : "dark"} theme`,
       keywords: "color mode dark light",
       icon: <Icon as={colorMode === "dark" ? FiSun : FiMoon} />,
+      hue: "state.warn",
       run: toggleColorMode,
     },
     {
       id: "sidebar",
       label: "Toggle Sidebar",
       hint: "Ctrl+B",
+      icon: <Icon as={VscLayoutSidebarLeft} />,
+      hue: "brand.400",
       run: () => setSidebarCollapsed((c) => !c),
     },
     {
       id: "newfile",
       label: "New File",
       icon: <Icon as={VscNewFile} />,
+      hue: "spectral.400",
       run: () => goExplorerThen(() => treeRef.current?.startCreate("file")),
     },
     {
       id: "newfolder",
       label: "New Folder",
       icon: <Icon as={VscNewFolder} />,
+      hue: "brand.400",
       run: () => goExplorerThen(() => treeRef.current?.startCreate("folder")),
     },
     {
@@ -1455,54 +1541,232 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
       label: "New Whiteboard",
       keywords: "draw sketch diagram excalidraw board shapes ideas",
       icon: <Icon as={VscEdit} />,
+      hue: "state.warn",
       run: () => goExplorerThen(() => treeRef.current?.startCreate("board")),
     },
     {
       id: "upload",
       label: "Upload Files…",
       icon: <Icon as={VscCloudUpload} />,
+      hue: "state.ok",
       run: () => requestUpload(""),
     },
     {
       id: "newgroup",
       label: "New Group",
       icon: <Icon as={VscOrganization} />,
+      hue: "accent.cyan",
       run: newGroup,
     },
     {
       id: "split",
       label: "Split Editor Right",
+      icon: <Icon as={VscSplitHorizontal} />,
+      hue: "brand.400",
       run: () => splitGroup(focusedIdx),
     },
     {
       id: "explorer",
       label: "Show Explorer",
       keywords: "files tree",
+      icon: <Icon as={VscFiles} />,
+      hue: "brand.400",
       run: () => showSection("explorer"),
     },
     {
       id: "chat",
       label: "Show Chat",
       keywords: "messages dm",
+      icon: <Icon as={VscComment} />,
+      hue: "accent.cyan",
       run: () => showSection("chat"),
     },
     {
       id: "collapse",
       label: "Collapse All Folders",
+      icon: <Icon as={VscFoldDown} />,
+      hue: "state.info",
       run: () => setCollapsed(new Set(allFolderPaths(allFiles))),
     },
     {
       id: "signout",
       label: "Sign Out",
       icon: <Icon as={VscSignOut} />,
+      hue: "state.bad",
       run: onLogout,
     },
   ];
+
+  // There is no window-wide header: its contents moved into the rail (the
+  // always-visible you-controls) and the top of the side panel (context).
+  const chrome: ChromeProps = {
+    me,
+    members: org.members,
+    myId,
+    activeGroupId,
+    groupName: activeGroup ? groupLabel(activeGroup) : null,
+    detail: ws,
+    groups: org.groups,
+    workspaces: org.workspaces,
+    onSelectGroup: selectGroup,
+    onSelectWorkspace: selectWorkspace,
+    onNewGroup: newGroup,
+    onNewWorkspace: newWorkspaceInGroup,
+    // The switcher rows carry the same menus the sidebar list used to, so the
+    // panel body can be nothing but files.
+    renderGroupMenu: (g) => {
+      const isPersonal = g.scope === "personal";
+      const label = groupLabel(g);
+      return (
+        <Menu placement="right-start" closeOnSelect={false}>
+          <MenuButton
+            as={IconButton}
+            aria-label={`${label} actions`}
+            icon={<VscEllipsis />}
+            size="xs"
+            variant="ghost"
+            color="ink.subtle"
+            _hover={{ color: "ink.base", bg: "surface.active" }}
+            onClick={(e: React.MouseEvent) => e.stopPropagation()}
+          />
+          <MenuList minW="190px">
+            <MenuItem
+              icon={<Icon as={VscAdd} fontSize="15px" />}
+              onClick={() => newWorkspaceInGroup(g.id)}
+            >
+              New workspace
+            </MenuItem>
+            {!isPersonal && (
+              <>
+                <MenuItem
+                  icon={<Icon as={VscEdit} fontSize="15px" />}
+                  onClick={() => renameGroup(g)}
+                >
+                  Rename
+                </MenuItem>
+                <MenuItem
+                  icon={<Icon as={VscAccount} fontSize="15px" />}
+                  onClick={() => openMembers(g)}
+                >
+                  Manage members…
+                </MenuItem>
+                <MenuDivider />
+                <MenuItem
+                  color="state.bad"
+                  _hover={{ bg: "state.badTint", color: "state.bad" }}
+                  _focus={{ bg: "state.badTint", color: "state.bad" }}
+                  icon={<Icon as={VscTrash} fontSize="15px" />}
+                  onClick={() => deleteGroup(g)}
+                >
+                  Delete group
+                </MenuItem>
+              </>
+            )}
+          </MenuList>
+        </Menu>
+      );
+    },
+    renderWorkspaceMenu: (w) => {
+      const count = fileClipboard?.items.length ?? 0;
+      return (
+        <Menu placement="right-start" closeOnSelect={false}>
+          <MenuButton
+            as={IconButton}
+            aria-label={`${w.name} actions`}
+            icon={<VscEllipsis />}
+            size="xs"
+            variant="ghost"
+            color="ink.subtle"
+            _hover={{ color: "ink.base", bg: "surface.active" }}
+            onClick={(e: React.MouseEvent) => e.stopPropagation()}
+          />
+          <MenuList minW="210px">
+            {count > 0 && (
+              <MenuItem
+                icon={<Icon as={VscFiles} fontSize="15px" />}
+                onClick={() => void pasteIntoWorkspace(w.id).catch(() => {})}
+              >
+                Paste {count} {count === 1 ? "file" : "files"} here
+              </MenuItem>
+            )}
+            <MenuItem
+              icon={<Icon as={VscCloudUpload} fontSize="15px" />}
+              onClick={() => requestImportZip(w.id)}
+            >
+              Import ZIP…
+            </MenuItem>
+            {canManageWorkspace(w) && (
+              <>
+                <MenuDivider />
+                <MenuItem
+                  icon={<Icon as={VscEdit} fontSize="15px" />}
+                  onClick={() => renameWorkspace(w)}
+                >
+                  Rename
+                </MenuItem>
+                <MenuItem
+                  icon={<Icon as={VscFolderOpened} fontSize="15px" />}
+                  onClick={() => chooseWorkspaceAction("group", w)}
+                >
+                  Move to group…
+                </MenuItem>
+                <MenuItem
+                  icon={<Icon as={VscFiles} fontSize="15px" />}
+                  onClick={() => chooseWorkspaceAction("merge", w)}
+                >
+                  Merge into…
+                </MenuItem>
+                <MenuItem
+                  color="state.bad"
+                  _hover={{ bg: "state.badTint", color: "state.bad" }}
+                  _focus={{ bg: "state.badTint", color: "state.bad" }}
+                  icon={<Icon as={VscTrash} fontSize="15px" />}
+                  onClick={() => deleteWorkspace(w)}
+                >
+                  Delete
+                </MenuItem>
+              </>
+            )}
+          </MenuList>
+        </Menu>
+      );
+    },
+    onSettings: () => setSettingsOpen(true),
+    colorMode,
+    toggleColorMode,
+    onLogout,
+    onExit,
+    settingsOpen,
+    overview,
+    chatTarget,
+    section,
+    notifInApp: notifPrefs.inApp,
+    onChatNavigate: (t) => {
+      setSettingsOpen(false);
+      setSidebarCollapsed(false);
+      setChatTarget(t);
+      setSection("chat");
+    },
+  };
 
   return (
     <Flex h="100vh" overflow="hidden" bg="surface.bg" color="ink.base">
       <ActivityBar
         section={section}
+        brand={
+          <Tooltip label="Cortex — search everything (Ctrl+K)" placement="right" openDelay={400}>
+            <Box
+              as="button"
+              display="flex"
+              flexShrink={0}
+              aria-label="Cortex"
+              onClick={() => setPalette("all")}
+            >
+              <Logo size={24} glow={false} />
+            </Box>
+          </Tooltip>
+        }
+        actions={<RailActions {...chrome} />}
         onSelect={(s) => {
           if (settingsOpen) {
             setSettingsOpen(false);
@@ -1517,31 +1781,6 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
           }
         }}
         chatCount={chatUnreadCount}
-        me={me}
-        onProfile={() => setSettingsOpen(true)}
-        colorMode={colorMode}
-        toggleColorMode={toggleColorMode}
-        onLogout={onLogout}
-        onExit={onExit}
-        groups={org.groups}
-        activeGroupId={activeGroupId}
-        onSelectGroup={selectGroup}
-        onNewGroup={newGroup}
-        onRenameGroup={renameGroup}
-        onNewWorkspace={newWorkspaceInGroup}
-        onManageMembers={openMembers}
-        onDeleteGroup={deleteGroup}
-        overview={overview}
-        members={org.members}
-        chatTarget={chatTarget}
-        settingsOpen={settingsOpen}
-        onChatNavigate={(t) => {
-          setSettingsOpen(false);
-          setSidebarCollapsed(false);
-          setChatTarget(t);
-          setSection("chat");
-        }}
-        notifInApp={notifPrefs.inApp}
       />
 
       {/* Side panel — Explorer, or Chat */}
@@ -1556,10 +1795,12 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
         borderColor="surface.border"
         overflow="hidden"
       >
+        <ContextHeader {...chrome} />
+
         {section === "chat" ? (
           <Flex direction="column" flex={1} minH={0}>
             {/* The chat sidebar is the conversation list itself (personal /
-                groups / org / DMs) — no workspace switcher up here anymore. */}
+                groups / org / DMs). */}
             <ChatChannels
               me={me}
               groups={org.groups}
@@ -1585,169 +1826,20 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
           </Flex>
         ) : (
           <Box flex={1} overflowY="auto" pb={2}>
-            {/* Workspaces — a collapsible section at the top of the Explorer panel
-                listing every workspace in the active group. The header has a
-                chevron to collapse/expand and a + button to create a workspace. */}
-            {activeGroup && (
-              <Box px={2} pt={2} pb={1}>
-                <Flex
-                  align="center"
-                  gap={1}
-                  px={1}
-                  py={0.5}
-                  borderRadius="md"
-                  cursor="pointer"
-                  _hover={{ bg: "surface.hover" }}
-                  onClick={() => setWsSectionOpen((o) => !o)}
-                >
-                  <Icon
-                    as={wsSectionOpen ? VscChevronDown : VscChevronRight}
-                    boxSize="12px"
-                    color="ink.subtle"
-                    flexShrink={0}
-                  />
-                  <Text
-                    flex={1}
-                    fontSize="10px"
-                    fontWeight={700}
-                    textTransform="uppercase"
-                    letterSpacing="0.05em"
-                    color="ink.subtle"
-                  >
-                    Workspaces
-                  </Text>
-                  <Tooltip label="New workspace" openDelay={400}>
-                    <PanelIconButton
-                      aria-label="New workspace"
-                      icon={<VscAdd />}
-                      size="xs"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        newWorkspaceInGroup(activeGroup.id);
-                      }}
-                    />
-                  </Tooltip>
-                </Flex>
-                {wsSectionOpen &&
-                  org.workspaces
-                    .filter((w) => w.group_id === activeGroup.id)
-                    .map((w) => {
-                      const active = w.id === activeWsId;
-                      return (
-                        <Flex
-                          key={w.id}
-                          align="center"
-                          gap={2}
-                          px={2}
-                          py={1.5}
-                          borderRadius="md"
-                          cursor="pointer"
-                          bg={active ? "accent.tint" : "transparent"}
-                          _hover={{
-                            bg: active ? "accent.tint" : "surface.hover",
-                          }}
-                          w="full"
-                          onClick={() => selectWorkspace(w.id)}
-                          onDragOver={(e) => {
-                            if (Array.from(e.dataTransfer.types).includes(CORTEX_DRAG_MIME)) {
-                              e.preventDefault();
-                              e.dataTransfer.dropEffect = e.ctrlKey || e.altKey ? "copy" : "move";
-                            }
-                          }}
-                          onDrop={(e) => {
-                            const payload = parseExplorerDrag(e.dataTransfer.getData(CORTEX_DRAG_MIME));
-                            if (!payload) return;
-                            e.preventDefault();
-                            e.stopPropagation();
-                            void transferInto(
-                              w.id,
-                              e.ctrlKey || e.altKey ? "copy" : "move",
-                              payload.entries.map(({ id, rel }) => ({ id, path: rel })),
-                              "rename",
-                            ).catch(() => {});
-                          }}
-                          onContextMenu={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            setWsMenu({
-                              x: e.clientX,
-                              y: e.clientY,
-                              actions: [
-                                ...(fileClipboard ? [{
-                                  label: `Paste ${fileClipboard.items.length} ${fileClipboard.items.length === 1 ? "file" : "files"} here`,
-                                  icon: VscFiles,
-                                  onClick: () => void pasteIntoWorkspace(w.id).catch(() => {}),
-                                }] : []),
-                                {
-                                  label: "Import ZIP…",
-                                  icon: VscCloudUpload,
-                                  onClick: () => requestImportZip(w.id),
-                                },
-                                ...(canManageWorkspace(w) ? [
-                                  {
-                                    label: "Rename",
-                                    icon: VscEdit,
-                                    onClick: () => renameWorkspace(w),
-                                  },
-                                  {
-                                    label: "Move to group…",
-                                    icon: VscFolderOpened,
-                                    onClick: () => chooseWorkspaceAction("group", w),
-                                  },
-                                  {
-                                    label: "Merge into…",
-                                    icon: VscFiles,
-                                    onClick: () => chooseWorkspaceAction("merge", w),
-                                  },
-                                  {
-                                    label: "Delete",
-                                    icon: VscTrash,
-                                    danger: true,
-                                    onClick: () => deleteWorkspace(w),
-                                  },
-                                ] : []),
-                              ],
-                            });
-                          }}
-                        >
-                          <Icon
-                            as={VscFiles}
-                            boxSize="13px"
-                            color={active ? "brand.400" : "ink.subtle"}
-                            flexShrink={0}
-                          />
-                          <Text
-                            fontSize="13px"
-                            isTruncated
-                            flex={1}
-                            color={active ? "ink.base" : "ink.muted"}
-                          >
-                            {w.name}
-                          </Text>
-                          {active && (
-                            <Icon
-                              as={VscCheck}
-                              color="brand.400"
-                              boxSize="13px"
-                              flexShrink={0}
-                            />
-                          )}
-                        </Flex>
-                      );
-                    })}
-              </Box>
-            )}
 
             {activeWs && (
               <>
                 <PanelHeader
                   title="Explorer"
+                  icon={VscFiles}
+                  hue="brand.400"
                   actions={
                     <>
                       <Tooltip label="New file" openDelay={400}>
                         <PanelIconButton
                           aria-label="New file"
                           icon={<VscNewFile />}
+                          color="brand.400"
                           onClick={() => treeRef.current?.startCreate("file")}
                         />
                       </Tooltip>
@@ -1755,6 +1847,7 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
                         <PanelIconButton
                           aria-label="New folder"
                           icon={<VscNewFolder />}
+                          color="brand.400"
                           onClick={() => treeRef.current?.startCreate("folder")}
                         />
                       </Tooltip>
@@ -1762,6 +1855,7 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
                         <PanelIconButton
                           aria-label="New whiteboard"
                           icon={<VscEdit />}
+                          color="state.warn"
                           onClick={() => treeRef.current?.startCreate("board")}
                         />
                       </Tooltip>
@@ -1771,6 +1865,7 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
                             as={PanelIconButton}
                             aria-label="Upload"
                             icon={<VscCloudUpload />}
+                            color="state.ok"
                           />
                           <MenuList
                             minW="175px"
@@ -1820,6 +1915,7 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
                         <PanelIconButton
                           aria-label="Download workspace as zip"
                           icon={<VscCloudDownload />}
+                          color="state.info"
                           onClick={() =>
                             api
                               .downloadWorkspaceZip(activeWs.id, activeWs.name)
@@ -1837,6 +1933,7 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
                         <PanelIconButton
                           aria-label="Refresh file list"
                           icon={<VscRefresh />}
+                          color="accent.cyan"
                           onClick={() => loadWs()}
                         />
                       </Tooltip>
@@ -1912,51 +2009,40 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
         />
       )}
 
-      {/* Main pane */}
+      {/* Main pane — the editor, or the full-width chat when it is the section */}
       {section === "chat" && !settingsOpen ? (
-        <ChatView
-          me={me}
-          orgId={orgId}
-          groupId={activeGroupId}
-          members={org.members}
-          isAdmin={me.role === "admin" || me.role === "root"}
-          target={chatTarget}
-          groupName={activeGroup ? groupLabel(activeGroup) : undefined}
-          groupMemberCount={
-            activeGroup?.scope === "group" ? memberIds.length : undefined
-          }
-          canClearGroup={
-            me.role === "admin" ||
-            me.role === "root" ||
-            activeGroup?.created_by === myId
-          }
-          prefs={chatPrefs}
-          onPrefsChange={setRawChatPrefs}
-        />
+        chatPane
       ) : (
-        <EditorPane
-          groups={resolvedGroups}
-          focused={focusedIdx}
-          userLabel={me.name || me.email}
-          canManage={canManage}
-          onSelectTab={selectTab}
-          onCloseTab={closeTab}
-          onFocusGroup={focusGroup}
-          onSplit={splitGroup}
-          onReorder={reorderTab}
-          onMoveTab={moveTab}
-          onOpenInGroup={openInGroup}
-          onSplitFile={splitFile}
-          settingsActive={settingsOpen}
-          settingsNode={
-            <Settings
-              me={me}
-              onClose={() => setSettingsOpen(false)}
-              onUpdated={() => onUpdated?.()}
-            />
-          }
-          onCloseSettings={() => setSettingsOpen(false)}
-        />
+        <>
+          <EditorPane
+            groups={resolvedGroups}
+            focused={focusedIdx}
+            userLabel={me.name || me.email}
+            canManage={canManage}
+            onSelectTab={selectTab}
+            onCloseTab={closeTab}
+            onFocusGroup={focusGroup}
+            onSplit={splitGroup}
+            onReorder={reorderTab}
+            onMoveTab={moveTab}
+            onOpenInGroup={openInGroup}
+            onSplitFile={splitFile}
+            settingsActive={settingsOpen}
+            settingsNode={
+              <Settings
+                me={me}
+                onClose={() => setSettingsOpen(false)}
+                onUpdated={() => onUpdated?.()}
+              />
+            }
+            onCloseSettings={() => setSettingsOpen(false)}
+            recents={recentFiles}
+            onOpenFile={openFile}
+            onSearch={() => setPalette("all")}
+            sidebarOpen={!sidebarCollapsed}
+            onToggleSidebar={() => setSidebarCollapsed((c) => !c)}
+          />
+        </>
       )}
 
       <input
@@ -2021,7 +2107,6 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
         onConfirm={() => confirm?.onConfirm()}
         onClose={() => setConfirm(null)}
       />
-      <ContextMenu state={wsMenu} onClose={() => setWsMenu(null)} />
       <AlertDialog
         isOpen={!!workspaceAction}
         leastDestructiveRef={dialogRef}
@@ -2059,9 +2144,19 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
         isOpen={palette !== null}
         onClose={() => setPalette(null)}
         placeholder={
-          palette === "commands" ? "Type a command…" : "Search files by name…"
+          palette === "commands"
+            ? "Type a command…"
+            : palette === "all"
+              ? "Search files, people and commands…"
+              : "Search files by name…"
         }
-        items={palette === "commands" ? commandItems : fileItems}
+        items={
+          palette === "commands"
+            ? commandItems
+            : palette === "all"
+              ? [...fileItems, ...peopleItems, ...commandItems]
+              : fileItems
+        }
       />
 
       {/* New group: name + visibility layer (personal / group / org). */}

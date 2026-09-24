@@ -69,6 +69,28 @@ function listTime(unix: number) {
   });
 }
 
+/** Mono section caption with the live count — the mockup's "DIRECT MESSAGES (7)". */
+function SectionLabel({ label, count }: { label: string; count: number }) {
+  return (
+    <Flex align="center" gap={2} px={4} pt={3} pb={1.5}>
+      <Text
+        flex={1}
+        fontSize="9.5px"
+        fontWeight={700}
+        letterSpacing="0.09em"
+        textTransform="uppercase"
+        fontFamily="mono"
+        color="ink.subtle"
+      >
+        {label}
+      </Text>
+      <Text fontSize="9.5px" fontFamily="mono" color="ink.subtle">
+        {count}
+      </Text>
+    </Flex>
+  );
+}
+
 function Row({
   active,
   label,
@@ -107,11 +129,7 @@ function Row({
       onClick={onClick}
     >
       <Box position="relative" flexShrink={0}>
-        <ChatAvatar
-          name={avatarName || "?"}
-          size={34}
-          radius="lg"
-        />
+        <ChatAvatar name={avatarName || "?"} size={32} />
         {online !== undefined && (
           <Box
             position="absolute"
@@ -119,7 +137,7 @@ function Row({
             right="-1px"
             boxSize="11px"
             borderRadius="full"
-            bg={online ? "signal.ok" : "surface.borderStrong"}
+            bg={online ? "state.ok" : "ink.subtle"}
             border="2px solid"
             borderColor="surface.panel"
             title={online ? "Online" : "Offline"}
@@ -201,7 +219,9 @@ function ChatChannels({
   onPrefsChange,
 }: Props) {
   const [query, setQuery] = useState("");
-  const [tab, setTab] = useState<"all" | "people" | "groups">("all");
+  // People first: this is a messenger, and the thing you came to do is write
+  // to a person, not browse channels.
+  const [tab, setTab] = useState<"people" | "groups" | "all">("people");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const q = query.trim().toLowerCase();
 
@@ -286,6 +306,10 @@ function ChatChannels({
         (tab === "people" && it.kind === "dm") ||
         (tab === "groups" && it.kind === "group")),
   );
+  // The list is two different things — rooms and people — so it is labelled as
+  // two sections rather than one undifferentiated column.
+  const groupRows = visible.filter((it) => it.kind === "group");
+  const dmRows = visible.filter((it) => it.kind === "dm");
 
   return (
     <Flex direction="column" flex={1} minH={0} overflowY="auto" py={2}>
@@ -304,7 +328,7 @@ function ChatChannels({
             variant="unstyled"
             size="sm"
             fontSize="sm"
-            placeholder="Search chats"
+            placeholder="Search channels or people…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
@@ -321,14 +345,15 @@ function ChatChannels({
         </Flex>
       </Box>
 
-      {/* All / People / Groups filter — WhatsApp-style segmented tabs. */}
+      {/* All / People / Groups filter — the active segment is tinted, not
+          filled, so it stays legible against the panel it sits in. */}
       <Box px={3} pb={2} flexShrink={0}>
-        <HStack spacing={1} bg="surface.hover" borderRadius="full" p="3px">
+        <HStack spacing={1.5} bg="surface.hover" borderRadius="lg" p="3px">
           {(
             [
-              ["all", "All"],
               ["people", "People"],
               ["groups", "Groups"],
+              ["all", "All"],
             ] as const
           ).map(([id, label]) => (
             <Box
@@ -336,15 +361,17 @@ function ChatChannels({
               as="button"
               type="button"
               flex={1}
-              py="4px"
+              py="5px"
               px={2}
-              borderRadius="full"
+              borderRadius="md"
               fontSize="12px"
               fontWeight={600}
               userSelect="none"
-              transition="all 0.15s ease"
-              bg={tab === id ? "brand.500" : "transparent"}
-              color={tab === id ? "white" : "ink.muted"}
+              transition="all 0.15s var(--cx-ease-soft)"
+              border="1px solid"
+              borderColor={tab === id ? "brand.500" : "transparent"}
+              bg={tab === id ? "accent.tint" : "transparent"}
+              color={tab === id ? "brand.300" : "ink.muted"}
               _hover={tab === id ? undefined : { color: "ink.base" }}
               onClick={() => setTab(id)}
             >
@@ -517,7 +544,14 @@ function ChatChannels({
         </Collapse>
       </Box>
 
-      {visible.map(renderItem)}
+      {groupRows.length > 0 && (
+        <SectionLabel label="Group channels" count={groupRows.length} />
+      )}
+      {groupRows.map(renderItem)}
+      {groupRows.length > 0 && dmRows.length > 0 && (
+        <Box h="1px" bg="surface.border" mx={4} my={2} />
+      )}
+      {dmRows.map(renderItem)}
 
       {visible.length === 0 && (
         <Text px={4} py={2} fontSize="xs" color="ink.subtle">

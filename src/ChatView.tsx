@@ -1291,8 +1291,9 @@ function ChatView({
       <Flex
         align="center"
         justify="space-between"
-        px={5}
-        h={14}
+        gap={3}
+        px={4}
+        py={2}
         borderBottom="1px solid"
         borderColor="surface.border"
         bg="surface.panel"
@@ -1301,14 +1302,14 @@ function ChatView({
         <Flex align="center" gap={2.5} minW={0}>
           {peer ? (
             <Box position="relative" flexShrink={0}>
-              <ChatAvatar name={peer.name || peer.email} size={34} />
+              <ChatAvatar name={peer.name || peer.email} size={32} />
               <Box
                 position="absolute"
                 bottom="-1px"
                 right="-1px"
                 boxSize="11px"
                 borderRadius="full"
-                bg={peerPresence?.online ? "state.ok" : "surface.borderStrong"}
+                bg={peerPresence?.online ? "state.ok" : "ink.subtle"}
                 border="2px solid"
                 borderColor="surface.panel"
               />
@@ -1316,51 +1317,60 @@ function ChatView({
           ) : (
             <Center
               flexShrink={0}
-              boxSize="34px"
+              boxSize="32px"
               borderRadius="md"
-              bg="brand.600"
+              sx={{ background: "linear-gradient(135deg, #6b5bff 0%, #5b4bd6 100%)" }}
               color="white"
             >
-              <Icon as={VscComment} boxSize="18px" />
+              <Icon as={VscComment} boxSize="17px" />
             </Center>
           )}
           <Box minW={0}>
+            <Text textStyle="eyebrow" color="accent.base" mb="2px">
+              {target.kind === "group" ? "Workspace chat" : "Direct message"}
+            </Text>
             <Text
-              fontSize="md"
-              fontWeight="semibold"
+              fontSize="14px"
+              fontWeight={650}
+              letterSpacing="-0.015em"
               color="ink.base"
               isTruncated
             >
               {title}
             </Text>
+          </Box>
+        </Flex>
+        {/* Settings moved to the sidebar next to the wallpaper picker. */}
+        <Flex align="center" gap={2.5} flexShrink={0}>
+          <Box textAlign="right" display={{ base: "none", sm: "block" }}>
             <Text
-              fontSize="xs"
+              fontSize="10.5px"
               color={peerPresence?.online ? "state.ok" : "ink.subtle"}
               isTruncated
+              maxW="220px"
             >
               {subtitle}
             </Text>
           </Box>
+          {/* Always reserve the slot so showing/hiding it never reflows the header. */}
+          <Tooltip
+            label={target.kind === "group" ? "Clear chat" : "Clear conversation"}
+            maxW="200px"
+          >
+            <IconButton
+              aria-label="Clear conversation"
+              icon={<VscClearAll />}
+              size="sm"
+              variant="ghost"
+              color="ink.muted"
+              flexShrink={0}
+              _hover={{ bg: "surface.hover", color: "state.bad" }}
+              visibility={canClear && messages.length > 0 ? "visible" : "hidden"}
+              isDisabled={!canClear || messages.length === 0}
+              onClick={() => setConfirmClear(true)}
+            />
+          </Tooltip>
         </Flex>
-        {/* Settings moved to the sidebar next to the wallpaper picker. */}
-        {/* Always reserve the slot so showing/hiding it never reflows the header. */}
-        <Tooltip
-          label={target.kind === "group" ? "Clear chat" : "Clear conversation"}
-          maxW="200px"
-        >
-          <IconButton
-            aria-label="Clear conversation"
-            icon={<VscClearAll />}
-            size="sm"
-            variant="ghost"
-            color="ink.muted"
-            flexShrink={0}
-            _hover={{ bg: "surface.hover", color: "state.bad" }}
-            visibility={canClear && messages.length > 0 ? "visible" : "hidden"}
-            isDisabled={!canClear || messages.length === 0}
-            onClick={() => setConfirmClear(true)}
-          />
-        </Tooltip>
       </Flex>
 
       <Flex flex={1} minH={0} position="relative">
@@ -1398,11 +1408,9 @@ function ChatView({
                   !newDay &&
                   prev.email === m.email &&
                   m.created_at - prev.created_at < 300;
-                // The timestamp sits bottom-right; reserve room on the last text line
-                // for it with an inline spacer so it doesn't overlap the message.
+                // The timestamp and author sit in the row header, so the bubble
+                // carries nothing but the message.
                 const metaText = `${m.edited_at ? "edited · " : ""}${timeOf(m.created_at)}`;
-                const metaW =
-                  Math.round(metaText.length * 5.6 + 10) + (mine ? 18 : 0);
 
                 const actions = (
                   <HStack
@@ -1440,33 +1448,6 @@ function ChatView({
                   </HStack>
                 );
 
-                // Integrated tail on the first message of a run: a small
-                // right-triangle clipped from the SAME background as the bubble,
-                // attached at the TOP corner (WhatsApp style) instead of a
-                // detached rotated square. The bubble corner where it attaches
-                // gets a flatter radius so the two merge seamlessly.
-                const tail = !grouped && (
-                  <Box
-                    position="absolute"
-                    top="0"
-                    right={mine ? "-6px" : undefined}
-                    left={mine ? undefined : "-6px"}
-                    zIndex={0}
-                    aria-hidden
-                  >
-                    <Box
-                      w="12px"
-                      h="12px"
-                      bg={mine ? "brand.500" : "chat.incoming"}
-                      clipPath={
-                        mine
-                          ? "polygon(0 0, 100% 0, 0 100%)"
-                          : "polygon(100% 0, 0 0, 100% 100%)"
-                      }
-                    />
-                  </Box>
-                );
-
                 // Single-attachment messages render as sleek one-piece cards
                 // (image fills the bubble edge-to-edge; voice/file get a compact
                 // row) instead of a markdown card nested inside the bubble.
@@ -1490,8 +1471,36 @@ function ChatView({
                   </Box>
                 );
 
+                // Author and time sit ABOVE the bubble (channel style), not
+                // inside it — the bubble carries only the message.
+                const header = (
+                  <Flex
+                    align="baseline"
+                    gap={1.5}
+                    mb="4px"
+                    px="2px"
+                    justify={mine ? "flex-end" : "flex-start"}
+                  >
+                    <Text
+                      fontSize="12px"
+                      fontWeight={650}
+                      letterSpacing="-0.01em"
+                      color={mine ? "brand.300" : `hsl(${hueOf(m.email)}, 62%, 66%)`}
+                      isTruncated
+                      maxW="180px"
+                    >
+                      {mine ? "You" : label}
+                    </Text>
+                    <Text fontSize="10px" color="ink.subtle" flexShrink={0} textStyle="num">
+                      {metaText}
+                    </Text>
+                    {ticks}
+                  </Flex>
+                );
+
                 const bubble = (
                   <Box maxW={{ base: "82%", md: "68%" }} minW={0}>
+                    {header}
                     {att && att.kind === "image" ? (
                       <Box
                         position="relative"
@@ -1502,65 +1511,43 @@ function ChatView({
                         borderColor={callsMe ? "brand.400" : undefined}
                       >
                         <MediaImage src={att.url} name={att.name} />
-                        <Box
-                          position="absolute"
-                          insetX={0}
-                          bottom={0}
-                          h="52px"
-                          bgGradient="linear(to-t, rgba(0,0,0,0.5), transparent)"
-                        />
-                        <Text
-                          position="absolute"
-                          bottom="5px"
-                          right="9px"
-                          fontSize="10px"
-                          lineHeight="1"
-                          whiteSpace="nowrap"
-                          display="inline-flex"
-                          alignItems="center"
-                          gap="2px"
-                          color={mine && tickColor ? tickColor : "white"}
-                        >
-                          <Box as="span">{metaText}</Box>
-                          {ticks}
-                        </Text>
                       </Box>
                     ) : (
                       <Box
                         position="relative"
-                        bg={mine ? "brand.500" : "chat.incoming"}
+                        // Mine is a violet gradient rather than a flat fill, so
+                        // your own words read as yours before you read them.
+                        sx={
+                          mine
+                            ? {
+                                background:
+                                  "linear-gradient(135deg, #6b5bff 0%, #5b4bd6 100%)",
+                              }
+                            : undefined
+                        }
+                        bg={mine ? undefined : "chat.incoming"}
                         color={mine ? "white" : "chat.incomingText"}
-                        border={mine || !callsMe ? undefined : "1px solid"}
-                        borderColor={callsMe ? "brand.400" : undefined}
+                        border="1px solid"
+                        borderColor={
+                          callsMe
+                            ? "brand.400"
+                            : mine
+                              ? "transparent"
+                              : "chat.incomingBorder"
+                        }
                         boxShadow={
                           callsMe
                             ? "0 0 0 1px var(--chakra-colors-brand-400)"
                             : "0 1px 1px rgba(0,0,0,0.14)"
                         }
-                        borderRadius="16px"
-                        borderTopRightRadius={mine && !grouped ? "6px" : "16px"}
-                        borderTopLeftRadius={!mine && !grouped ? "6px" : "16px"}
-                        px="10px"
-                        py="5px"
+                        borderRadius="12px"
+                        borderTopLeftRadius={mine ? "12px" : "4px"}
+                        borderTopRightRadius={mine ? "4px" : "12px"}
+                        px="11px"
+                        py="6px"
                         fontSize={fontSize}
                       >
-                        {tail}
-                        {!mine && !grouped && (
-                          <Text
-                            fontSize="xs"
-                            fontWeight={700}
-                            mb="1px"
-                            color={`hsl(${hueOf(m.email)}, 60%, 62%)`}
-                            isTruncated
-                          >
-                            {label}
-                          </Text>
-                        )}
-                        <Box
-                          position="relative"
-                          zIndex={1}
-                          pr={att ? `${metaW + 6}px` : undefined}
-                        >
+                        <Box position="relative" zIndex={1}>
                           {att ? (
                             att.kind === "voice" ? (
                               <AudioBubble src={att.url} mine={mine} />
@@ -1657,54 +1644,16 @@ function ChatView({
                               >
                                 {m.body}
                               </ReactMarkdown>
-                              {/* Timestamp flows inline right after the text (Telegram
-                                style) so short bubbles hug their content instead of
-                                being stretched by a reserved spacer. */}
-                              <Text
-                                as="span"
-                                display="inline-flex"
-                                alignItems="flex-end"
-                                whiteSpace="nowrap"
-                                gap="2px"
-                                ml={1.5}
-                                fontSize="10px"
-                                lineHeight="1"
-                                color={
-                                  mine ? "whiteAlpha.800" : "chat.incomingMeta"
-                                }
-                              >
-                                <Box as="span">{metaText}</Box>
-                                {ticks}
-                              </Text>
                             </Box>
                           )}
                         </Box>
-                        {att && (
-                          <Text
-                            position="absolute"
-                            bottom="5px"
-                            right="9px"
-                            fontSize="10px"
-                            lineHeight="1"
-                            whiteSpace="nowrap"
-                            display="inline-flex"
-                            alignItems="center"
-                            gap="2px"
-                            color={
-                              mine ? "whiteAlpha.800" : "chat.incomingMeta"
-                            }
-                          >
-                            <Box as="span">{metaText}</Box>
-                            {ticks}
-                          </Text>
-                        )}
                       </Box>
                     )}
                     {m.reactions && m.reactions.length > 0 && (
                       <HStack
                         spacing={1}
-                        mt="-7px"
-                        ml={mine ? "auto" : "6px"}
+                        mt={1}
+                        ml={mine ? "auto" : "2px"}
                         w="fit-content"
                         flexWrap="wrap"
                         justify={mine ? "flex-end" : "flex-start"}
@@ -1765,12 +1714,8 @@ function ChatView({
                       gap={2}
                       align="flex-start"
                       justify={mine ? "flex-end" : "flex-start"}
-                      mt={grouped ? "2px" : "8px"}
+                      mt={grouped ? "6px" : "14px"}
                       animation={`${msgIn} 0.18s ease`}
-                      // The bubble tail (rotated square) pokes ~9px past the
-                      // bubble edge; padding the row keeps it inside the
-                      // scrollable area so no horizontal scrollbar shows up.
-                      pr={mine ? "12px" : 0}
                     >
                       {mine ? (
                         <>
@@ -1779,11 +1724,12 @@ function ChatView({
                         </>
                       ) : (
                         <>
-                          {grouped ? (
-                            <Box w="28px" flexShrink={0} />
-                          ) : (
+                          {/* A grouped run keeps its avatar but dims it, so the
+                              column stays aligned and the run still reads as one
+                              person talking. */}
+                          <Box opacity={grouped ? 0.35 : 1} flexShrink={0}>
                             <ChatAvatar name={label} size={28} />
-                          )}
+                          </Box>
                           {bubble}
                           {actions}
                         </>

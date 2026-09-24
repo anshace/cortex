@@ -1,6 +1,6 @@
 import {
   Box,
-  Center,
+  Button,
   Divider,
   Flex,
   HStack,
@@ -40,7 +40,9 @@ import {
   VscChevronUp,
   VscChromeClose,
   VscCircleFilled,
+  VscLayoutSidebarLeft,
   VscOpenPreview,
+  VscSearch,
   VscSettingsGear,
   VscSplitHorizontal,
 } from "react-icons/vsc";
@@ -62,7 +64,7 @@ import {
 } from "./editorThemes";
 import { fileIcon } from "./fileIcon";
 import Rustpad, { UserInfo } from "./rustpad";
-import { LiveDot } from "./ui";
+import { KeyHint, LiveDot } from "./ui";
 
 type Connection = "connected" | "disconnected" | "desynchronized";
 
@@ -92,6 +94,13 @@ type EditorPaneProps = {
   settingsActive: boolean;
   settingsNode: ReactNode;
   onCloseSettings: () => void;
+  // The empty editor doubles as the workspace landing screen, so it needs the
+  // recently-opened list and a way to reach the palette and the panels.
+  recents: FileRow[];
+  onOpenFile: (file: FileRow) => void;
+  onSearch: () => void;
+  sidebarOpen: boolean;
+  onToggleSidebar: () => void;
 };
 
 function getWsUri(docId: string) {
@@ -159,13 +168,44 @@ const LANGUAGES = [
   "ruby",
 ];
 
+// A language is named in the picker, but it is recognised by its files — so
+// show each one with the same glyph and colour the tree gives that extension.
+const LANG_SAMPLE_EXT: Record<string, string> = {
+  plaintext: "txt",
+  javascript: "js",
+  typescript: "ts",
+  python: "py",
+  rust: "rs",
+  go: "go",
+  java: "java",
+  c: "c",
+  cpp: "cpp",
+  csharp: "cs",
+  json: "json",
+  markdown: "md",
+  html: "html",
+  css: "css",
+  scss: "scss",
+  shell: "sh",
+  sql: "sql",
+  yaml: "yml",
+  toml: "toml",
+  xml: "xml",
+  php: "php",
+  ruby: "rb",
+};
+
+function langSpec(lang: string) {
+  return fileIcon(`sample.${LANG_SAMPLE_EXT[lang] ?? "txt"}`);
+}
+
 function countWords(text: string): number {
   const m = text.match(/\S+/g);
   return m ? m.length : 0;
 }
 
-// A VS Code-style status-bar segment: full height, tight padding, hover when
-// interactive.
+// A segment of the status bar: full height, tight padding, and a hover tile
+// when it does something.
 function StatusCell({
   children,
   onClick,
@@ -181,10 +221,11 @@ function StatusCell({
     <HStack
       as={onClick ? "button" : "div"}
       h="full"
-      px="8px"
-      spacing="5px"
+      px={2}
+      spacing={1.5}
       cursor={onClick ? "pointer" : "default"}
       color={color ?? "ink.muted"}
+      transition="background 0.12s var(--cx-ease-soft), color 0.12s"
       _hover={
         onClick
           ? { bg: "surface.hover", color: color ?? "ink.base" }
@@ -199,9 +240,51 @@ function StatusCell({
   );
 }
 
+// Hairline between two segments. Reads as structure instead of as a gap.
+function Sep() {
+  return <Box w="1px" my="6px" bg="surface.border" flexShrink={0} />;
+}
+
+// A colour at a given strength, for the tinted fills the bar's controls use.
+// Accepts both a theme token ("brand.400") and a raw hex from `fileIcon`.
+const tintOf = (color: string, pct = 14) => {
+  const cv =
+    color.startsWith("#") || color.includes("(")
+      ? color
+      : `var(--chakra-colors-${color.replace(".", "-")})`;
+  return `color-mix(in oklab, ${cv} ${pct}%, transparent)`;
+};
+
+// A small bordered control inside the bar (the font stepper, the language
+// picker) so it is obviously pressable rather than just text.
+function BarPill({
+  children,
+  hue,
+  ...rest
+}: { children: ReactNode; hue?: string } & Record<string, unknown>) {
+  const cv = hue ? `var(--chakra-colors-${hue.replace(".", "-")})` : null;
+  return (
+    <Flex
+      align="center"
+      h="18px"
+      px={1.5}
+      borderRadius="sm"
+      border="1px solid"
+      borderColor="surface.border"
+      flexShrink={0}
+      {...rest}
+      sx={{
+        background: cv ? `color-mix(in oklab, ${cv} 10%, transparent)` : undefined,
+      }}
+    >
+      {children}
+    </Flex>
+  );
+}
+
 // A focused editor group publishes this up so the single bottom status bar can
 // render it. Split view has two groups but only ever one status bar.
-type StatusInfo = {
+export type StatusInfo = {
   pos: { ln: number; col: number };
   counts: { rows: number; words: number; chars: number };
   fontSize: number;
@@ -217,120 +300,242 @@ type StatusInfo = {
   download?: () => void;
 };
 
-// The one and only status bar, spanning the full pane, driven by the focused group.
-function StatusBar({ info }: { info: StatusInfo }) {
+// The one and only status bar, spanning the full window, driven by the focused
+// group. It is rendered by the shell rather than the pane so the rail and the
+// side panel do not leave it floating under the editor column alone.
+export function StatusBar({ info }: { info: StatusInfo }) {
   const connectionColor =
     info.connection === "connected"
       ? "state.ok"
       : info.connection === "desynchronized"
         ? "state.bad"
         : "state.warn";
+  const spec = info.activeFile ? fileIcon(info.activeFile.path) : null;
   return (
     <Flex
-      h="22px"
+      h="28px"
       align="stretch"
       bg="surface.panel2"
       borderTop="1px solid"
       borderColor="surface.border"
-      fontSize="11px"
+      fontSize="11.5px"
       color="ink.muted"
       flexShrink={0}
-      sx={{ fontVariantNumeric: "tabular-nums" }}
+      sx={{
+        fontVariantNumeric: "tabular-nums",
+        boxShadow: "inset 0 1px 0 rgba(255,255,255,0.02)",
+      }}
     >
+      {/* Subject first: which file all of these numbers describe. */}
+      {info.activeFile && spec && (
+        <StatusCell title={info.activeFile.path}>
+          <Box
+            boxSize="6px"
+            borderRadius="full"
+            bg={spec.color}
+            flexShrink={0}
+            sx={{
+              boxShadow: `0 0 6px color-mix(in oklab, ${spec.color} 60%, transparent)`,
+            }}
+          />
+          <Icon as={spec.icon} fontSize="12px" color={spec.color} />
+          <Text color="ink.base" fontWeight={600}>
+            {info.activeFile.path.split("/").pop()}
+          </Text>
+          {info.activeFile.path.includes("/") && (
+            <Text
+              color="ink.subtle"
+              display={{ base: "none", lg: "block" }}
+              fontSize="10.5px"
+            >
+              {info.activeFile.path.slice(0, info.activeFile.path.lastIndexOf("/"))}
+            </Text>
+          )}
+        </StatusCell>
+      )}
+      <Sep />
       <StatusCell title="Cursor position (line, column)">
-        <Icon as={FiMousePointer} fontSize="11px" />
-        <Text>
+        <Icon as={FiMousePointer} fontSize="11px" color="brand.400" />
+        <Text color="ink.base">
           Ln {info.pos.ln}, Col {info.pos.col}
         </Text>
       </StatusCell>
       {info.showStats && (
-        <StatusCell title="Lines · words · characters">
-          <Text>
-            {info.counts.rows} lines · {info.counts.words} words ·{" "}
-            {info.counts.chars} chars
-          </Text>
-        </StatusCell>
+        <>
+          <Sep />
+          <StatusCell title="Lines · words · characters">
+            <Text color="ink.subtle">
+              {info.counts.rows} lines · {info.counts.words} words ·{" "}
+              {info.counts.chars} chars
+            </Text>
+          </StatusCell>
+        </>
       )}
-      <HStack h="full" px="8px" spacing="3px" color="ink.muted">
-        <Box
-          as="button"
-          px="3px"
-          _hover={{ color: "ink.base" }}
-          title="Smaller (Ctrl -)"
-          onClick={() => info.setFont(info.fontSize - 1)}
-        >
-          A−
-        </Box>
-        <Text minW="32px" textAlign="center" color="ink.base">
-          {info.fontSize}px
-        </Text>
-        <Box
-          as="button"
-          px="3px"
-          _hover={{ color: "ink.base" }}
-          title="Larger (Ctrl +)"
-          onClick={() => info.setFont(info.fontSize + 1)}
-        >
-          A+
-        </Box>
-      </HStack>
-      <Menu placement="top-start" isLazy>
-        <MenuButton
-          h="full"
-          px="10px"
-          title="Select language"
-          _hover={{ bg: "surface.hover" }}
-          _active={{ bg: "surface.hover" }}
-        >
-          <HStack spacing="5px" color="ink.base">
-            <Text>{info.language}</Text>
-            <Icon as={VscChevronUp} fontSize="10px" color="ink.subtle" />
-          </HStack>
-        </MenuButton>
-        <MenuList
-          bg="surface.raised"
-          borderColor="surface.border"
-          boxShadow="pop"
-          maxH="320px"
-          overflowY="auto"
-          py={1}
-          minW="180px"
-        >
-          {LANGUAGES.map((l) => (
-            <MenuItem
-              key={l}
-              bg="transparent"
-              _hover={{ bg: "surface.hover" }}
-              fontSize="sm"
-              onClick={() => info.setLang(l)}
-            >
-              <HStack w="full" spacing={2}>
-                <Text flex={1}>{l}</Text>
-                {l === info.language && (
-                  <Icon as={VscCheck} color="brand.400" />
-                )}
-              </HStack>
-            </MenuItem>
-          ))}
-        </MenuList>
-      </Menu>
+      {/* The two controls share one centred row: the bar stretches its text
+          cells, so pills have to be aligned by hand or they ride the top edge. */}
+      <Flex align="center" h="full" gap={1.5} px={1.5} flexShrink={0}>
+        <BarPill hue="state.warn">
+          <Box
+            as="button"
+            boxSize="16px"
+            display="flex"
+            alignItems="center"
+            justifyContent="center"
+            borderRadius="sm"
+            fontSize="10.5px"
+            lineHeight={1}
+            color="ink.muted"
+            _hover={{ color: "state.warn", bg: tintOf("state.warn") }}
+            title="Smaller (Ctrl -)"
+            onClick={() => info.setFont(info.fontSize - 1)}
+          >
+            A−
+          </Box>
+          <Text
+            minW="36px"
+            textAlign="center"
+            color="ink.base"
+            fontWeight={600}
+            fontSize="10.5px"
+            lineHeight="16px"
+          >
+            {info.fontSize} px
+          </Text>
+          <Box
+            as="button"
+            boxSize="16px"
+            display="flex"
+            alignItems="center"
+            justifyContent="center"
+            borderRadius="sm"
+            fontSize="10.5px"
+            lineHeight={1}
+            color="ink.muted"
+            _hover={{ color: "state.warn", bg: tintOf("state.warn") }}
+            title="Larger (Ctrl +)"
+            onClick={() => info.setFont(info.fontSize + 1)}
+          >
+            A+
+          </Box>
+        </BarPill>
 
-      <Box flex={1} />
+        {(() => {
+          const cur = langSpec(info.language);
+          return (
+            <Menu placement="top-start" isLazy>
+              <MenuButton
+                h="18px"
+                px={1.5}
+                borderRadius="sm"
+                border="1px solid"
+                borderColor="surface.border"
+                fontSize="11.5px"
+                title="Select language"
+                sx={{ background: tintOf(cur.color, 12) }}
+                _hover={{ borderColor: cur.color }}
+                _active={{ bg: "surface.hover" }}
+              >
+                <HStack spacing={1.5} color="ink.base">
+                  <Icon as={cur.icon} fontSize="12px" color={cur.color} />
+                  <Text lineHeight={1}>{info.language}</Text>
+                  <Icon as={VscChevronUp} fontSize="9px" color="ink.subtle" />
+                </HStack>
+              </MenuButton>
+              {/* Each language carries the glyph and colour its files get in the
+                  tree, so the picker is recognisable without reading it. */}
+              <MenuList
+                bg="surface.raised"
+                borderColor="surface.border"
+                boxShadow="pop"
+                maxH="340px"
+                overflowY="auto"
+                px={1}
+                py={1.5}
+                minW="236px"
+              >
+                <Flex align="center" justify="space-between" px={2} pt={0.5} pb={1.5}>
+                  <Text textStyle="eyebrow" color="ink.subtle">
+                    Language mode
+                  </Text>
+                  <Text fontSize="9.5px" fontFamily="mono" color="ink.subtle">
+                    {LANGUAGES.length}
+                  </Text>
+                </Flex>
+                {LANGUAGES.map((l) => {
+                  const spec = langSpec(l);
+                  const on = l === info.language;
+                  return (
+                    <MenuItem
+                      key={l}
+                      gap={2.5}
+                      py={1.5}
+                      px={2}
+                      borderRadius="md"
+                      bg={on ? tintOf(spec.color, 12) : "transparent"}
+                      color={on ? "ink.base" : "ink.muted"}
+                      _hover={{ bg: "surface.hover", color: "ink.base" }}
+                      _focus={{ bg: on ? tintOf(spec.color, 12) : "surface.hover", color: "ink.base" }}
+                      fontSize="12.5px"
+                      fontWeight={on ? 600 : 500}
+                      onClick={() => info.setLang(l)}
+                    >
+                      <Flex
+                        boxSize="18px"
+                        borderRadius="sm"
+                        align="center"
+                        justify="center"
+                        flexShrink={0}
+                        sx={{ background: tintOf(spec.color, 16) }}
+                      >
+                        <Icon as={spec.icon} fontSize="11px" color={spec.color} />
+                      </Flex>
+                      <Text flex={1} isTruncated>
+                        {l}
+                      </Text>
+                      <Text
+                        fontSize="9.5px"
+                        fontFamily="mono"
+                        color={on ? spec.color : "ink.subtle"}
+                        flexShrink={0}
+                      >
+                        .{LANG_SAMPLE_EXT[l] ?? "txt"}
+                      </Text>
+                      {on && (
+                        <Icon as={VscCheck} fontSize="12px" color={spec.color} flexShrink={0} />
+                      )}
+                    </MenuItem>
+                  );
+                })}
+              </MenuList>
+            </Menu>
+          );
+        })()}
+      </Flex>
+
+      <Box flex={1} minW="8px" />
 
       {info.canManage && info.activeFile && info.download && (
-        <StatusCell title="Download this file" onClick={info.download}>
-          <Icon as={FiDownload} fontSize="13px" />
-          <Text>Download</Text>
-        </StatusCell>
+        <>
+          <StatusCell
+            title="Download this file"
+            color="spectral.400"
+            onClick={info.download}
+          >
+            <Icon as={FiDownload} fontSize="12px" />
+            <Text>Download</Text>
+          </StatusCell>
+          <Sep />
+        </>
       )}
       <Popover placement="top-end" trigger="click" isLazy>
         <PopoverTrigger>
           <HStack
             as="button"
             h="full"
-            px="8px"
-            spacing="6px"
+            px={2}
+            spacing={1.5}
             color={connectionColor}
+            transition="background 0.12s var(--cx-ease-soft)"
             _hover={{ bg: "surface.hover" }}
             whiteSpace="nowrap"
             title="Connection & people in this file"
@@ -341,9 +546,27 @@ function StatusBar({ info }: { info: StatusInfo }) {
               size="7px"
               pulse={info.connection === "connected"}
             />
-            <Text textTransform="capitalize">{info.connection}</Text>
+            <Text textTransform="capitalize" fontWeight={600}>
+              {info.connection}
+            </Text>
             {info.collaborators.length > 0 && (
-              <Text color="ink.muted">· {info.collaborators.length + 1}</Text>
+              <HStack spacing={-1} ml={1}>
+                {info.collaborators.slice(0, 3).map((u, i) => (
+                  <Box
+                    key={i}
+                    boxSize="14px"
+                    borderRadius="full"
+                    bg={`hsl(${u.hue}, 55%, 48%)`}
+                    border="1.5px solid"
+                    borderColor="surface.panel2"
+                    ml={i === 0 ? 0 : -5}
+                    title={u.name}
+                  />
+                ))}
+                <Text color="ink.muted" fontSize="10.5px" ml={1}>
+                  {info.collaborators.length + 1}
+                </Text>
+              </HStack>
             )}
           </HStack>
         </PopoverTrigger>
@@ -400,6 +623,9 @@ function EditorPane(props: EditorPaneProps) {
     setStatuses((prev) => ({ ...prev, [i]: info }));
   }, []);
 
+  // The focused group drives the one status bar at the bottom of this pane.
+  const focusedStatus = statuses[props.focused] ?? null;
+
   // Drag the divider between the two split groups to change their ratio.
   function startSplitDrag(e: ReactMouseEvent) {
     e.preventDefault();
@@ -424,57 +650,14 @@ function EditorPane(props: EditorPaneProps) {
 
   if (empty && !props.settingsActive) {
     return (
-      <Center
-        flex={1}
-        minW={0}
-        flexDirection="column"
-        gap={4}
-        bg="surface.bg"
-        px={6}
-        textAlign="center"
-      >
-        <Box opacity={0.45}>
-          <Logo size={48} />
-        </Box>
-        <Box>
-          <Text fontSize="lg" fontWeight="semibold" color="ink.base">
-            No file open
-          </Text>
-          <Text fontSize="sm" color="ink.muted" mt={1.5} maxW="xs">
-            Open a file from the Explorer to edit together in real time. Split
-            the view to work on two files side by side.
-          </Text>
-        </Box>
-        <HStack spacing={2} mt={2}>
-          {[
-            { keys: "Ctrl P", label: "Find a file" },
-            { keys: "Ctrl Shift P", label: "Commands" },
-            { keys: "Ctrl B", label: "Toggle sidebar" },
-          ].map((s) => (
-            <HStack
-              key={s.keys}
-              spacing={1.5}
-              px={2.5}
-              py={1}
-              borderRadius="md"
-              border="1px solid"
-              borderColor="surface.border"
-              bg="surface.panel"
-            >
-              <Text fontSize="11px" fontFamily="mono" color="ink.muted">
-                {s.keys}
-              </Text>
-              <Text fontSize="11px" color="ink.subtle">
-                {s.label}
-              </Text>
-            </HStack>
-          ))}
-        </HStack>
-      </Center>
+      <WelcomePane
+        recents={props.recents}
+        onOpenFile={props.onOpenFile}
+        onSearch={props.onSearch}
+      />
     );
   }
 
-  const status = statuses[props.focused] ?? null;
 
   return (
     <Flex
@@ -528,12 +711,194 @@ function EditorPane(props: EditorPaneProps) {
                   else if (p.g != null && p.g !== i)
                     props.onMoveTab(p.g, p.id, i);
                 }}
+                sidebarOpen={props.sidebarOpen}
+                onToggleSidebar={props.onToggleSidebar}
               />
             </Flex>
           </Fragment>
         ))}
       </Flex>
-      {status && <StatusBar info={status} />}
+      {focusedStatus && <StatusBar info={focusedStatus} />}
+    </Flex>
+  );
+}
+
+/** What the editor area shows when nothing is open: a way back into the last
+ *  files you touched, and the handful of shortcuts that replace mouse travel. */
+function WelcomePane({
+  recents,
+  onOpenFile,
+  onSearch,
+}: {
+  recents: FileRow[];
+  onOpenFile: (file: FileRow) => void;
+  onSearch: () => void;
+}) {
+  const rows = recents.slice(0, 5);
+  return (
+    <Flex
+      flex={1}
+      minW={0}
+      align="center"
+      justify="center"
+      position="relative"
+      overflow="hidden"
+      bg="surface.sunken"
+      px={6}
+    >
+      {/* Engineering paper, masked so it dissolves before it hits an edge. */}
+      <Box
+        aria-hidden
+        position="absolute"
+        inset={0}
+        className="cx-gridpaper"
+        opacity={0.55}
+        pointerEvents="none"
+        sx={{
+          maskImage:
+            "radial-gradient(46% 44% at 50% 40%, #000 0%, transparent 74%)",
+          WebkitMaskImage:
+            "radial-gradient(46% 44% at 50% 40%, #000 0%, transparent 74%)",
+        }}
+      />
+      <Box position="relative" w="full" maxW="420px" textAlign="center">
+        <Box className="cx-in">
+          <Box className="cx-float" display="inline-block" mb={5}>
+            <Logo size={54} />
+          </Box>
+          <Text
+            fontSize="19px"
+            fontWeight={600}
+            letterSpacing="-0.025em"
+            color="ink.base"
+          >
+            Pick up where your team left off
+          </Text>
+          <Text
+            fontSize="12.5px"
+            color="ink.subtle"
+            mt={1.5}
+            mb={0}
+            maxW="38ch"
+            mx="auto"
+            lineHeight={1.65}
+          >
+            Every file is its own operational-transform document. Open one and
+            everyone else&apos;s cursor appears in it immediately.
+          </Text>
+        </Box>
+
+        {rows.length > 0 ? (
+          <Box mt={7} textAlign="left" className="cx-in">
+            <Text textStyle="eyebrow" color="ink.subtle" mb={2} px={1}>
+              Recent
+            </Text>
+            <Box
+              bg="surface.panel"
+              border="1px solid"
+              borderColor="surface.border"
+              borderRadius="lg"
+              overflow="hidden"
+            >
+              {rows.map((f, i) => {
+                const glyph = fileIcon(f.path);
+                const name = f.path.split("/").pop() ?? f.path;
+                const dir = f.path.includes("/")
+                  ? f.path.slice(0, f.path.lastIndexOf("/"))
+                  : null;
+                const ext = name.includes(".")
+                  ? name.split(".").pop()!.toUpperCase()
+                  : "";
+                return (
+                  <Flex
+                    key={f.id}
+                    as="button"
+                    align="center"
+                    gap={2.5}
+                    w="full"
+                    textAlign="left"
+                    px={3}
+                    py={2.5}
+                    borderBottom={
+                      i === rows.length - 1 ? "none" : "1px solid"
+                    }
+                    borderColor="surface.border"
+                    _hover={{ bg: "surface.hover" }}
+                    onClick={() => onOpenFile(f)}
+                  >
+                    <Icon
+                      as={glyph.icon}
+                      boxSize="15px"
+                      color={glyph.color}
+                      flexShrink={0}
+                    />
+                    <Box flex={1} minW={0}>
+                      <Text
+                        fontSize="12.5px"
+                        fontWeight={500}
+                        color="ink.base"
+                        isTruncated
+                      >
+                        {name}
+                      </Text>
+                      {dir && (
+                        <Text
+                          fontSize="10.5px"
+                          color="ink.subtle"
+                          isTruncated
+                        >
+                          {dir}
+                        </Text>
+                      )}
+                    </Box>
+                    <Text
+                      fontSize="10px"
+                      fontFamily="mono"
+                      color={glyph.color}
+                      flexShrink={0}
+                    >
+                      {ext}
+                    </Text>
+                  </Flex>
+                );
+              })}
+            </Box>
+          </Box>
+        ) : (
+          <Box mt={7} className="cx-in">
+            <Button
+              size="sm"
+              variant="outline"
+              leftIcon={<Icon as={VscSearch} />}
+              onClick={onSearch}
+            >
+              Find a file
+            </Button>
+          </Box>
+        )}
+
+        <Flex
+          mt={7}
+          gap={5}
+          justify="center"
+          align="center"
+          flexWrap="wrap"
+          color="ink.subtle"
+        >
+          {[
+            { keys: ["Ctrl", "K"], label: "search everything" },
+            { keys: ["Ctrl", "B"], label: "explorer" },
+            { keys: ["Ctrl", "J"], label: "chat panel" },
+          ].map((h) => (
+            <Flex key={h.label} align="center" gap={1.5}>
+              <KeyHint keys={h.keys} />
+              <Text fontSize="10.5px" color="ink.subtle">
+                {h.label}
+              </Text>
+            </Flex>
+          ))}
+        </Flex>
+      </Box>
     </Flex>
   );
 }
@@ -555,6 +920,8 @@ type GroupProps = {
   onFocus: () => void;
   onTabDropAt: (payload: DropPayload, atIndex: number) => void;
   onDrop: (payload: DropPayload, split: boolean) => void;
+  sidebarOpen: boolean;
+  onToggleSidebar: () => void;
 };
 
 function EditorGroup({
@@ -574,6 +941,8 @@ function EditorGroup({
   onFocus,
   onTabDropAt,
   onDrop,
+  sidebarOpen,
+  onToggleSidebar,
 }: GroupProps) {
   const { files: openFiles, activeFileId } = data;
   const toast = useToast();
@@ -1130,6 +1499,20 @@ function EditorGroup({
           borderLeft="1px solid"
           borderColor="surface.border"
         >
+          <Tooltip label="Explorer (Ctrl+B)" openDelay={300}>
+            <Flex
+              boxSize="26px"
+              borderRadius="4px"
+              align="center"
+              justify="center"
+              cursor="pointer"
+              color={sidebarOpen ? "ink.base" : "ink.subtle"}
+              _hover={{ bg: "surface.hover", color: "ink.base" }}
+              onClick={onToggleSidebar}
+            >
+              <Icon as={VscLayoutSidebarLeft} fontSize="16px" />
+            </Flex>
+          </Tooltip>
           {previewable && (
             <Tooltip
               label={previewActive ? "Back to editor" : "Open preview tab"}

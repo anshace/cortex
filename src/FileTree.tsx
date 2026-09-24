@@ -19,6 +19,7 @@ import {
   VscChevronRight,
   VscCloudDownload,
   VscCloudUpload,
+  VscClose,
   VscCopy,
   VscEdit,
   VscFile,
@@ -30,6 +31,7 @@ import {
   VscListSelection,
   VscNewFile,
   VscNewFolder,
+  VscSearch,
   VscTrash,
 } from "react-icons/vsc";
 
@@ -140,6 +142,28 @@ function visibleOrder(
     else if (!collapsed.has(p)) visibleOrder(c, p, collapsed, out);
   }
 }
+
+// Filtered view of the tree: keep a folder when its own name matches (with its
+// whole subtree, so you can still browse into it) or when something inside it
+// matches. Folders that only matched through a descendant keep just the
+// matching branches.
+function pruneTree(node: TreeNode, q: string): TreeNode {
+  const out: TreeNode = { name: node.name, children: new Map() };
+  for (const c of Array.from(node.children.values())) {
+    if (c.file) {
+      if (c.name.toLowerCase().includes(q)) out.children.set(c.name, c);
+      continue;
+    }
+    if (c.name.toLowerCase().includes(q)) out.children.set(c.name, c);
+    else {
+      const sub = pruneTree(c, q);
+      if (sub.children.size) out.children.set(c.name, sub);
+    }
+  }
+  return out;
+}
+
+const NO_FOLDERS_COLLAPSED = new Set<string>();
 
 export type FileTreeHandle = {
   startCreate: (kind: "file" | "folder" | "board") => void;
@@ -286,7 +310,14 @@ const FileTree = memo(
     // changes, not on every render (selection clicks, menus, …).
     const root = useMemo(() => buildTree(files), [files]);
     const byId = useMemo(() => new Map(files.map((f) => [f.id, f])), [files]);
-    const rootChildren = useMemo(() => sorted(root), [root]);
+    const [filter, setFilter] = useState("");
+    const query = filter.trim().toLowerCase();
+    // What the tree actually shows — the same structure, narrowed to matches.
+    const view = useMemo(
+      () => (query ? pruneTree(root, query) : root),
+      [root, query],
+    );
+    const rootChildren = useMemo(() => sorted(view), [view]);
     // Very large levels render in chunks: a flat 5k-file workspace would
     // otherwise mount thousands of rows at once and lock the sidebar.
     const [rootShown, setRootShown] = useState(CHUNK);
@@ -302,6 +333,11 @@ const FileTree = memo(
       setSelected(new Set());
       lastClick.current = null;
     }, [props.workspaceId]);
+
+    // A filter result is a different list; don't inherit the old chunk window.
+    useEffect(() => {
+      setRootShown(CHUNK);
+    }, [query]);
 
     // A hard delete, move or merge can remove selected IDs in the current
     // workspace. Don't leave a phantom selection in the context menu.
@@ -386,7 +422,7 @@ const FileTree = memo(
         lastClick.current = file.id;
       } else if (e.shiftKey && lastClick.current != null) {
         const order: number[] = [];
-        visibleOrder(root, "", collapsed, order);
+        visibleOrder(view, "", collapsed, order);
         const a = order.indexOf(lastClick.current);
         const b = order.indexOf(file.id);
         if (a >= 0 && b >= 0) {
@@ -682,7 +718,7 @@ const FileTree = memo(
           divider: true,
           onClick: () => {
             const order: number[] = [];
-            visibleOrder(root, "", collapsed, order);
+            visibleOrder(view, "", collapsed, order);
             setSelected(new Set(order));
           },
         },
@@ -732,7 +768,9 @@ const FileTree = memo(
       workspaceId: props.workspaceId,
       filesInFolder: descendantsOf,
       activeFileId: props.activeFileId,
-      collapsed: props.collapsed,
+      // While filtering, every surviving branch is a match on the path to it,
+      // so honouring the user's collapse state would hide the hits.
+      collapsed: query ? NO_FOLDERS_COLLAPSED : props.collapsed,
       onToggle: props.onToggle,
       onDownload: props.onDownload,
       selected,
@@ -793,6 +831,66 @@ const FileTree = memo(
               </Text>
             </Flex>
           )}
+          {/* Filter, pinned to the top of the sidebar's scroll container. */}
+          <Flex
+            position="sticky"
+            top={0}
+            zIndex={2}
+            align="center"
+            gap={1.5}
+            h="28px"
+            px={2}
+            mx={0}
+            mb={1}
+            bg="surface.panel"
+            borderBottom="1px solid"
+            borderColor="surface.border"
+          >
+            <Icon as={VscSearch} boxSize="12px" color="ink.subtle" flexShrink={0} />
+            <Box
+              as="input"
+              type="search"
+              value={filter}
+              placeholder="Filter files"
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                setFilter(e.currentTarget.value)
+              }
+              onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
+                if (e.key === "Escape") {
+                  e.stopPropagation();
+                  setFilter("");
+                }
+              }}
+              flex={1}
+              minW={0}
+              h="full"
+              bg="transparent"
+              border="none"
+              outline="none"
+              boxShadow="none"
+              color="ink.base"
+              fontSize="12px"
+              _placeholder={{ color: "ink.subtle" }}
+              sx={{ "&::-webkit-search-cancel-button": { display: "none" } }}
+            />
+            {filter && (
+              <Flex
+                as="button"
+                align="center"
+                justify="center"
+                boxSize="16px"
+                borderRadius="sm"
+                color="ink.subtle"
+                flexShrink={0}
+                aria-label="Clear filter"
+                _hover={{ color: "ink.base", bg: "surface.hover" }}
+                onClick={() => setFilter("")}
+              >
+                <Icon as={VscClose} boxSize="11px" />
+              </Flex>
+            )}
+          </Flex>
+
           {/* Workspace root folder header */}
           <RowShell depth={0}>
             <HStack
@@ -814,6 +912,12 @@ const FileTree = memo(
                 flexShrink={0}
                 transform={rootOpen ? "rotate(90deg)" : "rotate(0deg)"}
                 transition="transform 0.18s var(--cx-ease-spring)"
+              />
+              <Icon
+                as={VscFolderOpened}
+                boxSize="13px"
+                color="brand.400"
+                flexShrink={0}
               />
               <Text
                 fontWeight={700}
@@ -852,6 +956,19 @@ const FileTree = memo(
                   hidden={rootChildren.length - rootShown}
                   onShow={() => setRootShown((s) => s + CHUNK)}
                 />
+              )}
+              {query && rootChildren.length === 0 && (
+                <RowShell depth={1}>
+                  <Text
+                    fontSize="11.5px"
+                    color="ink.subtle"
+                    pl={`${BASE}px`}
+                    py={1}
+                    isTruncated
+                  >
+                    No files match “{filter.trim()}”
+                  </Text>
+                </RowShell>
               )}
             </>
           )}
