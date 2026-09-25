@@ -398,14 +398,14 @@ async fn setup_2fa(user: User, db: Database) -> Result<impl Reply, Rejection> {
 }
 
 async fn enable_2fa(user: User, db: Database, body: CodeReq) -> Result<impl Reply, Rejection> {
-    let secret = match &user.totp_secret {
+    let secret = match user.totp_secret() {
         Some(_) if user.totp_enabled => {
             return Ok(err(StatusCode::BAD_REQUEST, "two-factor is already on"))
         }
         Some(s) => s,
         None => return Ok(err(StatusCode::BAD_REQUEST, "start setup first")),
     };
-    if !verify_totp(secret, &user.email, body.code.trim()) {
+    if !verify_totp(&secret, &user.email, body.code.trim()) {
         return Ok(err(
             StatusCode::BAD_REQUEST,
             "that code isn't right — enter the current one",

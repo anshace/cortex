@@ -309,9 +309,8 @@ async fn login_handler(
         match body.code.as_deref().map(str::trim) {
             Some(code) if !code.is_empty() => {
                 let ok = user
-                    .totp_secret
-                    .as_deref()
-                    .map(|s| verify_totp(s, &user.email, code))
+                    .totp_secret()
+                    .map(|s| verify_totp(&s, &user.email, code))
                     .unwrap_or(false);
                 if !ok {
                     throttle_record_fail(&throttle, &ip, now);

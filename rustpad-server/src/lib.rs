@@ -20,6 +20,7 @@ pub mod auth;
 mod board;
 pub mod crypto;
 pub mod database;
+mod keystore;
 mod ot;
 mod rustpad;
 pub mod workspace;

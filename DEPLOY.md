@@ -65,8 +65,10 @@ box and ports 80+443 must be open. DNS propagation can take a while (up to a day
 **Do not copy a live `authpad.db` directly.** SQLite uses WAL: recent writes may
 still be in `authpad.db-wal`, so `cp` of only the main file can silently omit
 data. The owner can download a portable **Data → Export everything (.zip)**
-from the console. It includes account password hashes and 2FA secrets; encrypt
-and protect it, and test restoring it on a separate installation.
+from the console. It includes account password hashes; 2FA seeds travel only in
+sealed form, so they are useless to whoever gets the ZIP without also getting the
+data key beside the database. Encrypt and protect it anyway — bcrypt hashes are
+offline-crackable — and test restoring it on a separate installation.
 
 For a scheduled *database* backup, use SQLite's online backup API instead of
 copying the live file. With the compose stack, run this from the project dir
@@ -78,8 +80,11 @@ mkdir -p "$HOME/backups" && chmod 700 "$HOME/backups"
 docker run --rm -v cortex_cortex-data:/data:ro -v "$HOME/backups:/out" \
   alpine sh -c 'apk add --no-cache -q sqlite >/dev/null && \
     sqlite3 "file:/data/authpad.db?mode=ro" ".backup /out/authpad-$(date +%F).db" && \
-    chmod 600 /out/authpad-$(date +%F).db'
+    chmod 600 /out/authpad-$(date +%F).db && cp /data/authpad.db.key /out/authpad-$(date +%F).key'
 ```
+
+Back up the **data key** with the database: restoring a `.db` whose `.key` is gone
+leaves every enrolled account unable to pass 2FA.
 
 A backup schedule is optional and **not** needed for database cleanup. The Rust
 server runs maintenance itself (five minutes after startup, then every 24 hours):
@@ -199,7 +204,13 @@ DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.prod.yml up -d
 
 - `COOKIE_SECURE=1` is set in the prod compose (session cookie is HTTPS-only).
 - The owner's session is short-lived (12h) vs 7 days for everyone else.
-- The app publishes no ports in prod; only Caddy reaches it on the compose network.
+- **The data key.** TOTP seeds are sealed with AES-256-GCM before they are
+  stored, so a leaked database file hands out no working second factors. The key
+  is `CORTEX_DATA_KEY` (32 bytes, hex or base64) if you set it, and otherwise a
+  `<database>.key` file created beside the database on first boot. Set the env
+  var on anything you do not fully control, and back the key up separately from
+  the database — **if the key is lost, every enrolled account's 2FA stops
+  verifying** and must be reset from the owner console (or the break-glass below).
 - If you later buy a real domain, point an A record at the Elastic IP and just
   change `DOMAIN=`.
 
@@ -267,19 +278,22 @@ mkdir -p "$HOME/backups" && chmod 700 "$HOME/backups"
 sudo docker run --rm -v cortex-data:/data:ro -v "$HOME/backups:/out" alpine sh -c \
   'apk add --no-cache -q sqlite >/dev/null && \
    sqlite3 "file:/data/authpad.db?mode=ro" ".backup /out/authpad-$(date +%F).db" && \
-   chmod 600 /out/authpad-$(date +%F).db'
+   chmod 600 /out/authpad-$(date +%F).db && cp /data/authpad.db.key /out/authpad-$(date +%F).key'
 
 # Restore an offline .db backup on a NEW box BEFORE first start:
 sudo docker run --rm -v cortex-data:/data -v "$HOME/backups:/in:ro" \
-  alpine cp /in/authpad-YYYY-MM-DD.db /data/authpad.db
+  alpine sh -c 'cp /in/authpad-YYYY-MM-DD.db /data/authpad.db && \
+    cp /in/authpad-YYYY-MM-DD.key /data/authpad.db.key'
 sudo docker run --rm -v cortex-data:/data alpine chown -R 1000:1000 /data
 # Start the app only after the database is in place.
 ```
 
 Alternatively, restore an owner ZIP from **Data → Import archive** on a test or
 fresh instance: it replaces application data transactionally and signs everyone
-out. The ZIP contains credentials (password hashes, 2FA secrets); store it
-encrypted. Test a restore periodically. This online backup command is separate
+out. The ZIP contains password hashes, and 2FA seeds only in sealed form; store it
+encrypted, and carry the data key with the database — a restore onto an install
+with a different `<database>.key` leaves every enrolment unverifiable. Test a
+restore periodically. This online backup command is separate
 from maintenance: scheduled pruning, WAL checkpointing and conditional VACUUM
 run **inside Rust** every 24 hours, with **Settings → Storage → Compact now**
 (owner only). A backup cron is optional; no maintenance cron or sidecar is used.
@@ -295,7 +309,10 @@ After ANY write (below), always: `sudo docker run --rm -v cortex-data:/d alpine 
 
 ## 2FA lockout recovery
 
-`totp_secret`/`totp_enabled` live per user in `users`. Fix time first, then:
+2FA lives per user in `users`: `totp_enabled`, plus the seed in
+`totp_secret_cipher` — sealed, so editing it by hand is useless. The legacy
+`totp_secret` column is kept only for old rows and is NULL once they have been
+backfilled at startup. Fix time first, then:
 
 ```sh
 # owner locked out — break-glass (clears owner/root 2FA on boot):
@@ -307,7 +324,7 @@ sudo docker run -d --name cortex -p 80:80 -p 443:443 -e DOMAIN=your-domain.examp
 
 # disable 2FA for EVERYONE (nuclear):
 sudo docker run --rm -v cortex-data:/d alpine sh -c \
-  "apk add -q sqlite && sqlite3 /d/authpad.db 'UPDATE users SET totp_secret=NULL, totp_enabled=0;'"
+  "apk add -q sqlite && sqlite3 /d/authpad.db 'UPDATE users SET totp_secret=NULL, totp_secret_cipher=NULL, totp_enabled=0;'"
 sudo docker run --rm -v cortex-data:/d alpine chown -R 1000:1000 /d && sudo docker restart cortex
 ```
 A regular user's 2FA is reset by the owner in **Owner console → Accounts → shield**.

@@ -18,6 +18,8 @@ use sqlx::{
     Column, Sqlite, SqlitePool, Transaction,
 };
 
+use crate::keystore;
+
 /// Represents a document persisted in database storage.
 #[derive(sqlx::FromRow, PartialEq, Eq, Clone, Debug)]
 pub struct PersistedDocument {
@@ -42,10 +44,20 @@ pub struct User {
     pub role: String,
     /// Org the user is assigned to (None for root / unassigned).
     pub org_id: Option<i64>,
-    /// Base32 TOTP secret, if the user has started 2FA enrollment (None = never set).
-    pub totp_secret: Option<String>,
+    /// HKDF-sealed [`Self::totp_secret`] — never the seed itself. None means 2FA
+    /// was never started.
+    pub totp_secret_cipher: Option<String>,
     /// True once the user has confirmed 2FA with a valid code; login then requires it.
     pub totp_enabled: bool,
+}
+
+impl User {
+    /// The base32 TOTP seed, unsealed. None if 2FA was never started, and also
+    /// None if the row was sealed by a different install's data key — which reads
+    /// as "start setup again" rather than as a working second factor.
+    pub fn totp_secret(&self) -> Option<String> {
+        self.totp_secret_cipher.as_deref().and_then(|cipher| keystore::open(keystore::TOTP, cipher))
+    }
 }
 
 /// A user as shown in the root admin console (never includes root accounts).
@@ -468,10 +480,46 @@ impl Database {
             .connect_with(options)
             .await?;
         sqlx::migrate!().run(&pool).await?;
-        Ok(Database {
+        // The data key must exist before anything can be sealed, and the
+        // backfill below needs it to move seeds that predate encryption.
+        keystore::ensure_for(uri).map_err(anyhow::Error::msg)?;
+        let db = Database {
             pool,
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
-        })
+        };
+        db.seal_existing_totp().await?;
+        Ok(db)
+    }
+
+    /// One-time, at startup: copy plaintext TOTP seeds into the sealed column and
+    /// empty the plaintext one. A seed that cannot be sealed fails the boot rather
+    /// than being left readable, because a half-done backfill is exactly the leak
+    /// the sealed column exists to close.
+    async fn seal_existing_totp(&self) -> Result<()> {
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as(r#"SELECT id, totp_secret FROM users WHERE totp_secret IS NOT NULL"#)
+                .fetch_all(&self.pool)
+                .await?;
+        for (id, seed) in &rows {
+            let cipher = keystore::seal(keystore::TOTP, seed).ok_or_else(|| {
+                anyhow::anyhow!("no data key available to seal existing TOTP seeds")
+            })?;
+            sqlx::query(
+                r#"UPDATE users SET totp_secret_cipher = $1, totp_secret = NULL WHERE id = $2"#,
+            )
+            .bind(cipher)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        }
+        if !rows.is_empty() {
+            log::info!(
+                "sealed {} TOTP seed(s) at rest (data key: {})",
+                rows.len(),
+                keystore::source()
+            );
+        }
+        Ok(())
     }
 
     // ----- Documents (OT content) -----
@@ -574,7 +622,7 @@ impl Database {
     /// Look up a user by email for login.
     pub async fn get_user_by_email(&self, email: &str) -> Result<Option<User>> {
         sqlx::query_as(
-            r#"SELECT id, email, name, password_hash, role, org_id, totp_secret, totp_enabled FROM users WHERE email = $1"#,
+            r#"SELECT id, email, name, password_hash, role, org_id, totp_secret_cipher, totp_enabled FROM users WHERE email = $1"#,
         )
         .bind(email)
         .fetch_optional(&self.pool)
@@ -638,12 +686,19 @@ impl Database {
     }
 
     /// Store a pending TOTP secret (enrollment started but not yet confirmed).
+    /// The seed is sealed before it is stored; a missing data key is an error,
+    /// never a licence to write it in the clear.
     pub async fn set_totp_pending(&self, user_id: i64, secret: &str) -> Result<()> {
-        sqlx::query(r#"UPDATE users SET totp_secret = $1, totp_enabled = 0 WHERE id = $2"#)
-            .bind(secret)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
+        let cipher = keystore::seal(keystore::TOTP, secret)
+            .ok_or_else(|| anyhow::anyhow!("no data key available to seal a TOTP seed"))?;
+        sqlx::query(
+            r#"UPDATE users SET totp_secret = NULL, totp_secret_cipher = $1, totp_enabled = 0
+               WHERE id = $2"#,
+        )
+        .bind(cipher)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -658,17 +713,21 @@ impl Database {
 
     /// Remove TOTP entirely (user turn-off, or owner recovery / break-glass reset).
     pub async fn clear_totp(&self, user_id: i64) -> Result<()> {
-        sqlx::query(r#"UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE id = $1"#)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            r#"UPDATE users SET totp_secret = NULL, totp_secret_cipher = NULL, totp_enabled = 0
+               WHERE id = $1"#,
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     /// Clear TOTP for every root/owner account. Host-level break-glass on boot.
     pub async fn clear_totp_for_roots(&self) -> Result<u64> {
         let r = sqlx::query(
-            r#"UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE role = 'root'"#,
+            r#"UPDATE users SET totp_secret = NULL, totp_secret_cipher = NULL, totp_enabled = 0
+               WHERE role = 'root'"#,
         )
         .execute(&self.pool)
         .await?;
@@ -689,7 +748,7 @@ impl Database {
     /// Resolve a session token to its user, only if the session is unexpired.
     pub async fn get_session_user(&self, token: &str, now: i64) -> Result<Option<User>> {
         sqlx::query_as(
-            r#"SELECT u.id, u.email, u.name, u.password_hash, u.role, u.org_id, u.totp_secret, u.totp_enabled
+            r#"SELECT u.id, u.email, u.name, u.password_hash, u.role, u.org_id, u.totp_secret_cipher, u.totp_enabled
                FROM session s JOIN users u ON u.id = s.user_id
                WHERE s.token = $1 AND s.expires_at > $2"#,
         )
@@ -747,7 +806,7 @@ impl Database {
     /// Fetch a target for an authorization decision (never expose its hash).
     pub async fn admin_target(&self, id: i64) -> Result<Option<User>> {
         Ok(sqlx::query_as(
-            "SELECT id, email, name, password_hash, role, org_id, totp_secret, totp_enabled FROM users WHERE id = $1",
+            "SELECT id, email, name, password_hash, role, org_id, totp_secret_cipher, totp_enabled FROM users WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -809,7 +868,9 @@ impl Database {
             sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2 AND role != 'root' AND ($3 IS NULL OR org_id = $3)")
                 .bind(hash).bind(id).bind(scope).execute(&mut tx).await?
         } else {
-            sqlx::query("UPDATE users SET totp_secret = NULL, totp_enabled = 0 WHERE id = $1 AND role != 'root' AND ($2 IS NULL OR org_id = $2)")
+            sqlx::query(
+                "UPDATE users SET totp_secret = NULL, totp_secret_cipher = NULL, totp_enabled = 0 WHERE id = $1 AND role != 'root' AND ($2 IS NULL OR org_id = $2)",
+            )
                 .bind(id).bind(scope).execute(&mut tx).await?
         };
         if r.rows_affected() == 0 { return Ok(false); }
@@ -2798,6 +2859,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn a_sealed_totp_seed_never_reaches_the_file() {
+        let (file, db) = test_database().await;
+        db.create_user_if_absent("ada", "Ada", "pw", "user", None).await.unwrap();
+        let user = db.get_user_by_email("ada").await.unwrap().unwrap();
+        db.set_totp_pending(user.id, "JBSWY3DPEHPK3PXP").await.unwrap();
+
+        // Reading it back works, but the seed is not in the file bytes — nor in
+        // the WAL sidecar, which is what a live backup would also capture.
+        let stored = db.get_user_by_email("ada").await.unwrap().unwrap();
+        assert_eq!(stored.totp_secret().as_deref(), Some("JBSWY3DPEHPK3PXP"));
+        let seed = b"JBSWY3DPEHPK3PXP";
+        for path in [file.path().to_path_buf(), wal_path(file.path())] {
+            if let Ok(bytes) = std::fs::read(&path) {
+                assert!(
+                    !bytes.windows(seed.len()).any(|w| w == seed),
+                    "plaintext seed found in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_seeds_are_sealed_on_the_next_boot() {
+        let (_file, db) = test_database().await;
+        db.create_user_if_absent("miriam", "Miriam", "pw", "user", None).await.unwrap();
+        let (id,): (i64,) =
+            sqlx::query_as("SELECT id FROM users WHERE email = 'miriam'").fetch_one(&db.pool).await.unwrap();
+        // A row written by an older build, before the sealed column existed.
+        sqlx::query("UPDATE users SET totp_secret = 'JBSWY3DPEHPK3PXP', totp_enabled = 1 WHERE id = $1")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        db.seal_existing_totp().await.unwrap();
+
+        let user = db.get_user_by_email("miriam").await.unwrap().unwrap();
+        assert!(user.totp_enabled, "2FA must stay on across the backfill");
+        assert_eq!(user.totp_secret().as_deref(), Some("JBSWY3DPEHPK3PXP"));
+        let (left,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM users WHERE totp_secret IS NOT NULL")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(left, 0, "no row may keep a readable seed");
+    }
+
+    fn wal_path(path: &std::path::Path) -> std::path::PathBuf {
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        std::path::PathBuf::from(wal)
     }
 
     #[tokio::test]
