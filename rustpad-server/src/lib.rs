@@ -17,6 +17,7 @@ use crate::{board::BoardHub, database::Database, rustpad::Rustpad};
 
 pub mod account;
 pub mod auth;
+pub mod blobstore;
 mod board;
 pub mod crypto;
 pub mod database;

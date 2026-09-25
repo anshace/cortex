@@ -483,6 +483,11 @@ impl Database {
         // The data key must exist before anything can be sealed, and the
         // backfill below needs it to move seeds that predate encryption.
         keystore::ensure_for(uri).map_err(anyhow::Error::msg)?;
+        // Choose where binary content will live before any handler can store
+        // any. Logged every boot, because "where are my files" is a question
+        // worth answering from the log.
+        let blobs = crate::blobstore::init(uri);
+        log::info!("blob storage backend: {blobs}");
         let db = Database {
             pool,
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
