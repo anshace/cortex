@@ -2479,6 +2479,8 @@ async fn admin_storage(user: User, db: Database) -> Result<impl Reply, Rejection
         "db_bytes": db.db_size_bytes().await.unwrap_or(0),
         "free_bytes": db.free_bytes().await.unwrap_or(0),
         "blob_bytes": db.blob_bytes().await.unwrap_or(0),
+        "object_bytes": db.object_bytes().await.unwrap_or(0),
+        "blob_backend": db.blob_backend(),
         "tables": tables,
     }))
     .into_response())

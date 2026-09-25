@@ -551,6 +551,10 @@ export type StorageStats = {
   db_bytes: number;
   free_bytes: number;
   blob_bytes: number;
+  /** Content held outside the database file, once the object backend is on. */
+  object_bytes: number;
+  /** `inline` while bytes live in the database file, `fs` once they do not. */
+  blob_backend: string;
   tables: { name: string; rows: number }[];
 };
 export type MaintenanceReport = {
@@ -564,6 +568,8 @@ export type MaintenanceReport = {
   orphan_blobs: number;
   orphan_reactions: number;
   orphan_chat_images: number;
+  /** Objects no row referenced any more, deleted by the same pass. */
+  released_objects: number;
   pruned_audit: number;
 };
 export async function getStorage(): Promise<StorageStats> {

@@ -102,6 +102,21 @@ impl BlobStore {
         }
     }
 
+    /// Store bytes under the name derived from their content ([`content_key`]),
+    /// returning the key. `None` means this backend keeps bytes elsewhere — the
+    /// caller must store them in its own row.
+    ///
+    /// Content addressing is what makes a shared object safe: two rows can
+    /// reference one key only because identical keys hold identical bytes, so a
+    /// file copy is a metadata insert and never has to move content.
+    pub fn store(&self, bytes: &[u8]) -> Option<String> {
+        if self.is_inline() {
+            return None;
+        }
+        let key = content_key(bytes);
+        self.put(&key, bytes).then_some(key)
+    }
+
     /// True when the row's `data` column is still the source of truth.
     pub fn is_inline(&self) -> bool {
         matches!(self.inner, Inner::Inline)
@@ -165,9 +180,32 @@ impl BlobStore {
         }
     }
 
-    /// Drop an object. Missing is success; only a real failure is reported.
-    pub fn delete(&self, key: &str) -> io::Result<()> {
+    /// Every object this store holds, as keys. A temporary file left by an
+    /// interrupted write is removed here rather than listed, because nothing can
+    /// ever name it.
+    pub fn object_keys(&self) -> Vec<String> {
         let Inner::Fs { dir } = &self.inner else {
+            return Vec::new();
+        };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut keys = Vec::new();
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            if name.contains(".tmp") {
+                let _ = fs::remove_file(entry.path());
+                continue;
+            }
+            keys.push(name);
+        }
+        keys
+    }
+
+    /// Drop an object. Missing is success; only a real failure is reported.
+    pub fn delete(&self, key: &str) -> io::Result<()> {        let Inner::Fs { dir } = &self.inner else {
             return Ok(());
         };
         let Some(path) = safe_path(dir, key) else {
@@ -179,6 +217,21 @@ impl BlobStore {
             Err(e) => Err(e),
         }
     }
+}
+
+use sha2::{Digest, Sha256};
+
+/// The object name for a byte string: its SHA-256, hex encoded. Two rows with
+/// the same content therefore agree on one object without being told about each
+/// other, which is why a copy never has to write bytes.
+pub fn content_key(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Install the process-wide store once, at boot. Returns the mode for logging.
@@ -287,6 +340,20 @@ mod tests {
         fs::write(&blocker, b"not a directory").unwrap();
         let store = BlobStore::fs(&blocker);
         assert!(store.is_err(), "a non-writable target must be rejected");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn content_addressed_store_dedupes_and_reads_back() {
+        let dir = temp_dir();
+        let store = BlobStore::fs(&dir).unwrap();
+        let key = store.store(b"same bytes".as_slice()).expect("fs stores");
+        assert_eq!(key, content_key(b"same bytes"));
+        // Storing the same content again yields the same single object.
+        assert_eq!(store.store(b"same bytes".as_slice()).as_deref(), Some(key.as_str()));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(store.get(&key).as_deref(), Some(b"same bytes".as_slice()));
+        assert_eq!(BlobStore::inline().store(b"x".as_slice()), None);
         let _ = fs::remove_dir_all(&dir);
     }
 

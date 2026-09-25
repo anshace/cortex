@@ -80,7 +80,8 @@ mkdir -p "$HOME/backups" && chmod 700 "$HOME/backups"
 docker run --rm -v cortex_cortex-data:/data:ro -v "$HOME/backups:/out" \
   alpine sh -c 'apk add --no-cache -q sqlite >/dev/null && \
     sqlite3 "file:/data/authpad.db?mode=ro" ".backup /out/authpad-$(date +%F).db" && \
-    chmod 600 /out/authpad-$(date +%F).db && cp /data/authpad.db.key /out/authpad-$(date +%F).key'
+    chmod 600 /out/authpad-$(date +%F).db && cp /data/authpad.db.key /out/authpad-$(date +%F).key && \
+    { [ -d /data/blobs ] && tar -C /data -cf /out/authpad-$(date +%F).blobs.tar blobs; } ; true'
 ```
 
 Back up the **data key** with the database: restoring a `.db` whose `.key` is gone
@@ -211,6 +212,13 @@ DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.prod.yml up -d
   var on anything you do not fully control, and back the key up separately from
   the database — **if the key is lost, every enrolled account's 2FA stops
   verifying** and must be reset from the owner console (or the break-glass below).
+- **Binary content location.** Uploaded files and pasted images live in the
+  database by default. Setting `BLOB_BACKEND=fs` moves them into objects under
+  `BLOB_DIR` (default `/data/blobs`), keyed by content hash, so the database
+  holds structure and the objects hold bytes; a misconfigured or unwritable
+  directory logs a warning and stays inline. **When you turn this on, the object
+  directory becomes part of every backup** — `.backup` of the `.db` alone no
+  longer contains your users' files, though a console ZIP export still does.
 - If you later buy a real domain, point an A record at the Elastic IP and just
   change `DOMAIN=`.
 
@@ -278,7 +286,8 @@ mkdir -p "$HOME/backups" && chmod 700 "$HOME/backups"
 sudo docker run --rm -v cortex-data:/data:ro -v "$HOME/backups:/out" alpine sh -c \
   'apk add --no-cache -q sqlite >/dev/null && \
    sqlite3 "file:/data/authpad.db?mode=ro" ".backup /out/authpad-$(date +%F).db" && \
-   chmod 600 /out/authpad-$(date +%F).db && cp /data/authpad.db.key /out/authpad-$(date +%F).key'
+   chmod 600 /out/authpad-$(date +%F).db && cp /data/authpad.db.key /out/authpad-$(date +%F).key && \
+   { [ -d /data/blobs ] && tar -C /data -cf /out/authpad-$(date +%F).blobs.tar blobs; } ; true'
 
 # Restore an offline .db backup on a NEW box BEFORE first start:
 sudo docker run --rm -v cortex-data:/data -v "$HOME/backups:/in:ro" \

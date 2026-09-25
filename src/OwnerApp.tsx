@@ -256,6 +256,9 @@ function OwnerApp({
         title: r.vacuumed
           ? `Compacted — ${humanBytes(r.db_bytes_before)} → ${humanBytes(r.db_bytes_after)}`
           : "Checkpoint done — file is under the vacuum threshold",
+        description: r.released_objects
+          ? `${r.released_objects} unreferenced object(s) freed`
+          : undefined,
         status: "success",
         duration: 4000,
       });
@@ -1108,7 +1111,23 @@ function OwnerApp({
                   </Text>
                   <KV label="Database" value={storage ? humanBytes(storage.db_bytes) : "—"} hue="state.ok" />
                   <KV label="Uploaded blobs" value={storage ? humanBytes(storage.blob_bytes) : "—"} hue="state.warn" />
+                  {storage?.blob_backend === "fs" && (
+                    <KV
+                      label="In objects"
+                      value={humanBytes(storage.object_bytes)}
+                      hue="accent.cyan"
+                    />
+                  )}
                   <KV label="Reclaimable" value={storage ? humanBytes(storage.free_bytes) : "—"} hue="state.info" />
+                  {/* The one backup fact an owner has to know once content
+                      leaves the database file. */}
+                  {storage && storage.object_bytes > 0 && (
+                    <Text fontSize="11px" color="ink.subtle" mt={2.5} lineHeight={1.55}>
+                      {humanBytes(storage.object_bytes)} of content is stored outside
+                      the database file. A ZIP export still carries it; a{" "}
+                      <Text as="span" fontFamily="mono">.db</Text> backup does not.
+                    </Text>
+                  )}
                 </Box>
               </Flex>
             </Card>

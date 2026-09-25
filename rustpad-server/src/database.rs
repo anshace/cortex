@@ -18,6 +18,7 @@ use sqlx::{
     Column, Sqlite, SqlitePool, Transaction,
 };
 
+use crate::blobstore::BlobStore;
 use crate::keystore;
 
 /// Represents a document persisted in database storage.
@@ -387,6 +388,8 @@ pub struct MaintenanceReport {
     pub orphan_reactions: u64,
     /// Unreferenced old pasted chat images.
     pub orphan_chat_images: u64,
+    /// Objects no row references any more, deleted from the object store.
+    pub released_objects: u64,
     /// Audit entries older than the configured retention period.
     pub pruned_audit: u64,
 }
@@ -396,6 +399,9 @@ pub struct MaintenanceReport {
 pub struct Database {
     pool: SqlitePool,
     maintenance_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Where binary content lives: inline in the row, or as an object the row
+    /// names. Chosen once at boot and never re-decided per query.
+    blobs: BlobStore,
 }
 
 // These helpers share the caller's transaction. File content, chats, reactions
@@ -460,6 +466,16 @@ async fn delete_group_tx(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<Ve
 impl Database {
     /// Construct a new database, creating the file and running migrations.
     pub async fn new(uri: &str) -> Result<Self> {
+        // One store for the process, chosen once from the environment, so every
+        // database opened later agrees on where content lives.
+        crate::blobstore::init(uri);
+        let blobs = crate::blobstore::store().clone();
+        Self::open_with(uri, blobs).await
+    }
+
+    /// Open a database against an explicit blob backend. Tests use this to
+    /// exercise the object path without touching the process environment.
+    async fn open_with(uri: &str, blobs: BlobStore) -> Result<Self> {
         // The migrator and *every* pooled connection need the same pragmas.
         // WAL allows readers to continue during edits; foreign keys stay ON
         // (SQLx's default). Only use WAL on a local disk, not a network share.
@@ -483,17 +499,67 @@ impl Database {
         // The data key must exist before anything can be sealed, and the
         // backfill below needs it to move seeds that predate encryption.
         keystore::ensure_for(uri).map_err(anyhow::Error::msg)?;
-        // Choose where binary content will live before any handler can store
-        // any. Logged every boot, because "where are my files" is a question
-        // worth answering from the log.
-        let blobs = crate::blobstore::init(uri);
-        log::info!("blob storage backend: {blobs}");
         let db = Database {
             pool,
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
+            blobs,
         };
         db.seal_existing_totp().await?;
+        db.record_inline_sizes().await?;
+        log::info!("blob storage backend: {}", db.blobs.mode());
         Ok(db)
+    }
+
+    /// Move an imported row's inline bytes into this install's object store.
+    /// Returns the row unchanged when there is nothing to rehome.
+    fn rehome_content(&self, row: &serde_json::Value) -> Result<serde_json::Value> {
+        let serde_json::Value::Object(map) = row else {
+            return Ok(row.clone());
+        };
+        let mut map = map.clone();
+        let bytes = match map.get("data") {
+            Some(serde_json::Value::String(text)) => B64.decode(text)?,
+            Some(serde_json::Value::Null) | None => return Ok(serde_json::Value::Object(map)),
+            _ => bail!("malformed export: content row holds a non-string data value"),
+        };
+        if let Some(key) = self.blobs.store(&bytes) {
+            // An empty value, not a null: the column is NOT NULL, and reads
+            // always prefer the key.
+            map.insert("data".into(), serde_json::json!(""));
+            map.insert("storage_key".into(), serde_json::Value::String(key));
+            map.insert("size".into(), serde_json::json!(bytes.len()));
+        }
+        Ok(serde_json::Value::Object(map))
+    }
+
+    /// Record the byte length of every blob on the row that holds it, so a size
+    /// question never depends on where the bytes are. Rows written by an older
+    /// build carry only `data`.
+    async fn record_inline_sizes(&self) -> Result<()> {
+        for table in ["file_blob", "chat_image"] {
+            let sql =
+                format!("UPDATE {table} SET size = LENGTH(data) WHERE size IS NULL AND data IS NOT NULL");
+            let moved = sqlx::query(&sql).execute(&self.pool).await?.rows_affected();
+            if moved > 0 {
+                log::info!("recorded content sizes for {moved} {table} row(s)");
+            }
+        }
+        Ok(())
+    }
+
+    /// A row's bytes, wherever they live. A row naming an object the store
+    /// cannot produce is an error, not an empty file — a silently blank download
+    /// is how lost data stays undiscovered.
+    async fn blob_content(&self, data: Vec<u8>, key: Option<String>) -> Result<Vec<u8>> {
+        match key {
+            Some(key) => self.blobs.get(&key).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "stored object {key} is missing from the {} backend",
+                    self.blobs.mode()
+                )
+            }),
+            None => Ok(data),
+        }
     }
 
     /// One-time, at startup: copy plaintext TOTP seeds into the sealed column and
@@ -1714,7 +1780,7 @@ impl Database {
     pub async fn list_files(&self, workspace_id: i64) -> Result<Vec<FileRow>> {
         sqlx::query_as(
             r#"SELECT f.id, f.workspace_id, f.path, f.doc_id, f.kind, f.mime,
-                      COALESCE((SELECT LENGTH(fb.data) FROM file_blob fb WHERE fb.file_id = f.id),
+                      COALESCE((SELECT COALESCE(fb.size, LENGTH(fb.data), 0) FROM file_blob fb WHERE fb.file_id = f.id),
                                (SELECT LENGTH(CAST(d.text AS BLOB)) FROM document d WHERE d.id = f.doc_id), 0) AS size
                FROM file f
                WHERE f.workspace_id = $1 ORDER BY f.path"#,
@@ -1729,7 +1795,7 @@ impl Database {
     pub async fn get_file(&self, id: i64) -> Result<Option<FileRow>> {
         sqlx::query_as(
             r#"SELECT f.id, f.workspace_id, f.path, f.doc_id, f.kind, f.mime,
-                      COALESCE((SELECT LENGTH(fb.data) FROM file_blob fb WHERE fb.file_id = f.id),
+                      COALESCE((SELECT COALESCE(fb.size, LENGTH(fb.data), 0) FROM file_blob fb WHERE fb.file_id = f.id),
                                (SELECT LENGTH(CAST(d.text AS BLOB)) FROM document d WHERE d.id = f.doc_id), 0) AS size
                FROM file f WHERE f.id = $1"#,
         )
@@ -1791,7 +1857,7 @@ impl Database {
             }
             let file: Option<FileRow> = sqlx::query_as(
                 r#"SELECT f.id, f.workspace_id, f.path, f.doc_id, f.kind, f.mime,
-                         COALESCE((SELECT LENGTH(fb.data) FROM file_blob fb WHERE fb.file_id = f.id),
+                         COALESCE((SELECT COALESCE(fb.size, LENGTH(fb.data), 0) FROM file_blob fb WHERE fb.file_id = f.id),
                                   (SELECT LENGTH(CAST(d.text AS BLOB)) FROM document d WHERE d.id = f.doc_id), 0) AS size
                    FROM file f WHERE f.id = $1"#,
             )
@@ -1890,7 +1956,7 @@ impl Database {
                     };
                     if rows != 1 { bail!("source text content missing"); }
                 } else {
-                    let rows = sqlx::query("INSERT INTO file_blob (file_id, data) SELECT $1, data FROM file_blob WHERE file_id = $2")
+                    let rows = sqlx::query("INSERT INTO file_blob (file_id, data, storage_key, size) SELECT $1, data, storage_key, size FROM file_blob WHERE file_id = $2")
                         .bind(id)
                         .bind(src.id)
                         .execute(&mut tx)
@@ -1915,35 +1981,60 @@ impl Database {
         Ok(result)
     }
 
+    /// Decide where new bytes go. With an object backend the bytes are stored
+    /// once under their content hash and the row keeps only the key; with the
+    /// inline backend the row keeps the bytes, exactly as before.
+    ///
+    /// The row's `data` column is NOT NULL in the schema, so a keyed row keeps an
+    /// empty placeholder rather than a null. Reads always prefer the key, and the
+    /// `size` column is what byte accounting uses, so the placeholder is never
+    /// mistaken for content.
+    fn place(&self, data: &[u8]) -> (Vec<u8>, Option<String>, i64) {
+        let key = self.blobs.store(data);
+        let inline = if key.is_some() { Vec::new() } else { data.to_vec() };
+        (inline, key, data.len() as i64)
+    }
+
     /// Store raw bytes for a binary file.
     pub async fn store_blob(&self, file_id: i64, data: &[u8]) -> Result<()> {
+        let (inline, key, size) = self.place(data);
         sqlx::query(
-            r#"INSERT INTO file_blob (file_id, data) VALUES ($1, $2)
+            r#"INSERT INTO file_blob (file_id, data, storage_key, size) VALUES ($1, $2, $3, $4)
                ON CONFLICT(file_id) DO UPDATE SET
                  data = excluded.data,
+                 storage_key = excluded.storage_key,
+                 size = excluded.size,
                  revision = file_blob.revision + 1"#,
         )
         .bind(file_id)
-        .bind(data)
+        .bind(inline)
+        .bind(key)
+        .bind(size)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Replace a blob only if it still has the revision read by the client.
+    /// Replace a blob only if it still has the revision read by the client. The
+    /// object is written before the guarded update, because an object store
+    /// cannot join this transaction; a revision that no longer matches leaves the
+    /// new object unreferenced, and maintenance collects it.
     pub async fn store_blob_at_revision(
         &self,
         file_id: i64,
         data: &[u8],
         expected_revision: i64,
     ) -> Result<Option<i64>> {
+        let (inline, key, size) = self.place(data);
         let row: Option<(i64,)> = sqlx::query_as(
             r#"UPDATE file_blob
-               SET data = $1, revision = revision + 1
-               WHERE file_id = $2 AND revision = $3
+               SET data = $1, storage_key = $2, size = $3, revision = revision + 1
+               WHERE file_id = $4 AND revision = $5
                RETURNING revision"#,
         )
-        .bind(data)
+        .bind(inline)
+        .bind(key)
+        .bind(size)
         .bind(file_id)
         .bind(expected_revision)
         .fetch_optional(&self.pool)
@@ -1953,22 +2044,32 @@ impl Database {
 
     /// Load raw bytes for a binary file.
     pub async fn load_blob(&self, file_id: i64) -> Result<Option<Vec<u8>>> {
-        let row: Option<(Vec<u8>,)> =
-            sqlx::query_as(r#"SELECT data FROM file_blob WHERE file_id = $1"#)
-                .bind(file_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|r| r.0))
+        let row: Option<(Vec<u8>, Option<String>)> = sqlx::query_as(
+            "SELECT data, storage_key FROM file_blob WHERE file_id = $1",
+        )
+        .bind(file_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some((data, key)) => Ok(Some(self.blob_content(data, key).await?)),
+            None => Ok(None),
+        }
     }
 
     /// Load a binary file's bytes together with its concurrency revision.
     pub async fn load_blob_with_revision(&self, file_id: i64) -> Result<Option<(Vec<u8>, i64)>> {
-        Ok(
-            sqlx::query_as(r#"SELECT data, revision FROM file_blob WHERE file_id = $1"#)
-                .bind(file_id)
-                .fetch_optional(&self.pool)
-                .await?,
+        let row: Option<(Vec<u8>, Option<String>, i64)> = sqlx::query_as(
+            "SELECT data, storage_key, revision FROM file_blob WHERE file_id = $1",
         )
+        .bind(file_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some((data, key, revision)) => {
+                Ok(Some((self.blob_content(data, key).await?, revision)))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Hard-delete files and their content atomically. Returns their document
@@ -2030,15 +2131,63 @@ impl Database {
         Ok(n)
     }
 
-    /// Total bytes stored in binary blobs (uploaded files + pasted chat images).
+    /// Total content bytes held by binary rows, whether they live in the
+    /// database or in the object store.
     pub async fn blob_bytes(&self) -> Result<i64> {
-        let (a,): (i64,) = sqlx::query_as("SELECT COALESCE(SUM(LENGTH(data)),0) FROM file_blob")
-            .fetch_one(&self.pool)
-            .await?;
-        let (b,): (i64,) = sqlx::query_as("SELECT COALESCE(SUM(LENGTH(data)),0) FROM chat_image")
-            .fetch_one(&self.pool)
-            .await?;
+        let (a,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(COALESCE(size, LENGTH(data))),0) FROM file_blob",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let (b,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(COALESCE(size, LENGTH(data))),0) FROM chat_image",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         Ok(a + b)
+    }
+
+    /// Which backend content is kept in, for the owner console: `inline` while
+    /// bytes sit in the database file, `fs` once they live beside it.
+    pub fn blob_backend(&self) -> &'static str {
+        self.blobs.mode()
+    }
+
+    /// Content bytes that live outside the database file, and so are not covered
+    /// by a backup of that file alone. Zero while the inline backend is active.
+    pub async fn object_bytes(&self) -> Result<i64> {        let mut total = 0;
+        for table in ["file_blob", "chat_image"] {
+            let (n,): (i64,) = sqlx::query_as(&format!(
+                "SELECT COALESCE(SUM(size),0) FROM {table} WHERE storage_key IS NOT NULL"
+            ))
+            .fetch_one(&self.pool)
+            .await?;
+            total += n;
+        }
+        Ok(total)
+    }
+
+    /// Objects no row refers to any more. Row deletes deliberately do not touch
+    /// the object store — a content-addressed object can be shared by any number
+    /// of rows, so the only safe place to decide is here, where every reference
+    /// can be checked at once.
+    pub async fn unreferenced_objects(&self) -> Result<Vec<String>> {
+        let mut referenced: HashSet<String> = HashSet::new();
+        for table in ["file_blob", "chat_image"] {
+            let keys: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT DISTINCT storage_key FROM {table} WHERE storage_key IS NOT NULL"
+            ))
+            .fetch_all(&self.pool)
+            .await?;
+            referenced.extend(keys.into_iter().map(|(key,)| key));
+        }
+        let mut orphaned = Vec::new();
+        for key in self.blobs.object_keys() {
+            if !referenced.contains(&key) {
+                orphaned.push(key);
+            }
+        }
+        Ok(orphaned)
     }
 
     /// Bytes in pages SQLite may reuse but the OS cannot reclaim until VACUUM.
@@ -2100,6 +2249,16 @@ impl Database {
             .rows_affected();
         tx.commit().await?;
 
+        // Objects are reclaimed only after the deletes above are committed: until
+        // this point a row may still name them, and a content-addressed object can
+        // be shared by any number of rows.
+        let mut released_objects = 0;
+        for key in self.unreferenced_objects().await? {
+            if self.blobs.delete(&key).is_ok() {
+                released_objects += 1;
+            }
+        }
+
         let free_bytes_before = self.free_bytes().await?;
         let vacuum_needed = force
             || free_bytes_before >= 16 * 1024 * 1024
@@ -2132,6 +2291,7 @@ impl Database {
             orphan_blobs,
             orphan_reactions,
             orphan_chat_images,
+            released_objects,
             pruned_audit,
         })
     }
@@ -2654,18 +2814,21 @@ impl Database {
         data: &[u8],
         now: i64,
     ) -> Result<i64> {
+        let (inline, key, size) = self.place(data);
         let row: (i64,) = sqlx::query_as(
             r#"INSERT INTO chat_image
-                 (org_id, mime, data, created_at, uploaded_by, group_id, dm_with)
-               VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id"#,
+                 (org_id, mime, data, created_at, uploaded_by, group_id, dm_with, storage_key, size)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id"#,
         )
         .bind(org_id)
         .bind(mime)
-        .bind(data)
+        .bind(inline)
         .bind(now)
         .bind(uploaded_by)
         .bind(scope.group_id)
         .bind(scope.dm_with)
+        .bind(key)
+        .bind(size)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0)
@@ -2673,13 +2836,26 @@ impl Database {
 
     /// Load a chat image with the conversation it may be read in.
     pub async fn get_chat_image(&self, id: i64) -> Result<Option<ChatImage>> {
-        Ok(sqlx::query_as(
-            r#"SELECT org_id, uploaded_by, group_id, dm_with, mime, data
+        use sqlx::Row;
+        let row = sqlx::query(
+            r#"SELECT org_id, uploaded_by, group_id, dm_with, mime, data, storage_key
                FROM chat_image WHERE id = $1"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
-        .await?)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let data = self
+            .blob_content(row.try_get("data")?, row.try_get("storage_key")?)
+            .await?;
+        Ok(Some(ChatImage {
+            org_id: row.try_get("org_id")?,
+            uploaded_by: row.try_get("uploaded_by")?,
+            group_id: row.try_get("group_id")?,
+            dm_with: row.try_get("dm_with")?,
+            mime: row.try_get("mime")?,
+            data,
+        }))
     }
 
     // ----- Full export / import (root owner, whole-instance migration) -----
@@ -2729,8 +2905,19 @@ impl Database {
                         obj.insert(name.into(), serde_json::to_value(v.map(|b| B64.encode(b)))?);
                     }
                 }
-                values.push(serde_json::Value::Object(obj));
-            }
+                // A whole-instance archive always carries its content inline, so
+                // it stays readable by an install on the inline backend and by a
+                // build that predates the object store entirely.
+                if *table == "file_blob" || *table == "chat_image" {
+                    if let Some(serde_json::Value::String(key)) = obj.remove("storage_key") {
+                        let bytes = self.blobs.get(&key).ok_or_else(|| {
+                            anyhow::anyhow!("cannot export {table}: stored object {key} is missing")
+                        })?;
+                        obj.insert("data".into(), serde_json::to_value(B64.encode(bytes))?);
+                        obj.insert("storage_key".into(), serde_json::Value::Null);
+                    }
+                }
+                values.push(serde_json::Value::Object(obj));            }
             out.insert((*table).to_string(), serde_json::Value::Array(values));
         }
         tx.rollback().await?;
@@ -2764,6 +2951,21 @@ impl Database {
                 .await?;
         }
         for (table, rows) in tables {
+            // An archive carries bytes inline; on an install using the object
+            // store, content rows are rehomed into objects as they come in so the
+            // database does not fill back up with what it just stopped holding.
+            let rehomed: Vec<serde_json::Value> = if !self.blobs.is_inline()
+                && (*table == "file_blob" || *table == "chat_image")
+            {
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    out.push(self.rehome_content(row)?);
+                }
+                out
+            } else {
+                Vec::new()
+            };
+            let rows = if rehomed.is_empty() { rows.as_slice() } else { rehomed.as_slice() };
             if rows.is_empty() {
                 continue;
             }
@@ -2809,9 +3011,13 @@ impl Database {
                     let is_blob_col = name == "data"
                         && (*table == "file_blob" || *table == "chat_image");
                     if is_blob_col {
+                        // NULL stays NULL: a row whose content is an object
+                        // carries no inline bytes, and binding empty bytes here
+                        // would store a zero-length blob that reads as a file.
                         let bytes = match &v {
-                            serde_json::Value::String(s) => B64.decode(s)?,
-                            _ => Vec::new(),
+                            serde_json::Value::String(s) => Some(B64.decode(s)?),
+                            serde_json::Value::Null => None,
+                            _ => Some(Vec::new()),
                         };
                         q = q.bind(bytes);
                     } else {
@@ -2849,13 +3055,210 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatImageScope, Database};
+    use super::{BlobStore, ChatImageScope, Database, B64};
+    use base64::Engine;
 
+    /// Every test runs against the object backend, so the storage path that
+    /// ships as opt-in is the one this suite covers.
     async fn test_database() -> (tempfile::NamedTempFile, Database) {
         let file = tempfile::NamedTempFile::new().unwrap();
         let uri = format!("sqlite://{}", file.path().to_str().unwrap());
-        let db = Database::new(&uri).await.unwrap();
+        let blobs = BlobStore::fs(format!("{}.blobs", file.path().display())).unwrap();
+        let db = Database::open_with(&uri, blobs).await.unwrap();
         (file, db)
+    }
+
+    /// The backend a default install uses: bytes stay in the row.
+    async fn test_database_inline() -> (tempfile::NamedTempFile, Database) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let uri = format!("sqlite://{}", file.path().to_str().unwrap());
+        let db = Database::open_with(&uri, BlobStore::inline()).await.unwrap();
+        (file, db)
+    }
+
+    /// A user, org, group and workspace to hang files off, because blob rows are
+    /// foreign-keyed to real ones.
+    async fn seed_workspace(db: &Database) -> (i64, i64) {
+        db.create_user_if_absent("owner", "Owner", "pw", "root", None)
+            .await
+            .unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let org = db.create_org("Org", "org", 1).await.unwrap();
+        let group = db
+            .create_group(org.id, "Team", owner.id, 1, "group")
+            .await
+            .unwrap();
+        let ws = db
+            .create_workspace(group.id, "Project", owner.id, 1)
+            .await
+            .unwrap();
+        (owner.id, ws.id)
+    }
+
+    async fn add_binary(db: &Database, ws_id: i64, path: &str, bytes: &[u8]) -> i64 {
+        let file = db
+            .create_file(ws_id, path, &format!("doc-{path}"), "binary", Some("image/png"), 1)
+            .await
+            .unwrap();
+        db.store_blob(file.id, bytes).await.unwrap();
+        file.id
+    }
+
+    #[tokio::test]
+    async fn binary_content_is_written_as_an_object_and_read_back() {
+        let (tmp, db) = test_database().await;
+        let (_, ws) = seed_workspace(&db).await;
+        let id = add_binary(&db, ws, "shot.png", b"pretend png bytes").await;
+
+        assert_eq!(
+            db.load_blob(id).await.unwrap().as_deref(),
+            Some(b"pretend png bytes".as_ref())
+        );
+        // The row points at content instead of holding it.
+        let (inline_data, key, size): (Vec<u8>, Option<String>, i64) =
+            sqlx::query_as("SELECT data, storage_key, size FROM file_blob WHERE file_id = $1")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(inline_data.is_empty(), "content must not also sit in the row");
+        assert!(key.is_some(), "the row must name its object");
+        assert_eq!(size, 17);
+        // The bytes are on disk, and are not inside the database file.
+        assert_eq!(db.blobs.object_keys().len(), 1);
+        let db_bytes = std::fs::read(tmp.path()).unwrap();
+        assert!(!db_bytes
+            .windows(b"pretend png bytes".len())
+            .any(|window| window == b"pretend png bytes"));
+    }
+
+    #[tokio::test]
+    async fn identical_content_shares_one_object_until_the_last_row_goes() {
+        let (_tmp, db) = test_database().await;
+        let (_, ws) = seed_workspace(&db).await;
+        let first = add_binary(&db, ws, "a.png", b"duplicate bytes").await;
+        let second = add_binary(&db, ws, "b.png", b"duplicate bytes").await;
+
+        assert_eq!(db.blobs.object_keys().len(), 1, "same content is one object");
+        assert_eq!(
+            db.load_blob(second).await.unwrap().as_deref(),
+            Some(b"duplicate bytes".as_ref())
+        );
+
+        // Deleting one referrer must not pull the object out from under the other
+        // — which is what makes copying a file a metadata-only operation.
+        db.delete_file(first).await.unwrap();
+        db.maintain(2_000_000_000, 180, false).await.unwrap();
+        assert_eq!(db.blobs.object_keys().len(), 1, "still referenced elsewhere");
+        assert_eq!(
+            db.load_blob(second).await.unwrap().as_deref(),
+            Some(b"duplicate bytes".as_ref())
+        );
+
+        db.delete_file(second).await.unwrap();
+        let report = db.maintain(2_000_000_000, 180, false).await.unwrap();
+        assert!(report.released_objects >= 1, "the last delete frees the object");
+        assert!(db.blobs.object_keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inline_backend_keeps_bytes_in_the_row() {
+        let (_tmp, db) = test_database_inline().await;
+        let (_, ws) = seed_workspace(&db).await;
+        let id = add_binary(&db, ws, "legacy.bin", b"kept inline").await;
+
+        let (inline_data, key): (Vec<u8>, Option<String>) =
+            sqlx::query_as("SELECT data, storage_key FROM file_blob WHERE file_id = $1")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(inline_data, b"kept inline");
+        assert!(key.is_none(), "the inline backend names no objects");
+        assert_eq!(db.load_blob(id).await.unwrap().as_deref(), Some(b"kept inline".as_ref()));
+        assert_eq!(db.blob_bytes().await.unwrap(), 11);
+        assert_eq!(db.object_bytes().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn export_carries_object_content_back_inline() {
+        let (_tmp, db) = test_database().await;
+        let (_, ws) = seed_workspace(&db).await;
+        add_binary(&db, ws, "shot.png", b"archive me please").await;
+
+        let snapshot = db.export_snapshot().await.unwrap();
+        let rows = snapshot["file_blob"].as_array().unwrap();
+        let row = rows[0].as_object().unwrap();
+        let encoded = row["data"].as_str().expect("export must materialize content");
+        assert_eq!(B64.decode(encoded).unwrap(), b"archive me please");
+        assert!(row["storage_key"].is_null(), "an archive names no objects");
+    }
+
+    #[tokio::test]
+    async fn chat_images_round_trip_through_the_object_store() {
+        let (_tmp, db) = test_database().await;
+        let (owner, _ws) = seed_workspace(&db).await;
+        let id = db
+            .create_chat_image(
+                1,
+                owner,
+                ChatImageScope { group_id: None, dm_with: None },
+                Some("image/png"),
+                b"pasted bytes",
+                1,
+            )
+            .await
+            .unwrap();
+
+        let image = db.get_chat_image(id).await.unwrap().expect("image reads back");
+        assert_eq!(image.data, b"pasted bytes");
+        assert_eq!(db.blobs.object_keys().len(), 1);
+        let (inline_data,): (Vec<u8>,) =
+            sqlx::query_as("SELECT data FROM chat_image WHERE id = $1")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(inline_data.is_empty(), "the paste must not sit in the row as well");
+    }
+
+    #[tokio::test]
+    async fn object_bytes_and_database_bytes_are_counted_apart() {
+        let (tmp, db) = test_database().await;
+        let (_, ws) = seed_workspace(&db).await;
+        add_binary(&db, ws, "a.bin", b"0123456789").await;
+        add_binary(&db, ws, "b.bin", b"01234").await;
+        assert_eq!(db.object_bytes().await.unwrap(), 15);
+        assert_eq!(db.blob_bytes().await.unwrap(), 15);
+        // Content lives outside the database file, so the size a backup reports
+        // is no longer the size the content weighs.
+        let on_disk = std::fs::read(tmp.path()).unwrap();
+        assert!(!on_disk.windows(10).any(|w| w == b"0123456789"));
+    }
+
+    #[tokio::test]
+    async fn a_restored_archive_lands_in_the_object_store() {
+        let (_tmp, source) = test_database_inline().await;
+        let (_, ws) = seed_workspace(&source).await;
+        add_binary(&source, ws, "portable.bin", b"bytes that travel").await;
+        let snapshot = source.export_snapshot().await.unwrap();
+        // Insert order is dependency order, so an archive is walked in
+        // `MIGRATE_TABLES` order rather than in whatever order the map yields.
+        let tables: Vec<(String, Vec<serde_json::Value>)> = Database::MIGRATE_TABLES
+            .iter()
+            .map(|name| ((*name).to_string(), snapshot[*name].as_array().unwrap().clone()))
+            .collect();
+
+        let (_tmp2, target) = test_database().await;
+        target.import_replace_all(&tables).await.unwrap();
+        let keys = target.blobs.object_keys();
+        assert_eq!(keys.len(), 1, "the import rehomed the content");
+        let files: Vec<(i64,)> =
+            sqlx::query_as("SELECT file_id FROM file_blob").fetch_all(&target.pool).await.unwrap();
+        assert_eq!(
+            target.load_blob(files[0].0).await.unwrap().as_deref(),
+            Some(b"bytes that travel".as_ref())
+        );
     }
 
     async fn assert_no_bad_foreign_keys(db: &Database) {
