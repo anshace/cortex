@@ -462,6 +462,10 @@ async fn delete_workspace_tx(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Resul
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    sqlx::query("DELETE FROM doc_org WHERE doc_id IN (SELECT doc_id FROM file WHERE workspace_id = $1)")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM file WHERE workspace_id = $1")
         .bind(id)
         .execute(&mut *tx)
@@ -504,6 +508,51 @@ async fn delete_group_tx(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<Ve
         .execute(&mut *tx)
         .await?;
     Ok(docs)
+}
+
+// The routing index (issue #24) is maintained inside these same transactions:
+// a document is never on record as belonging to an org while its file row
+// says otherwise, and never survives as a pointer to a deleted document.
+
+/// Point the routing index at the org that owns a document right now, derived
+/// from the workspace it currently sits in. Used when a file row is created
+/// and when a move changes the answer. If the workspace does not resolve to a
+/// group inside a live org the statement inserts nothing: an unroutable
+/// document is one no tenant database holds yet, not a mapping to guess.
+async fn route_doc_tx(tx: &mut Transaction<'_, Sqlite>, doc_id: &str, workspace_id: i64) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO doc_org (doc_id, org_id, created_at)
+           SELECT f.doc_id, g.org_id, f.created_at
+           FROM file f
+           JOIN workspace w ON w.id = f.workspace_id
+           JOIN groups g ON g.id = w.group_id
+           WHERE f.doc_id = $1 AND w.id = $2
+           ON CONFLICT(doc_id) DO UPDATE SET org_id = excluded.org_id"#,
+    )
+    .bind(doc_id)
+    .bind(workspace_id)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+/// Re-route every document under one workspace — the whole-subtree form of
+/// [`route_doc_tx`], for when a workspace is reparented and its files move
+/// with it without their rows changing.
+async fn route_workspace_tx(tx: &mut Transaction<'_, Sqlite>, workspace_id: i64) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO doc_org (doc_id, org_id, created_at)
+           SELECT f.doc_id, g.org_id, f.created_at
+           FROM file f
+           JOIN workspace w ON w.id = f.workspace_id
+           JOIN groups g ON g.id = w.group_id
+           WHERE w.id = $1
+           ON CONFLICT(doc_id) DO UPDATE SET org_id = excluded.org_id"#,
+    )
+    .bind(workspace_id)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
 }
 
 impl Database {
@@ -550,6 +599,7 @@ impl Database {
         };
         db.seal_existing_totp().await?;
         db.record_inline_sizes().await?;
+        db.backfill_doc_routing().await?;
         log::info!("blob storage backend: {}", db.blobs.mode());
         Ok(db)
     }
@@ -635,6 +685,29 @@ impl Database {
             );
         }
         Ok(())
+    }
+
+    /// At startup, once: route every document that predates the routing index.
+    /// A file whose workspace chain no longer resolves to a live org is left
+    /// unrouted rather than guessed at — it is unreachable data, not a tenant.
+    /// Rows already in the index are skipped, so running this against a healthy
+    /// database changes nothing and reports zero. Returns rows added.
+    async fn backfill_doc_routing(&self) -> Result<u64> {
+        let added = sqlx::query(
+            r#"INSERT INTO doc_org (doc_id, org_id, created_at)
+               SELECT f.doc_id, g.org_id, f.created_at
+               FROM file f
+               JOIN workspace w ON w.id = f.workspace_id
+               JOIN groups g ON g.id = w.group_id
+               WHERE f.doc_id NOT IN (SELECT doc_id FROM doc_org)"#,
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if added > 0 {
+            log::info!("routed {added} existing document(s) to their owning org");
+        }
+        Ok(added)
     }
 
     // ----- Documents (OT content) -----
@@ -1540,6 +1613,7 @@ impl Database {
                 .bind(id)
                 .execute(&mut tx)
                 .await?;
+            // MUTATION-10: route_doc_tx(&mut tx, doc_id, target).await?;
             occupied.insert(final_path);
             docs.push(doc_id.clone());
         }
@@ -1583,6 +1657,8 @@ impl Database {
             .bind(ws.id)
             .execute(&mut tx)
             .await?;
+        // The whole subtree changes owner with its parent group.
+        route_workspace_tx(&mut tx, ws.id).await?;
         tx.commit().await?;
         Ok(Workspace {
             id: ws.id,
@@ -1673,6 +1749,31 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.0))
+    }
+
+    /// Which org's database holds this document, answered straight from the
+    /// routing index — no joins, and valid even once the document's own tables
+    /// live in the tenant database rather than this one. None means the index
+    /// never learned this document: it is gone, or predates the table and the
+    /// next boot's [`Self::backfill_doc_routing`] will route it.
+    pub async fn org_of_doc(&self, doc_id: &str) -> Result<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT org_id FROM doc_org WHERE doc_id = $1")
+            .bind(doc_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Every document routed to one org. The control plane asks this when it
+    /// moves an org's whole estate into its own database — or verifies after
+    /// the move that nothing was left behind.
+    pub async fn docs_of_org(&self, org_id: i64) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT doc_id FROM doc_org WHERE org_id = $1 ORDER BY doc_id")
+                .bind(org_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// The group, org, visibility scope and creator of the group that owns
@@ -1796,6 +1897,7 @@ impl Database {
                 .execute(&mut tx)
                 .await?;
         }
+        route_doc_tx(&mut tx, doc_id, workspace_id).await?;
         tx.commit().await?;
         Ok(FileRow {
             id,
@@ -1862,6 +1964,7 @@ impl Database {
                     .execute(&mut tx)
                     .await?;
             }
+            route_doc_tx(&mut tx, &doc_id, workspace_id).await?;
             occupied.insert(path.clone());
             added.push(FileRow {
                 id,
@@ -2064,6 +2167,7 @@ impl Database {
                         .await?.rows_affected();
                     if rows != 1 { bail!("source blob content missing"); }
                 }
+                route_doc_tx(&mut tx, &doc_id, target_workspace).await?;
                 src.id = id;
                 src.doc_id = doc_id;
             } else {
@@ -2073,6 +2177,9 @@ impl Database {
                     .bind(src.id)
                     .execute(&mut tx)
                     .await?;
+                // A move across org boundaries re-routes; within one org it
+                // restates the answer. Either way the index cannot drift.
+                route_doc_tx(&mut tx, &src.doc_id, target_workspace).await?;
             }
             src.workspace_id = target_workspace;
             src.path = path;
@@ -2199,6 +2306,10 @@ impl Database {
                 .execute(&mut tx)
                 .await?;
             sqlx::query("DELETE FROM document WHERE id = $1")
+                .bind(&doc_id)
+                .execute(&mut tx)
+                .await?;
+            sqlx::query("DELETE FROM doc_org WHERE doc_id = $1")
                 .bind(&doc_id)
                 .execute(&mut tx)
                 .await?;
@@ -2377,6 +2488,12 @@ impl Database {
         .execute(&mut tx)
         .await?
         .rows_affected();
+        // A routing row for a document no file names any more is a pointer to
+        // nothing. Every delete path drops its rows in-transaction; this sweep
+        // is the belt-and-braces repair, the same kind boot-time backfill is.
+        sqlx::query("DELETE FROM doc_org WHERE doc_id NOT IN (SELECT doc_id FROM file)")
+            .execute(&mut tx)
+            .await?;
         let orphan_blobs = sqlx::query(
             "DELETE FROM file_blob WHERE NOT EXISTS (SELECT 1 FROM file WHERE file.id = file_blob.file_id)",
         )
@@ -3028,6 +3145,7 @@ impl Database {
         "workspace",
         "file",
         "document",
+        "doc_org",
         "file_blob",
         "message",
         "dm",
@@ -3206,13 +3324,17 @@ impl Database {
             bail!("export has {violations} broken foreign keys");
         }
         tx.commit().await?;
+        // An archive from a build that predates the routing index carries no
+        // doc_org rows; repair the mapping from the freshly imported files so
+        // the very first routed request after an import finds its tenant.
+        self.backfill_doc_routing().await?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BlobStore, ChatImageScope, Database, B64};
+    use super::{BlobStore, ChatImageScope, Database, Workspace, B64};
     use base64::Engine;
 
     /// Every test runs against the object backend, so the storage path that
@@ -3785,5 +3907,249 @@ mod tests {
                 .await
                 .expect("inspect migration history");
         assert_eq!(cleanup_applied, 1);
+    }
+
+    /// An org, a group and a workspace, handing back the two ids a routing
+    /// test has to name: the org that must own new documents, and the
+    /// workspace they are filed under.
+    async fn seed_routed_workspace(db: &Database) -> (i64, i64) {
+        db.create_user_if_absent("owner", "Owner", "pw", "root", None)
+            .await
+            .unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let org = db.create_org("Org", "org", 1).await.unwrap();
+        let group = db
+            .create_group(org.id, "Team", owner.id, 1, "group")
+            .await
+            .unwrap();
+        let ws = db
+            .create_workspace(group.id, "Project", owner.id, 1)
+            .await
+            .unwrap();
+        (org.id, ws.id)
+    }
+
+    /// One org with one group and one workspace, identified however a caller
+    /// needs them.
+    async fn seed_org(
+        db: &Database,
+        owner_id: i64,
+        name: &str,
+    ) -> (i64, i64, Workspace) {
+        let org = db.create_org(name, name, 1).await.unwrap();
+        let group = db
+            .create_group(org.id, name, owner_id, 1, "group")
+            .await
+            .unwrap();
+        let ws = db
+            .create_workspace(group.id, name, owner_id, 1)
+            .await
+            .unwrap();
+        (org.id, group.id, ws)
+    }
+
+    #[tokio::test]
+    async fn creating_a_file_routes_its_document_to_the_owning_org() {
+        let (_tmp, db) = test_database().await;
+        let (org, ws) = seed_routed_workspace(&db).await;
+        let note = db.create_file(ws, "note.txt", "route-note", "text", None, 1).await.unwrap();
+        assert_eq!(db.org_of_doc(&note.doc_id).await.unwrap(), Some(org));
+        // Uploads are documents too: a PDF has an owning tenant as much as a note.
+        let upload = db
+            .create_uploaded_file(ws, "deck.pdf", "route-deck", Some("application/pdf"), None, &[1, 2, 3], 1)
+            .await
+            .unwrap();
+        assert_eq!(db.org_of_doc(&upload.doc_id).await.unwrap(), Some(org));
+        assert_eq!(db.docs_of_org(org).await.unwrap(), vec!["route-deck".to_string(), "route-note".to_string()]);
+        assert_no_bad_foreign_keys(&db).await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_file_drops_its_routing_row() {
+        let (_tmp, db) = test_database().await;
+        let (org, ws) = seed_routed_workspace(&db).await;
+        let a = db.create_file(ws, "a.txt", "gone-a", "text", None, 1).await.unwrap();
+        let b = db.create_file(ws, "b.txt", "gone-b", "text", None, 1).await.unwrap();
+        db.delete_file(a.id).await.unwrap();
+        assert_eq!(db.org_of_doc("gone-a").await.unwrap(), None, "a dead document must not route anywhere");
+        assert_eq!(db.org_of_doc("gone-b").await.unwrap(), Some(org), "the survivor keeps its route");
+        db.delete_files(&[b.id]).await.unwrap();
+        assert!(db.docs_of_org(org).await.unwrap().is_empty());
+        assert_no_bad_foreign_keys(&db).await;
+    }
+
+    #[tokio::test]
+    async fn zip_import_and_file_copies_arrive_routed() {
+        use std::collections::HashMap;
+        let (_tmp, db) = test_database().await;
+        let (org, ws) = seed_routed_workspace(&db).await;
+        let entries = [
+            super::ImportedFile { path: "imported.txt".into(), mime: None, bytes: b"hello".to_vec(), is_text: true },
+            super::ImportedFile { path: "imported.bin".into(), mime: Some("image/png".into()), bytes: vec![0, 1, 2], is_text: false },
+        ];
+        let imported = db.import_files(ws, &entries, 1).await.unwrap();
+        assert_eq!(imported.len(), 2);
+        for file in &imported {
+            assert_eq!(db.org_of_doc(&file.doc_id).await.unwrap(), Some(org), "imported {file:?}");
+        }
+        // A copy is a new document and gets its own route, in the same tx.
+        let source = &imported[0];
+        let copied = db
+            .transfer_files(ws, &[(source.id, "copy.txt".into())], true, true, &HashMap::new(), 1)
+            .await
+            .unwrap();
+        assert_ne!(copied[0].doc_id, source.doc_id);
+        assert_eq!(db.org_of_doc(&copied[0].doc_id).await.unwrap(), Some(org));
+        assert_eq!(db.docs_of_org(org).await.unwrap().len(), 3);
+        assert_no_bad_foreign_keys(&db).await;
+    }
+
+    #[tokio::test]
+    async fn the_boot_backfill_routes_documents_that_predate_the_index() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let uri = format!("sqlite://{}", tmp.path().to_str().unwrap());
+        let db = Database::open_with(&uri, BlobStore::inline()).await.unwrap();
+        let (org, ws) = seed_routed_workspace(&db).await;
+        // Rows as an older build wrote them: a file, a document, no mapping.
+        sqlx::query("INSERT INTO file (workspace_id, path, doc_id, kind, created_at) VALUES ($1, 'legacy.txt', 'legacy-doc', 'text', 1)")
+            .bind(ws)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO document (id, text) VALUES ('legacy-doc', 'old but reachable')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(db.org_of_doc("legacy-doc").await.unwrap(), None, "the insert itself routes nothing");
+        assert_eq!(db.backfill_doc_routing().await.unwrap(), 1);
+        assert_eq!(db.org_of_doc("legacy-doc").await.unwrap(), Some(org));
+        assert_eq!(db.backfill_doc_routing().await.unwrap(), 0, "a second pass must repair nothing");
+        assert!(db.load("legacy-doc").await.is_ok(), "backfill must not disturb the document");
+        // Reopening the same database — a boot against an upgraded file — also
+        // finds and routes anything a previous pass missed.
+        drop(db);
+        let db = Database::open_with(&uri, BlobStore::inline()).await.unwrap();
+        assert_eq!(db.org_of_doc("legacy-doc").await.unwrap(), Some(org));
+        assert_no_bad_foreign_keys(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_document_in_an_orgless_workspace_is_not_routed() {
+        let (_tmp, db) = test_database().await;
+        let (_org, ws) = seed_routed_workspace(&db).await;
+        db.create_file(ws, "kept.txt", "kept-doc", "text", None, 1).await.unwrap();
+        // A workspace whose group link is NULL (the schema allows it; historic
+        // dev data has it) must not make the backfill invent an owner.
+        let (lost,): (i64,) = sqlx::query_as(
+            "INSERT INTO workspace (group_id, name, slug, created_by, created_at) VALUES (NULL, 'Lost', 'lost', 1, 1) RETURNING id",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO file (workspace_id, path, doc_id, kind, created_at) VALUES ($1, 'x.txt', 'orphan-chain', 'text', 1)")
+            .bind(lost)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(db.backfill_doc_routing().await.unwrap(), 0, "an unreachable chain routes nothing");
+        assert_eq!(db.org_of_doc("orphan-chain").await.unwrap(), None);
+        assert_eq!(db.org_of_doc("kept-doc").await.unwrap(), Some(_org));
+    }
+
+    #[tokio::test]
+    async fn two_orgs_documents_never_route_to_the_wrong_database() {
+        use std::collections::HashMap;
+        let (_tmp, db) = test_database().await;
+        db.create_user_if_absent("owner", "Owner", "pw", "root", None).await.unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let (org_a, group_a, ws_a) = seed_org(&db, owner.id, "Alpha").await;
+        let (org_b, group_b, ws_b) = seed_org(&db, owner.id, "Beta").await;
+        let a1 = db.create_file(ws_a.id, "one.txt", "a-one", "text", None, 1).await.unwrap();
+        db.create_file(ws_a.id, "two.txt", "a-two", "text", None, 1).await.unwrap();
+        db.create_file(ws_b.id, "only.txt", "b-only", "text", None, 1).await.unwrap();
+        assert_eq!(db.org_of_doc("a-one").await.unwrap(), Some(org_a));
+        assert_eq!(db.org_of_doc("b-only").await.unwrap(), Some(org_b));
+        assert_ne!(db.org_of_doc("a-one").await.unwrap(), db.org_of_doc("b-only").await.unwrap());
+        // docs_of_org answers with exactly that org's documents.
+        assert_eq!(db.docs_of_org(org_a).await.unwrap(), vec!["a-one".to_string(), "a-two".to_string()]);
+        assert_eq!(db.docs_of_org(org_b).await.unwrap(), vec!["b-only".to_string()]);
+
+        // A copy across the org boundary belongs to the destination, not the
+        // source — and the original never moves.
+        let copied = db
+            .transfer_files(ws_b.id, &[(a1.id, "stolen.txt".into())], true, true, &HashMap::new(), 1)
+            .await
+            .unwrap();
+        assert_eq!(db.org_of_doc(&copied[0].doc_id).await.unwrap(), Some(org_b));
+        assert_eq!(db.org_of_doc("a-one").await.unwrap(), Some(org_a));
+
+        // A real move re-routes the document itself.
+        db.transfer_files(ws_b.id, &[(a1.id, "moved.txt".into())], false, true, &HashMap::new(), 1)
+            .await
+            .unwrap();
+        assert_eq!(db.org_of_doc("a-one").await.unwrap(), Some(org_b));
+        assert_eq!(db.docs_of_org(org_a).await.unwrap(), vec!["a-two".to_string()]);
+
+        // Merging a workspace across the org boundary re-routes every moved
+        // document, even though its file and doc ids are preserved.
+        let ws_a2 = db.create_workspace(group_a, "Second", owner.id, 1).await.unwrap();
+        db.create_file(ws_a2.id, "merge.txt", "a-merge", "text", None, 1).await.unwrap();
+        db.merge_workspaces(ws_a2.id, ws_b.id).await.unwrap();
+        assert_eq!(db.org_of_doc("a-merge").await.unwrap(), Some(org_b));
+
+        // Reparenting a whole workspace re-routes all of its documents.
+        db.move_workspace_to_group(&ws_a, group_b).await.unwrap();
+        assert_eq!(db.org_of_doc("a-two").await.unwrap(), Some(org_b));
+        assert!(db.docs_of_org(org_a).await.unwrap().is_empty());
+        let mut expected = vec![
+            "a-one".to_string(),
+            "a-two".to_string(),
+            "a-merge".to_string(),
+            "b-only".to_string(),
+            copied[0].doc_id.clone(),
+        ];
+        expected.sort();
+        assert_eq!(db.docs_of_org(org_b).await.unwrap(), expected);
+        assert_no_bad_foreign_keys(&db).await;
+    }
+
+    #[tokio::test]
+    async fn deleting_an_org_or_workspace_takes_its_routing_rows_with_it() {
+        let (_tmp, db) = test_database().await;
+        db.create_user_if_absent("owner", "Owner", "pw", "root", None).await.unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let (org_a, _ga, ws_a) = seed_org(&db, owner.id, "Alpha").await;
+        let (org_b, gb, ws_b) = seed_org(&db, owner.id, "Beta").await;
+        db.create_file(ws_a.id, "doomed.txt", "ws-doc", "text", None, 1).await.unwrap();
+        db.create_file(ws_a.id, "also.txt", "org-doc", "text", None, 1).await.unwrap();
+        db.create_file(ws_b.id, "kept.txt", "other-doc", "text", None, 1).await.unwrap();
+
+        db.delete_workspace(ws_a.id).await.unwrap();
+        assert_eq!(db.org_of_doc("ws-doc").await.unwrap(), None);
+        assert_eq!(db.org_of_doc("org-doc").await.unwrap(), None, "no mapping may outlive its document");
+        // The workspace delete above took both rows, so the org list is empty.
+        assert!(db.docs_of_org(org_a).await.unwrap().is_empty());
+
+        let ws_b2 = db.create_workspace(gb, "More", owner.id, 1).await.unwrap();
+        db.create_file(ws_b2.id, "deep.txt", "deep-doc", "text", None, 1).await.unwrap();
+        db.delete_org(org_b).await.unwrap();
+        assert!(db.org_of_doc("other-doc").await.unwrap().is_none());
+        assert!(db.org_of_doc("deep-doc").await.unwrap().is_none());
+        assert!(db.docs_of_org(org_b).await.unwrap().is_empty());
+        assert_no_bad_foreign_keys(&db).await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_sweeps_routing_rows_that_point_at_nothing() {
+        let (_tmp, db) = test_database().await;
+        let (org, ws) = seed_routed_workspace(&db).await;
+        let file = db.create_file(ws, "real.txt", "real-doc", "text", None, 1).await.unwrap();
+        // A stale row as a crashed-transaction or hand-edited database would
+        // leave behind: the file is gone but the index still claims to know it.
+        sqlx::query("DELETE FROM file WHERE id = $1").bind(file.id).execute(&db.pool).await.unwrap();
+        assert_eq!(db.org_of_doc("real-doc").await.unwrap(), Some(org), "the sweep, not the delete, is tested here");
+        db.maintain(2_000_000_000, 180, false).await.unwrap();
+        assert_eq!(db.org_of_doc("real-doc").await.unwrap(), None);
+        assert_no_bad_foreign_keys(&db).await;
     }
 }
