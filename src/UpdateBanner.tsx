@@ -9,6 +9,12 @@ import { useRegisterSW } from "virtual:pwa-register/react";
 // NOT applied until the user reloads — so without this banner a returning user
 // would keep running a stale bundle forever, which is worse than the silent
 // auto-update it replaced.
+//
+// This component is also the only thing that registers the service worker: in
+// prompt mode the plugin emits no registration script into index.html (checked —
+// dist/index.html has none, and the Workbox client is in the bundle because
+// `useRegisterSW` pulls it in). Deleting this file would not just lose a banner;
+// the app would silently stop installing updates and going offline at all.
 function UpdateBanner() {
   const {
     needRefresh: [needRefresh, setNeedRefresh],
