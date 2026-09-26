@@ -588,6 +588,9 @@ export type StorageStats = {
       behind: boolean;
       size_bytes: number;
       documents: number;
+      /** Why this tenant's database could not be inspected, if it could not.
+       *  One damaged file is reported per row rather than failing the page. */
+      error: string | null;
     }[];
   };
   /** Whether this instance checks plans at all, and one row per org. */

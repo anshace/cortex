@@ -83,6 +83,10 @@ pub struct OrgDbStatus {
     pub size_bytes: i64,
     /// Documents the routing index credits to this organization.
     pub documents: i64,
+    /// Why this tenant's database could not be inspected, if it could not. One
+    /// unreadable file must not take down the page that exists to tell the
+    /// operator about it, and must not be reported as an empty organization.
+    pub error: Option<String>,
 }
 
 /// The console's whole databases block.
@@ -336,13 +340,26 @@ impl Databases {
             let provisioned = self.is_provisioned(org_id).await;
             // Absent is reported, not created. An operator who wants it created
             // provisions the organization; a page load does not decide that.
+            let mut error = None;
             let db = match (self.is_split(), provisioned) {
                 (false, _) => Some(self.inner.control.clone()),
-                (true, true) => Some(self.org(org_id).await?),
+                (true, true) => match self.org(org_id).await {
+                    Ok(db) => Some(db),
+                    Err(e) => {
+                        error = Some(format!("could not open: {e}"));
+                        None
+                    }
+                },
                 (true, false) => None,
             };
             let version = match &db {
-                Some(db) => schema_version(db).await?,
+                Some(db) => match schema_version(db).await {
+                    Ok(version) => version,
+                    Err(e) => {
+                        error = Some(format!("could not read: {e}"));
+                        0
+                    }
+                },
                 None => 0,
             };
             out.push(OrgDbStatus {
@@ -355,7 +372,10 @@ impl Databases {
                     Some(db) => db.file_size().await.unwrap_or(0),
                     None => 0,
                 },
+                // The routing index is control-plane data, so an unreadable
+                // tenant file still knows how many documents it owns.
                 documents: self.inner.control.count_documents_of(org_id).await.unwrap_or(0),
+                error,
             });
         }
         Ok(Report {
@@ -767,5 +787,30 @@ mod tests {
         registry.org(6).await.unwrap();
         registry.close_idle(Duration::ZERO, |_| true).await;
         assert_eq!(registry.cached().await, vec![6], "an open document pins its pool");
+    }
+
+    /// One damaged tenant file must not take down the page whose job is to
+    /// report on it, and must not be mistaken for an organization with nothing
+    /// in it.
+    #[tokio::test]
+    async fn one_unreadable_tenant_does_not_take_down_the_storage_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_t, control) = control().await;
+        add_org(&control, 8).await;
+        add_org(&control, 9).await;
+        let registry = split(control, Mode::Files(tmp.path().to_path_buf()));
+        registry.provision(9).await.unwrap();
+        std::fs::write(tmp.path().join("org-8.db"), b"not a database at all").unwrap();
+
+        let report = registry
+            .report()
+            .await
+            .expect("an unreadable tenant must not fail the whole report");
+        let eight = report.orgs.iter().find(|o| o.org_id == 8).unwrap();
+        assert!(eight.error.is_some(), "the damaged tenant says what went wrong");
+        assert_eq!(eight.schema_version, 0);
+        let nine = report.orgs.iter().find(|o| o.org_id == 9).unwrap();
+        assert!(nine.error.is_none(), "the healthy tenant is unaffected");
+        assert_eq!(nine.schema_version, expected_version());
     }
 }
