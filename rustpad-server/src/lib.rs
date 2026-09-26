@@ -554,7 +554,9 @@ async fn scheduled_maintenance(
         }
         if let Some(registry) = &databases {
             let busy = busy_orgs(&db, &documents, &boards).await;
-            registry.close_idle(|org| busy.contains(&org)).await;
+            registry
+                .close_idle(crate::databases::IDLE_TTL, |org| busy.contains(&org))
+                .await;
         }
         time::sleep(HOUR * 24).await;
     }

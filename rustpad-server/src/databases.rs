@@ -29,7 +29,7 @@ use crate::database::Database;
 /// How long an organization's pool may sit unused before maintenance closes it.
 /// Each open pool is a file handle plus a WAL pair, and a hundred dormant orgs
 /// should not cost a hundred of each.
-const IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+pub const IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// One database per organization, opened on demand and cached while in use.
 #[derive(Clone, Debug)]
@@ -246,9 +246,19 @@ impl Databases {
 
     /// Close pools nobody has used for [`IDLE_TTL`]. `busy` reports whether an
     /// org still has a live document or board, and those are never evicted.
-    pub async fn close_idle(&self, busy: impl Fn(i64) -> bool) {
+    /// Close pools idle for longer than `idle_longer_than`. `busy` reports whether
+    /// an org still has a live document or board, and those are never evicted.
+    ///
+    /// Only file-backed databases are ever closed. An in-memory tenant database
+    /// dies with the last handle to it, so evicting one would destroy that
+    /// organization's content to reclaim nothing at all — and in single mode
+    /// there is no separate pool to reclaim either.
+    pub async fn close_idle(&self, idle_longer_than: Duration, busy: impl Fn(i64) -> bool) {
+        if !matches!(self.inner.mode, Mode::Files(_)) {
+            return;
+        }
         let mut open = self.inner.open.lock().await;
-        let cutoff = Instant::now() - IDLE_TTL;
+        let cutoff = Instant::now() - idle_longer_than;
         let stale: Vec<i64> = open
             .iter()
             .filter(|(org, cached)| cached.used < cutoff && !busy(**org))
@@ -258,6 +268,15 @@ impl Databases {
             open.remove(&org);
             log::info!("closed idle database for org {org}");
         }
+    }
+
+    /// Which organizations hold an open pool right now. Test-only: eviction is
+    /// otherwise invisible in file mode, where the file outlives the handle.
+    #[cfg(test)]
+    async fn cached(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self.inner.open.lock().await.keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Every organization the control plane knows about, in a stable order.
@@ -701,5 +720,52 @@ mod tests {
         assert!(after.orgs[0].provisioned, "provisioning is what creates it");
         assert_eq!(after.orgs[0].schema_version, expected_version());
         assert!(!after.orgs[0].behind);
+    }
+
+    /// Idle-close exists to release file handles. An in-memory tenant database
+    /// has none, and dropping its last handle destroys the organization's
+    /// content, so the sweep must never touch memory mode.
+    #[tokio::test]
+    async fn idle_sweeping_never_evicts_an_in_memory_tenant_database() {
+        let (_t, control) = control().await;
+        add_org(&control, 5).await;
+        let registry = split(control, Mode::Memory);
+        let org = registry.org(5).await.unwrap();
+        sqlx::query("INSERT INTO document (id, text) VALUES ('mem-doc', 'only here')")
+            .execute(org.write())
+            .await
+            .unwrap();
+
+        registry.close_idle(Duration::ZERO, |_| false).await;
+
+        assert_eq!(registry.cached().await, vec![5], "the pool must stay open");
+        let back: Option<(String,)> =
+            sqlx::query_as("SELECT text FROM document WHERE id = 'mem-doc'")
+                .fetch_optional(registry.org(5).await.unwrap().read_only())
+                .await
+                .unwrap();
+        assert_eq!(
+            back.map(|(text,)| text).as_deref(),
+            Some("only here"),
+            "and its content has to survive the sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_sweeping_closes_a_file_pool_and_keeps_its_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_t, control) = control().await;
+        add_org(&control, 6).await;
+        let registry = split(control, Mode::Files(tmp.path().to_path_buf()));
+        registry.provision(6).await.unwrap();
+        assert_eq!(registry.cached().await, vec![6]);
+
+        registry.close_idle(Duration::ZERO, |_| false).await;
+        assert!(registry.cached().await.is_empty(), "an idle pool is what gets closed");
+        assert!(registry.is_provisioned(6).await, "the file survives its pool");
+
+        registry.org(6).await.unwrap();
+        registry.close_idle(Duration::ZERO, |_| true).await;
+        assert_eq!(registry.cached().await, vec![6], "an open document pins its pool");
     }
 }
