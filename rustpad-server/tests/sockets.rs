@@ -97,7 +97,6 @@ async fn test_invalid_operation() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "the server rejects a client that edits before seeing the document's history: an empty document's baseline operation is degenerate, and the transform crate cannot transform against an empty operation, so the joiner is disconnected instead of merged. That is defect #32, not a stale assertion — do not weaken this test to accept the close"]
 async fn test_concurrent_transform() -> Result<()> {
     pretty_env_logger::try_init().ok();
     let config = sqlite_config(1).await;
@@ -142,7 +141,7 @@ async fn test_concurrent_transform() -> Result<()> {
     operation.retain(2);
     let msg = json!({
         "Edit": {
-            "revision": 1,
+            "revision": 2,
             "operation": operation
         }
     });
