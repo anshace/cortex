@@ -1613,7 +1613,7 @@ impl Database {
                 .bind(id)
                 .execute(&mut tx)
                 .await?;
-            // MUTATION-10: route_doc_tx(&mut tx, doc_id, target).await?;
+            route_doc_tx(&mut tx, doc_id, target).await?;
             occupied.insert(final_path);
             docs.push(doc_id.clone());
         }
