@@ -445,6 +445,9 @@ pub struct Database {
     /// Where binary content lives: inline in the row, or as an object the row
     /// names. Chosen once at boot and never re-decided per query.
     blobs: BlobStore,
+    /// One lock per organization, held from the moment its stored bytes are
+    /// counted until the write that count authorized has landed.
+    quota_locks: Arc<dashmap::DashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 // These helpers share the caller's transaction. File content, chats, reactions
@@ -555,6 +558,23 @@ async fn route_workspace_tx(tx: &mut Transaction<'_, Sqlite>, workspace_id: i64)
     Ok(())
 }
 
+/// The answer to "may this organization store `n` more bytes?".
+pub enum Quota {
+    /// The plan puts no ceiling on storage.
+    Unlimited,
+    /// There is room, and the organization's accounting stays locked until the
+    /// carrier is dropped — which means the caller must keep it alive until the
+    /// content row is written, not just until it has been measured.
+    Admitted(QuotaHold),
+    /// The bytes would take the organization past its plan.
+    Over,
+}
+
+/// The lock portion of an admitted reservation. See [`Quota`].
+pub struct QuotaHold {
+    _hold: tokio::sync::OwnedMutexGuard<()>,
+}
+
 impl Database {
     /// Construct a new database, creating the file and running migrations.
     pub async fn new(uri: &str) -> Result<Self> {
@@ -596,6 +616,7 @@ impl Database {
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
             blobs,
             auth: Arc::default(),
+            quota_locks: Arc::default(),
         };
         db.seal_existing_totp().await?;
         db.record_inline_sizes().await?;
@@ -2372,6 +2393,38 @@ impl Database {
     }
 
     /// Every content byte an organization owns: binary blobs, chat attachments
+    /// The lock that serializes one organization's storage accounting. Distinct
+    /// organizations never wait on each other.
+    fn quota_gate(&self, org_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+        if let Some(existing) = self.quota_locks.get(&org_id) {
+            return existing.clone();
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        // A racing insert is harmless: either lock serializes the same way, and
+        // the loser's gate is dropped unused.
+        self.quota_locks.insert(org_id, gate.clone());
+        gate
+    }
+
+    /// Measure what an organization holds and decide whether `add` more bytes
+    /// fit under `limit`, as one indivisible step.
+    ///
+    /// Checking a ceiling by measuring and *then* writing is a race that costs
+    /// the plan its meaning: two uploads measure the same total, both see room,
+    /// and the organization ends up storing more than it pays for. Taking the
+    /// per-organization lock here and handing its guard back means the next
+    /// upload cannot even measure until this one's row is on disk.
+    pub async fn reserve_content_bytes(&self, org_id: i64, add: i64, limit: i64) -> Result<Quota> {
+        if limit == i64::MAX {
+            return Ok(Quota::Unlimited);
+        }
+        let hold = Arc::clone(&self.quota_gate(org_id)).lock_owned().await;
+        if self.org_content_bytes(org_id).await? + add > limit {
+            return Ok(Quota::Over);
+        }
+        Ok(Quota::Admitted(QuotaHold { _hold: hold }))
+    }
+
     /// and document text. Text is counted because a ceiling that only measures
     /// uploads is trivially escaped by typing. Reads `size`, so content that has
     /// moved to the object store is still counted.
@@ -4165,5 +4218,63 @@ mod tests {
         db.maintain(2_000_000_000, 180, false).await.unwrap();
         assert_eq!(db.org_of_doc("real-doc").await.unwrap(), None);
         assert_no_bad_foreign_keys(&db).await;
+    }
+
+    /// The storage ceiling is only real if two uploads written at the same moment
+    /// cannot both be told there is room. Each measures, compares, then writes;
+    /// without serialization both measure the same total and both pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_uploads_cannot_both_pass_a_storage_ceiling() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use crate::database::Quota;
+        let (_tmp, db) = test_database().await;
+        let (org, ws) = seed_routed_workspace(&db).await;
+        add_binary(&db, ws, "seeded.bin", vec![b'a'; 1024].as_slice()).await;
+        // Room for exactly one more 1 KiB upload, and nothing after it.
+        let limit = db.org_content_bytes(org).await.unwrap() + 1024;
+
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut racing = Vec::new();
+        for _ in 0..2 {
+            let db = db.clone();
+            let (admitted, refused, counter) =
+                (admitted.clone(), refused.clone(), counter.clone());
+            racing.push(tokio::spawn(async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                match db.reserve_content_bytes(org, 1024, limit).await.unwrap() {
+                    Quota::Admitted(held) => {
+                        // The write happens with the lock held, exactly as the
+                        // upload handler does: the next upload cannot measure
+                        // until this content is on disk.
+                        add_binary(
+                            &db,
+                            ws,
+                            &format!("race-{n}.bin"),
+                            vec![b'b'; 1024].as_slice(),
+                        )
+                        .await;
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                        drop(held);
+                    }
+                    Quota::Over => {
+                        refused.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Quota::Unlimited => panic!("a ceiling was given"),
+                }
+            }));
+        }
+        for task in racing {
+            task.await.unwrap();
+        }
+        assert_eq!(admitted.load(Ordering::SeqCst), 1, "one upload fits");
+        assert_eq!(refused.load(Ordering::SeqCst), 1, "the other does not");
+        assert!(
+            db.org_content_bytes(org).await.unwrap() <= limit,
+            "stored bytes never pass the plan's ceiling"
+        );
     }
 }

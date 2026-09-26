@@ -1584,9 +1584,11 @@ async fn upload_file(
     // route, never edited as text. ponytail: 1 MB text cap keeps huge files out
     // of the in-memory OT model; raise it if real docs get truncated to binary.
     let is_board = filename.to_lowercase().ends_with(".board");
-    // Plan limits are checked where content is added. Only blob content is
-    // metered — document text lives in the OT tables and is not counted — so a
-    // plan bounds uploaded files and chat attachments.
+    // Plan limits are checked where content is added, and the bytes that count
+    // toward them include document text — a ceiling on uploads alone is escaped
+    // by typing. The reservation's guard is bound out here because it has to
+    // stay held until the content below is actually written.
+    let mut _quota_hold = None;
     if let Some(org) = user.org_id {
         let plan = crate::licence::plan_for(org, now_secs());
         if is_board && !plan.allows("whiteboard", now_secs()) {
@@ -1595,14 +1597,24 @@ async fn upload_file(
                 "whiteboards are not part of this organization's plan",
             ));
         }
-        if plan.storage_bytes() < i64::MAX
-            && db.org_content_bytes(org).await.unwrap_or(0) + bytes.len() as i64
-                > plan.storage_bytes()
+        match db
+            .reserve_content_bytes(org, bytes.len() as i64, plan.storage_bytes())
+            .await
         {
-            return Ok(err(
-                StatusCode::INSUFFICIENT_STORAGE,
-                "this organization has used the storage in its plan",
-            ));
+            Ok(crate::database::Quota::Admitted(hold)) => _quota_hold = Some(hold),
+            Ok(crate::database::Quota::Over) => {
+                return Ok(err(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "this organization has used the storage in its plan",
+                ))
+            }
+            Ok(crate::database::Quota::Unlimited) => {}
+            Err(_) => {
+                return Ok(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not check this organization's storage use",
+                ))
+            }
         }
     }
     let text = if !is_board && bytes.len() <= 1_000_000 {
@@ -1676,17 +1688,29 @@ async fn put_file_blob(
         None => return Ok(err(StatusCode::BAD_REQUEST, "missing file revision")),
     };
     // A rewrite is metered on its growth, so replacing a file with a smaller one
-    // never needs headroom the org no longer requires.
+    // never needs headroom the org no longer requires. The guard is held until
+    // the new revision is stored, which is what stops two simultaneous rewrites
+    // of one file both fitting under the ceiling.
+    let mut _quota_hold = None;
     if let Some(org) = user.org_id {
         let plan = crate::licence::plan_for(org, now_secs());
-        if plan.storage_bytes() < i64::MAX {
-            let used = db.org_content_bytes(org).await.unwrap_or(0);
-            let after = used - file.size + raw.len() as i64;
-            if after > plan.storage_bytes() {
+        match db
+            .reserve_content_bytes(org, raw.len() as i64 - file.size, plan.storage_bytes())
+            .await
+        {
+            Ok(crate::database::Quota::Admitted(hold)) => _quota_hold = Some(hold),
+            Ok(crate::database::Quota::Over) => {
                 return Ok(err(
                     StatusCode::INSUFFICIENT_STORAGE,
                     "this organization has used the storage in its plan",
-                ));
+                ))
+            }
+            Ok(crate::database::Quota::Unlimited) => {}
+            Err(_) => {
+                return Ok(err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not check this organization's storage use",
+                ))
             }
         }
     }
