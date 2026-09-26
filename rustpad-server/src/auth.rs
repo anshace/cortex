@@ -286,7 +286,25 @@ async fn login_handler(
 
     // Email is case-insensitive and trimmed (stored lowercase).
     let email = body.email.trim().to_lowercase();
-    let user = db.get_user_by_email(&email).await.ok().flatten();
+    // A failed lookup is not an unknown account. There is one pooled connection,
+    // so a timeout here means housekeeping is holding it (see the maintenance
+    // loop); reporting that as a bad password would tell someone with the right
+    // credentials that they are wrong, and — worse — charge the attempt against
+    // the IP's failure count, so a long enough VACUUM can lock a whole shared
+    // address out behind the brute-force guard even after the database recovers.
+    let user = match db.get_user_by_email(&email).await {
+        Ok(user) => user,
+        Err(err) => {
+            warn!("login: could not read the account for {email}: {err}");
+            let reply = warp::reply::json(&json!({
+                "error": "database busy",
+                "detail": "the account could not be read right now; try again shortly",
+            }));
+            return Ok(
+                warp::reply::with_status(reply, StatusCode::SERVICE_UNAVAILABLE).into_response(),
+            );
+        }
+    };
     let authed = match &user {
         Some(u) => verify_password(&body.password, &u.password_hash),
         // Spend a real bcrypt on unknown emails so timing doesn't leak which
