@@ -86,6 +86,14 @@ workload. WASM needs `wasm-pack` + `wasm32-unknown-unknown` target.
   After any DB edit from a root container, chown back to `1000:1000`.
 - RESTORE ORDER: seed the DB first, THEN start the app.
 - Keep the box clock synced (`timedatectl set-ntp true`) or TOTP breaks (±30s).
+- **`Database` is a cheap handle, so a registry slot on it must be shared.**
+  Its fields are `Arc`s over one pool, but a plain `OnceCell<Databases>` field
+  would be *per handle*: `Databases::new` clones the control `Database` before
+  the registry exists, so the clone stored inside `Databases` and the clones
+  handed to handlers would disagree about whether routing is on, and which
+  document lives where would depend on which clone a given call site happens to
+  hold. Use `Arc<OnceCell<Databases>>` (set once, after both exist) and pass the
+  same shared slot to every `open_org`, or don't route inside `Database` at all.
 - Don't put tests that rewrite files in the committed tree.
 
 ### Per-organization storage (measured, so it doesn't get re-derived)
