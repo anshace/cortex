@@ -1194,9 +1194,17 @@ function OwnerApp({
                         storage.databases.orgs.map((o) => (
                           <KV
                             key={o.org_id}
-                            label={`org ${o.org_id}${o.behind ? " · behind" : ""}`}
-                            value={`${o.schema_version} · ${o.documents} docs · ${humanBytes(o.size_bytes)}`}
-                            hue={o.behind ? "state.warn" : "brand.400"}
+                            label={`org ${o.org_id}${
+                              o.provisioned ? (o.behind ? " · behind" : "") : " · not provisioned"
+                            }`}
+                            value={
+                              o.provisioned
+                                ? `${o.schema_version} · ${o.documents} docs · ${humanBytes(o.size_bytes)}`
+                                : `${o.documents} docs · opens when the organization is provisioned`
+                            }
+                            hue={
+                              !o.provisioned || o.behind ? "state.warn" : "brand.400"
+                            }
                           />
                         ))
                       )}

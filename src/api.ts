@@ -580,6 +580,9 @@ export type StorageStats = {
     orgs: {
       org_id: number;
       uri: string;
+      /** False when the tenant database does not exist yet — the console
+       *  reports that rather than creating it on a page load. */
+      provisioned: boolean;
       schema_version: number;
       /** True when this org's database is behind the running binary. */
       behind: boolean;

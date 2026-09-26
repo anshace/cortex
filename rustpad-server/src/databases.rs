@@ -70,6 +70,11 @@ pub struct OrgDbStatus {
     /// Where it is: a file path, or the name of a shared in-memory database.
     /// Empty in single mode, where there is nothing beyond the control file.
     pub uri: String,
+    /// False when the organization's database does not exist yet. Reporting is
+    /// a GET: it must not provision, both because a page load that writes to
+    /// disk surprises the operator and because on a read-only root filesystem it
+    /// would fail the whole page.
+    pub provisioned: bool,
     /// The highest migration this database has applied.
     pub schema_version: i64,
     /// True when this database is on an older schema than the running binary.
@@ -292,24 +297,45 @@ impl Databases {
         Ok(moved)
     }
 
+    /// Whether this organization's content database already exists. Reading the
+    /// console asks this instead of calling [`Self::org`], because opening is
+    /// creating: `report()` is a GET and must have no side effects on disk.
+    pub async fn is_provisioned(&self, org_id: i64) -> bool {
+        match &self.inner.mode {
+            Mode::Single => true,
+            Mode::Files(dir) => dir.join(format!("org-{org_id}.db")).exists(),
+            Mode::Memory => self.inner.open.lock().await.contains_key(&org_id),
+        }
+    }
+
     /// Every organization the control plane knows about, with what an operator
     /// needs in order to notice a database that an update left behind.
     pub async fn report(&self) -> Result<Report> {
         let expected = expected_version();
         let mut out = Vec::new();
         for org_id in self.org_ids().await? {
-            let (db, uri) = if self.is_split() {
-                (self.org(org_id).await?, self.uri_for(org_id))
-            } else {
-                (self.inner.control.clone(), String::new())
+            let provisioned = self.is_provisioned(org_id).await;
+            // Absent is reported, not created. An operator who wants it created
+            // provisions the organization; a page load does not decide that.
+            let db = match (self.is_split(), provisioned) {
+                (false, _) => Some(self.inner.control.clone()),
+                (true, true) => Some(self.org(org_id).await?),
+                (true, false) => None,
             };
-            let version = schema_version(&db).await?;
+            let version = match &db {
+                Some(db) => schema_version(db).await?,
+                None => 0,
+            };
             out.push(OrgDbStatus {
                 org_id,
-                uri,
+                uri: self.uri_for(org_id),
+                provisioned,
                 schema_version: version,
                 behind: version != expected,
-                size_bytes: db.file_size().await.unwrap_or(0),
+                size_bytes: match &db {
+                    Some(db) => db.file_size().await.unwrap_or(0),
+                    None => 0,
+                },
                 documents: self.inner.control.count_documents_of(org_id).await.unwrap_or(0),
             });
         }
@@ -646,5 +672,34 @@ mod tests {
         let again = registry.org(3).await.unwrap();
         assert!(base.exists(), "discarding does not stop a new tenant being provisioned");
         assert_eq!(schema_version(&again).await.unwrap(), expected_version());
+    }
+
+    /// The storage page is a GET. It used to call `org()`, which opens — and
+    /// therefore creates and migrates — a database for every organization it
+    /// listed, so viewing the page wrote to disk, and on a read-only root
+    /// filesystem the page could not load at all.
+    #[tokio::test]
+    async fn the_console_reports_a_missing_tenant_database_without_creating_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_t, control) = control().await;
+        add_org(&control, 4).await;
+        let registry = split(control, Mode::Files(tmp.path().to_path_buf()));
+
+        let report = registry.report().await.unwrap();
+        assert_eq!(report.orgs.len(), 1);
+        assert!(!report.orgs[0].provisioned, "reporting only reports");
+        assert_eq!(report.orgs[0].schema_version, 0);
+        assert!(report.orgs[0].behind, "a database that is not there is not current");
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).unwrap().count(),
+            0,
+            "a page load created files on disk"
+        );
+
+        registry.provision(4).await.unwrap();
+        let after = registry.report().await.unwrap();
+        assert!(after.orgs[0].provisioned, "provisioning is what creates it");
+        assert_eq!(after.orgs[0].schema_version, expected_version());
+        assert!(!after.orgs[0].behind);
     }
 }
