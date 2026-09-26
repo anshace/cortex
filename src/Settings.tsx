@@ -24,8 +24,26 @@ import {
   useToast,
 } from "@chakra-ui/react";
 import QRCode from "qrcode";
-import { FormEvent, ReactNode, useCallback, useEffect, useState } from "react";
-import { FiCommand, FiSliders } from "react-icons/fi";
+import {
+  FormEvent,
+  ReactNode,
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useState,
+} from "react";
+import {
+  FiAlignLeft,
+  FiAperture,
+  FiArrowUp,
+  FiBarChart2,
+  FiCommand,
+  FiEye,
+  FiHash,
+  FiSliders,
+  FiType,
+} from "react-icons/fi";
 import {
   VscAccount,
   VscBell,
@@ -64,20 +82,96 @@ const NAV: {
   id: Section;
   label: string;
   icon: typeof VscAccount;
+  /** Section identity: the nav marker, the panel rule and the row glyphs. */
+  hue: string;
+  blurb: string;
   adminOnly?: boolean;
   ownerOnly?: boolean;
   orgAdminOnly?: boolean;
 }[] = [
-  { id: "profile", label: "Profile", icon: VscAccount },
-  { id: "appearance", label: "Appearance", icon: VscColorMode },
-  { id: "editor", label: "Editor", icon: FiSliders },
-  { id: "keyboard", label: "Keyboard", icon: FiCommand },
-  { id: "security", label: "Security", icon: VscShield },
-  { id: "notifications", label: "Notifications", icon: VscBell },
-  { id: "activity", label: "Activity", icon: VscHistory, adminOnly: true },
-  { id: "members", label: "Org members", icon: VscOrganization, orgAdminOnly: true },
-  { id: "storage", label: "Storage", icon: VscDatabase, ownerOnly: true },
+  {
+    id: "profile",
+    label: "Profile",
+    icon: VscAccount,
+    hue: "accent.base",
+    blurb: "How you appear to your team, and how you sign in.",
+  },
+  {
+    id: "appearance",
+    label: "Appearance",
+    icon: VscColorMode,
+    hue: "accent.cyan",
+    blurb: "Light or dark, and the colours the editor wears.",
+  },
+  {
+    id: "editor",
+    label: "Editor",
+    icon: FiSliders,
+    hue: "state.warn",
+    blurb: "Fonts, wrapping and behaviour while you type.",
+  },
+  {
+    id: "keyboard",
+    label: "Keyboard",
+    icon: FiCommand,
+    hue: "state.info",
+    blurb: "Shortcuts the workbench answers to.",
+  },
+  {
+    id: "security",
+    label: "Security",
+    icon: VscShield,
+    hue: "state.ok",
+    blurb: "Password, two-factor, and which sessions stay alive.",
+  },
+  {
+    id: "notifications",
+    label: "Notifications",
+    icon: VscBell,
+    hue: "state.warn",
+    blurb: "When Cortex is allowed to interrupt you.",
+  },
+  {
+    id: "activity",
+    label: "Activity",
+    icon: VscHistory,
+    hue: "accent.cyan",
+    blurb: "What the server recorded about this instance.",
+    adminOnly: true,
+  },
+  {
+    id: "members",
+    label: "Org members",
+    icon: VscOrganization,
+    hue: "accent.base",
+    blurb: "The accounts in your organization.",
+    orgAdminOnly: true,
+  },
+  {
+    id: "storage",
+    label: "Storage",
+    icon: VscDatabase,
+    hue: "state.ok",
+    blurb: "Database size, maintenance, and plan limits.",
+    ownerOnly: true,
+  },
 ];
+
+const SECTION = Object.fromEntries(NAV.map((n) => [n.id, n])) as Record<
+  Section,
+  (typeof NAV)[number]
+>;
+
+/** A panel inherits its section's hue and glyph, rather than ten panels each
+ *  threading two more props through their own components. */
+const SectionIdentity = createContext<{ hue: string; icon: typeof VscAccount }>(
+  SECTION.profile,
+);
+
+/** A token name as its ~15% wash, so a chip is the same hue as its glyph in
+ *  either color mode. */
+const washOf = (token: string, pct = 15) =>
+  `color-mix(in oklab, var(--chakra-colors-${token.replace(".", "-")}) ${pct}%, transparent)`;
 
 function Settings({ me, onClose, onUpdated }: Props) {
   const [section, setSection] = useState<Section>("profile");
@@ -116,43 +210,76 @@ function Settings({ me, onClose, onUpdated }: Props) {
           ).map((n) => {
             const active = section === n.id;
             return (
-              <Flex
+              <Tooltip
                 key={n.id}
-                as="button"
-                align="center"
-                gap={3}
-                px={3}
-                py={2}
-                borderRadius="md"
-                fontSize="sm"
-                fontWeight={active ? 600 : 500}
-                color={active ? "ink.base" : "ink.muted"}
-                bg={active ? "surface.hover" : "transparent"}
-                _hover={{ bg: "surface.hover", color: "ink.base" }}
-                onClick={() => setSection(n.id)}
+                placement="right"
+                hasArrow
+                label={`${n.label} — ${n.blurb}`}
               >
-                <Icon as={n.icon} fontSize="16px" />
-                <Box display={{ base: "none", md: "block" }}>{n.label}</Box>
-              </Flex>
+                <Flex
+                  as="button"
+                  position="relative"
+                  overflow="hidden"
+                  align="center"
+                  gap={3}
+                  px={3}
+                  py={2}
+                  borderRadius="md"
+                  fontSize="sm"
+                  fontWeight={active ? 650 : 500}
+                  color={active ? n.hue : "ink.muted"}
+                  bg={active ? washOf(n.hue, 12) : "transparent"}
+                  _hover={{
+                    bg: "surface.hover",
+                    color: active ? n.hue : "ink.base",
+                  }}
+                  onClick={() => setSection(n.id)}
+                >
+                  {/* A hue edge marker, like the rail's: the nav and the rail are
+                      the same control at two widths. */}
+                  {active && (
+                    <Box
+                      position="absolute"
+                      left={0}
+                      top={0}
+                      bottom={0}
+                      w="2px"
+                      borderRadius="full"
+                      bg={n.hue}
+                      sx={{ boxShadow: `0 0 8px 0 ${washOf(n.hue, 70)}` }}
+                    />
+                  )}
+                  <Icon
+                    as={n.icon}
+                    fontSize="16px"
+                    color={active ? n.hue : undefined}
+                    opacity={active ? 1 : 0.65}
+                  />
+                  <Box display={{ base: "none", md: "block" }}>{n.label}</Box>
+                </Flex>
+              </Tooltip>
             );
           })}
         </VStack>
 
         <Box flex={1} minH={0} overflowY="auto" px={{ base: 5, md: 10 }} py={8}>
           <Box maxW="640px">
-            {section === "profile" && (
-              <ProfilePanel me={me} onUpdated={onUpdated} />
-            )}
-            {section === "appearance" && <AppearancePanel />}
-            {section === "editor" && <EditorPanel />}
-            {section === "keyboard" && <KeyboardPanel />}
-            {section === "security" && (
-              <SecurityPanel me={me} onUpdated={onUpdated} />
-            )}
-            {section === "notifications" && <NotificationsPanel />}
-            {section === "activity" && isAdmin && <ActivityPanel />}
-            {section === "members" && me?.role === "admin" && <OrgMembersPanel me={me} />}
-            {section === "storage" && me?.role === "root" && <StoragePanel />}
+            <SectionIdentity.Provider value={SECTION[section]}>
+              {section === "profile" && (
+                <ProfilePanel me={me} onUpdated={onUpdated} />
+              )}
+              {section === "appearance" && <AppearancePanel />}
+              {section === "editor" && <EditorPanel />}
+              {section === "keyboard" && <KeyboardPanel />}
+              {section === "security" && (
+                <SecurityPanel me={me} onUpdated={onUpdated} />
+              )}
+              {section === "notifications" && <NotificationsPanel />}
+              {section === "activity" && isAdmin && <ActivityPanel />}
+              {section === "members" &&
+                me?.role === "admin" && <OrgMembersPanel me={me} />}
+              {section === "storage" && me?.role === "root" && <StoragePanel />}
+            </SectionIdentity.Provider>
           </Box>
         </Box>
       </Flex>
@@ -161,12 +288,16 @@ function Settings({ me, onClose, onUpdated }: Props) {
 }
 
 function PanelHead({ title, sub }: { title: string; sub: string }) {
+  const { hue } = useContext(SectionIdentity);
   return (
     <Box mb={6}>
+      {/* The same 24px hue rule the landing sections use, so a panel says which
+          part of the product it belongs to before you read a word. */}
+      <Box w="24px" h="2px" borderRadius="full" bg={hue} mb={3} />
       <Text fontSize="lg" fontWeight={700} letterSpacing="-0.01em">
         {title}
       </Text>
-      <Text fontSize="sm" color="ink.muted" mt={1}>
+      <Text fontSize="sm" color="ink.muted" mt={1} lineHeight={1.6}>
         {sub}
       </Text>
     </Box>
@@ -179,9 +310,18 @@ function Card({ children }: { children: ReactNode }) {
       bg="surface.panel"
       border="1px solid"
       borderColor="surface.border"
-      borderRadius="lg"
+      borderRadius="xl"
       p={5}
       mb={5}
+      // Stacked rows divide themselves, so five switches read as one list
+      // instead of five unrelated lines.
+      sx={{
+        "& .cx-setrow + .cx-setrow": {
+          borderTopWidth: "1px",
+          borderTopStyle: "solid",
+          borderColor: "surface.border",
+        },
+      }}
     >
       {children}
     </Box>
@@ -414,24 +554,42 @@ function ToggleRow({
   hint,
   checked,
   onChange,
+  icon,
 }: {
   label: string;
   hint?: string;
   checked: boolean;
   onChange: () => void;
+  icon?: typeof VscAccount;
 }) {
+  const { hue } = useContext(SectionIdentity);
   return (
-    <Flex align="center" justify="space-between" gap={4}>
-      <Box>
-        <Text fontSize="sm" fontWeight={500}>
-          {label}
-        </Text>
-        {hint && (
-          <Text fontSize="xs" color="ink.subtle">
-            {hint}
-          </Text>
+    <Flex className="cx-setrow" py={3} align="center" justify="space-between" gap={4}>
+      <HStack spacing={3} minW={0}>
+        {icon && (
+          <Flex
+            boxSize="26px"
+            align="center"
+            justify="center"
+            borderRadius="md"
+            bg={washOf(hue, 14)}
+            color={hue}
+            flexShrink={0}
+          >
+            <Icon as={icon} boxSize="14px" />
+          </Flex>
         )}
-      </Box>
+        <Box minW={0}>
+          <Text fontSize="sm" fontWeight={500}>
+            {label}
+          </Text>
+          {hint && (
+            <Text fontSize="xs" color="ink.subtle">
+              {hint}
+            </Text>
+          )}
+        </Box>
+      </HStack>
       <Switch
         isChecked={checked}
         onChange={onChange}
@@ -443,6 +601,7 @@ function ToggleRow({
 }
 
 function EditorPanel() {
+  const { hue: editorHue } = useContext(SectionIdentity);
   const [prefs, setPrefs] = useEditorPrefs();
   const toggle = (k: keyof EditorPrefs) =>
     setPrefs({ ...prefs, [k]: !prefs[k] });
@@ -456,46 +615,70 @@ function EditorPanel() {
         sub="Tune the code editor. Changes apply everywhere, instantly."
       />
       <Card>
-        <VStack align="stretch" spacing={4}>
+        <VStack align="stretch" spacing={0}>
           <ToggleRow
+            icon={FiEye}
             label="Minimap"
             hint="The code overview strip on the right edge"
             checked={prefs.minimap}
             onChange={() => toggle("minimap")}
           />
           <ToggleRow
+            icon={FiAlignLeft}
             label="Word wrap"
             hint="Wrap long lines instead of scrolling"
             checked={prefs.wordWrap}
             onChange={() => toggle("wordWrap")}
           />
           <ToggleRow
+            icon={FiHash}
             label="Line numbers"
             checked={prefs.lineNumbers}
             onChange={() => toggle("lineNumbers")}
           />
           <ToggleRow
+            icon={FiAperture}
             label="Bracket pair colours"
             hint="Tint matching brackets"
             checked={prefs.bracketPairs}
             onChange={() => toggle("bracketPairs")}
           />
           <ToggleRow
+            icon={FiArrowUp}
             label="Sticky scroll"
             hint="Pin the enclosing scope to the top"
             checked={prefs.stickyScroll}
             onChange={() => toggle("stickyScroll")}
           />
           <ToggleRow
+            icon={FiBarChart2}
             label="Document stats"
             hint="Show lines · words · chars in the status bar"
             checked={prefs.showStats}
             onChange={() => toggle("showStats")}
           />
-          <Flex align="center" justify="space-between" pt={1}>
-            <Text fontSize="sm" fontWeight={500}>
-              Font size
-            </Text>
+          <Flex
+            className="cx-setrow"
+            py={3}
+            align="center"
+            justify="space-between"
+          >
+            <HStack spacing={3} minW={0}>
+              <Flex
+                boxSize="26px"
+                align="center"
+                justify="center"
+                borderRadius="md"
+                bg={washOf(editorHue, 14)}
+                color={editorHue}
+                flexShrink={0}
+              >
+                <Icon as={FiType} boxSize="14px" />
+              </Flex>
+              <Text fontSize="sm" fontWeight={500}>
+                Font size
+              </Text>
+            </HStack>
             <HStack>
               <Button
                 size="xs"
@@ -929,8 +1112,8 @@ function NotificationsPanel() {
         sub="Control how you're notified about new messages, mentions, and activity."
       />
       <Card>
-        <VStack align="stretch" spacing={4}>
-          <Box>
+        <VStack align="stretch" spacing={0}>
+          <Box className="cx-setrow" py={3}>
             <Text fontSize="sm" fontWeight={600} mb={1}>
               Notify me about
             </Text>
@@ -958,7 +1141,12 @@ function NotificationsPanel() {
               </VStack>
             </RadioGroup>
           </Box>
-          <Flex align="center" justify="space-between">
+          <Flex
+            className="cx-setrow"
+            py={3}
+            align="center"
+            justify="space-between"
+          >
             <Box
               opacity={silent ? 0.45 : 1}
               pointerEvents={silent ? "none" : undefined}
@@ -978,7 +1166,12 @@ function NotificationsPanel() {
               colorScheme="brand"
             />
           </Flex>
-          <Flex align="center" justify="space-between">
+          <Flex
+            className="cx-setrow"
+            py={3}
+            align="center"
+            justify="space-between"
+          >
             <Box
               opacity={silent ? 0.45 : 1}
               pointerEvents={silent ? "none" : undefined}
@@ -998,7 +1191,12 @@ function NotificationsPanel() {
               colorScheme="brand"
             />
           </Flex>
-          <Flex align="center" justify="space-between">
+          <Flex
+            className="cx-setrow"
+            py={3}
+            align="center"
+            justify="space-between"
+          >
             <Box
               opacity={silent ? 0.45 : 1}
               pointerEvents={silent ? "none" : undefined}
