@@ -186,13 +186,6 @@ impl Databases {
         self.org(org_id).await.map(|_| ())
     }
 
-    /// Drop the registry's handle. The pool closes when the last request holding
-    /// a clone lets go, so closing a database out from under a live document is
-    /// not possible from here.
-    pub async fn forget(&self, org_id: i64) {
-        self.inner.open.lock().await.remove(&org_id);
-    }
-
     /// Destroy an organization's storage once its control-plane rows are gone:
     /// drop the registry's handle, then unlink its database and the `-wal`/`-shm`
     /// siblings SQLite leaves beside it. Returns how many files went.
