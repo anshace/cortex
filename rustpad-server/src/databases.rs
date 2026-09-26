@@ -42,6 +42,11 @@ struct Inner {
     control: Database,
     mode: Mode,
     open: tokio::sync::Mutex<HashMap<i64, Cached>>,
+    /// Salts the in-memory database names so two registries in one process can
+    /// never resolve the same org to the same shared-cache database. One
+    /// registry per process is all the server does today; without a salt, two
+    /// of them race each other through the same migration set.
+    nonce: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +121,7 @@ impl Databases {
                 control,
                 mode,
                 open: tokio::sync::Mutex::new(HashMap::new()),
+                nonce: rand::random(),
             }),
         }
     }
@@ -143,7 +149,10 @@ impl Databases {
                 .join(format!("org-{org_id}.db"))
                 .to_string_lossy()
                 .replace('\\', "/"),
-            Mode::Memory => format!("file:cortex-org-{org_id}?mode=memory&cache=shared"),
+            Mode::Memory => format!(
+                "file:cortex-org-{org_id}-{}?mode=memory&cache=shared",
+                self.inner.nonce
+            ),
         }
     }
 
@@ -182,6 +191,57 @@ impl Databases {
     /// not possible from here.
     pub async fn forget(&self, org_id: i64) {
         self.inner.open.lock().await.remove(&org_id);
+    }
+
+    /// Destroy an organization's storage once its control-plane rows are gone:
+    /// drop the registry's handle, then unlink its database and the `-wal`/`-shm`
+    /// siblings SQLite leaves beside it. Returns how many files went.
+    ///
+    /// Nothing else in the server deletes a tenant file, so without this a
+    /// deleted organization keeps its database on disk forever — member rows
+    /// today, and its documents too once content is routed per tenant.
+    ///
+    /// Dropping the handle does not by itself close the pool: a request already
+    /// holding a clone keeps the file open. The caller must therefore have
+    /// disconnected the org's live documents and boards first, under the same
+    /// access gate the delete runs on.
+    pub async fn discard(&self, org_id: i64) -> usize {
+        // Close the pool before touching the filesystem: while a connection is
+        // open the database file is held — Windows refuses the unlink outright,
+        // and POSIX would happily delete a file SQLite is still writing.
+        if let Some(cached) = self.inner.open.lock().await.remove(&org_id) {
+            // `Pool::close` through the pool accessor: no further connections,
+            // and idle ones dropped — that is what releases the file handle.
+            cached.db.read_only().close();
+        }
+        let dir = match &self.inner.mode {
+            Mode::Files(dir) => dir.clone(),
+            // Single mode never made a file; memory mode has nothing on disk.
+            _ => return 0,
+        };
+        let base = dir.join(format!("org-{org_id}.db"));
+        let mut removed = 0;
+        for suffix in ["", "-wal", "-shm"] {
+            let path = std::path::PathBuf::from(format!("{}{suffix}", base.display()));
+            // Releasing a handle can lag the close by a few milliseconds, so try
+            // a handful of times before giving up — and say so loudly, because a
+            // tenant file that survives its organization's deletion is exactly
+            // the residue this method exists to remove.
+            for attempt in 0..5 {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        removed += 1;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(e) if attempt < 4 => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(e) => log::warn!("could not remove {}: {e}", path.display()),
+                }
+            }
+        }
+        removed
     }
 
     /// Close pools nobody has used for [`IDLE_TTL`]. `busy` reports whether an
@@ -361,6 +421,7 @@ mod tests {
                 control,
                 mode,
                 open: tokio::sync::Mutex::new(HashMap::new()),
+                nonce: rand::random(),
             }),
         }
     }
@@ -560,5 +621,35 @@ mod tests {
             vec![41, 43],
             "a tenant holds exactly who the control plane authorizes today"
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_organization_unlinks_its_database_and_wal_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_t, control) = control().await;
+        let registry = split(control, Mode::Files(tmp.path().to_path_buf()));
+        registry.provision(3).await.unwrap();
+        let base = tmp.path().join("org-3.db");
+        assert!(base.exists(), "provisioning created the tenant database");
+        assert_eq!(registry.discard(3).await, 1, "the tenant database goes with the tenant");
+        assert!(!base.exists(), "a deleted organization must not leave its data behind");
+
+        // SQLite leaves `-wal` and `-shm` siblings beside a live database, so a
+        // delete that unlinked only the `.db` would leave half a tenant on disk.
+        // Written by hand for an org that was never opened: Windows refuses to
+        // rewrite a WAL that a live connection has mapped.
+        for name in ["org-7.db", "org-7.db-wal", "org-7.db-shm"] {
+            std::fs::write(tmp.path().join(name), b"x").unwrap();
+        }
+        assert_eq!(registry.discard(7).await, 3, "database plus its wal and shm siblings");
+        for name in ["org-7.db", "org-7.db-wal", "org-7.db-shm"] {
+            assert!(!tmp.path().join(name).exists(), "{name} survived the delete");
+        }
+
+        // A later organization given the same id must start from nothing, not
+        // from a leftover file written under an older schema.
+        let again = registry.org(3).await.unwrap();
+        assert!(base.exists(), "discarding does not stop a new tenant being provisioned");
+        assert_eq!(schema_version(&again).await.unwrap(), expected_version());
     }
 }

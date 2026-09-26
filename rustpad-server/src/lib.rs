@@ -294,8 +294,8 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
     // registry rides along because the storage page reports where every
     // organization's content actually lives.
     let workspace_routes =
-        workspace::routes(db.clone(), live.clone(), boards.clone(), databases);
-    let account_routes = account::routes(db.clone(), live, boards);
+        workspace::routes(db.clone(), live.clone(), boards.clone(), databases.clone());
+    let account_routes = account::routes(db.clone(), live, boards, databases);
 
     // A plain db filter used by the document access checks below.
     let db_for_docs = db.clone();

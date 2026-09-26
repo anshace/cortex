@@ -24,6 +24,11 @@ fn with_docs(live: LiveDocs) -> impl Filter<Extract = (LiveDocs,), Error = Infal
 fn with_boards(boards: LiveBoards) -> impl Filter<Extract = (LiveBoards,), Error = Infallible> + Clone {
     warp::any().map(move || boards.clone())
 }
+fn with_databases(
+    databases: Option<crate::databases::Databases>,
+) -> impl Filter<Extract = (Option<crate::databases::Databases>,), Error = Infallible> + Clone {
+    warp::any().map(move || databases.clone())
+}
 
 fn err(status: StatusCode, msg: &str) -> warp::reply::Response {
     warp::reply::with_status(warp::reply::json(&json!({ "error": msg })), status).into_response()
@@ -155,7 +160,12 @@ struct RenameReq {
     name: String,
 }
 
-pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+pub(crate) fn routes(
+    db: Database,
+    live: LiveDocs,
+    boards: LiveBoards,
+    databases: Option<crate::databases::Databases>,
+) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
     let update_name = warp::path!("profile")
         .and(warp::post())
         .and(with_auth(db.clone()))
@@ -271,6 +281,7 @@ pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl F
         .and(with_db(db))
         .and(with_docs(live.clone()))
         .and(with_boards(boards.clone()))
+        .and(with_databases(databases.clone()))
         .and_then(org_delete);
 
     update_name
@@ -644,6 +655,7 @@ async fn org_delete(
     db: Database,
     live: LiveDocs,
     boards: LiveBoards,
+    databases: Option<crate::databases::Databases>,
 ) -> Result<impl Reply, Rejection> {
     require_root(&user)?;
     let _gate = crate::access_gate().write().await;
@@ -651,6 +663,17 @@ async fn org_delete(
     match db.delete_org(target).await {
         Ok(ids) => {
             evict_documents(&live, &ids);
+            // The control-plane rows are gone, so the tenant's own database file
+            // has to go with them: nothing else in the server ever deletes one,
+            // and a deleted organization's data must not outlive it. Safe to
+            // unlink here because the org's live documents and boards were just
+            // disconnected, under this same gate.
+            if let Some(registries) = &databases {
+                let files = registries.discard(target).await;
+                if files > 0 {
+                    log::info!("removed {files} storage file(s) for deleted org {target}");
+                }
+            }
             Ok(warp::reply::json(&json!({ "ok": true })).into_response())
         }
         Err(e) => {
@@ -701,7 +724,7 @@ mod account_routes_tests {
         let test_password = format!("test-{:032x}", rand::random::<u128>());
         let live: LiveDocs = Default::default();
         let boards: LiveBoards = Default::default();
-        let api = routes(db.clone(), live, boards).recover(crate::auth::handle_rejection);
+        let api = routes(db.clone(), live, boards, None).recover(crate::auth::handle_rejection);
 
         let list = warp::test::request().method("GET").path("/admin/users")
             .header("cookie", "authpad_session=admin-token").reply(&api).await;
@@ -757,7 +780,7 @@ mod account_routes_tests {
         db.create_session("elsewhere", member.id, now_secs() + 3600).await.unwrap();
         let live: LiveDocs = Default::default();
         let boards: LiveBoards = Default::default();
-        let api = routes(db.clone(), live, boards).recover(crate::auth::handle_rejection);
+        let api = routes(db.clone(), live, boards, None).recover(crate::auth::handle_rejection);
 
         let changed = warp::test::request().method("POST").path("/profile/password")
             .header("cookie", "authpad_session=current")
