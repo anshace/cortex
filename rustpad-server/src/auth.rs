@@ -224,7 +224,13 @@ pub fn with_auth(db: Database) -> impl Filter<Extract = (User,), Error = Rejecti
             let token = token.ok_or_else(|| warp::reject::custom(Unauthorized))?;
             match db.get_session_user(&token, now_secs()).await {
                 Ok(Some(user)) => Ok(user),
-                _ => Err(warp::reject::custom(Unauthorized)),
+                // An expired or forged session is a denial. A database that
+                // could not be read is not: there is one pooled connection, so
+                // a housekeeping pass can make an ordinary, still-valid session
+                // look invalid, and the browser throws it away and asks the user
+                // to sign in again for no reason they can see.
+                Ok(None) => Err(warp::reject::custom(Unauthorized)),
+                Err(err) => Err(warp::reject::custom(DatabaseBusy(err))),
             }
         })
 }
@@ -400,6 +406,18 @@ async fn me_handler(user: User) -> Result<impl Reply, Rejection> {
 }
 
 /// Convert [`Unauthorized`]/[`Forbidden`] rejections into JSON error responses.
+/// The request could not be answered because the storage connection was held
+/// by another operation. Distinct from `Forbidden` and `Unauthorized`: an
+/// unreadable database is not evidence that a user lacks access, or that their
+/// session is invalid.
+#[derive(Debug)]
+pub struct DatabaseBusy(pub anyhow::Error);
+
+impl warp::reject::Reject for DatabaseBusy {}
+
+/// Turn a rejection into the response the client sees: each rejection this
+/// crate raises has its own status and message, so storage trouble never shares
+/// a reply with a denial of access.
 pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
     if err.find::<Unauthorized>().is_some() {
         let reply = warp::reply::json(&json!({ "error": "unauthorized" }));
@@ -408,6 +426,17 @@ pub async fn handle_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
     if err.find::<Forbidden>().is_some() {
         let reply = warp::reply::json(&json!({ "error": "forbidden" }));
         return Ok(warp::reply::with_status(reply, StatusCode::FORBIDDEN));
+    }
+    if let Some(busy) = err.find::<DatabaseBusy>() {
+        warn!(
+            "request refused: the database connection is busy: {}",
+            busy.0
+        );
+        let reply = warp::reply::json(&json!({
+            "error": "database busy",
+            "detail": "the storage connection is held by another operation; try again shortly",
+        }));
+        return Ok(warp::reply::with_status(reply, StatusCode::SERVICE_UNAVAILABLE));
     }
     Err(err)
 }

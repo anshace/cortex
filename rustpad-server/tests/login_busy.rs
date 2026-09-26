@@ -52,5 +52,26 @@ async fn busy_database_is_not_a_bad_password() -> Result<()> {
         "the correct password must still work afterwards; body: {}",
         String::from_utf8_lossy(resp.body())
     );
+    // The session check sits in front of every data route, so it is the first
+    // place a held connection becomes an answer the user can see: a valid
+    // session must not turn into "you are not signed in".
+    let cookie = root_cookie(&filter).await;
+    let held = db.read_only().acquire().await?;
+    let resp = warp::test::request()
+        .path("/api/me")
+        .header("cookie", cookie)
+        .reply(&filter)
+        .await;
+    let body = String::from_utf8_lossy(resp.body()).to_string();
+    assert_eq!(
+        resp.status(),
+        503,
+        "a valid session during a busy database is not an invalid session; got {body}"
+    );
+    assert!(body.contains("database busy"), "body: {body}");
+    drop(held);
+
+    // And it must not be charged against the address's failure count,
+    // ...
     Ok(())
 }

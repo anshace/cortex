@@ -312,8 +312,10 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
                 let _gate = gate;
                 // The document must belong to a workspace in the user's org
                 // (root may access any) — otherwise no access.
-                if !doc_allowed(&db, &user, &id).await {
-                    return Err(warp::reject::custom(auth::Forbidden));
+                match doc_allowed(&db, &user, &id).await {
+                    Ok(true) => {}
+                    Ok(false) => return Err(warp::reject::custom(auth::Forbidden)),
+                    Err(err) => return Err(warp::reject::custom(auth::DatabaseBusy(err))),
                 }
                 socket_handler(id, ws, state).await
             },
@@ -333,8 +335,10 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
              db: Database,
              state: ServerState| async move {
                 let _gate = gate;
-                if !file_allowed(&db, &user, file_id).await {
-                    return Err(warp::reject::custom(auth::Forbidden));
+                match file_allowed(&db, &user, file_id).await {
+                    Ok(true) => {}
+                    Ok(false) => return Err(warp::reject::custom(auth::Forbidden)),
+                    Err(err) => return Err(warp::reject::custom(auth::DatabaseBusy(err))),
                 }
                 let name = if user.name.trim().is_empty() {
                     user.email
@@ -351,8 +355,10 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         .and(state_filter.clone())
         .and_then(
             |id: String, user: database::User, db: Database, state: ServerState| async move {
-                if !doc_allowed(&db, &user, &id).await {
-                    return Err(warp::reject::custom(auth::Forbidden));
+                match doc_allowed(&db, &user, &id).await {
+                    Ok(true) => {}
+                    Ok(false) => return Err(warp::reject::custom(auth::Forbidden)),
+                    Err(err) => return Err(warp::reject::custom(auth::DatabaseBusy(err))),
                 }
                 text_handler(id, state).await
             },
@@ -383,30 +389,35 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         .boxed()
 }
 
-async fn file_allowed(db: &Database, user: &database::User, file_id: i64) -> bool {
-    match db.file_ws_info(file_id).await.ok().flatten() {
+/// Whether a user may read the file `file_id`. A lookup that fails is reported
+/// as an error, not as a denial: with one pooled connection an unreadable
+/// database would otherwise tell someone they lack access to their own file.
+async fn file_allowed(
+    db: &Database,
+    user: &database::User,
+    file_id: i64,
+) -> Result<bool, anyhow::Error> {
+    let info = db.file_ws_info(file_id).await?;
+    Ok(match info {
         Some((group_id, org, scope, created_by)) => {
             if user.role == "root" {
-                return true;
+                return Ok(true);
             }
             if Some(org) != user.org_id {
-                return false;
+                return Ok(false);
             }
             if user.role == "admin" {
-                return true;
+                return Ok(true);
             }
             match scope.as_str() {
                 "org" => true,
                 "personal" => created_by == user.id,
-                "group" => db
-                    .is_group_member(group_id, user.id)
-                    .await
-                    .unwrap_or(false),
+                "group" => db.is_group_member(group_id, user.id).await?,
                 _ => false,
             }
         }
         None => false,
-    }
+    })
 }
 
 async fn board_socket_handler(
@@ -425,30 +436,32 @@ async fn board_socket_handler(
 
 /// Whether a user may access the document `doc_id` (root bypasses; otherwise
 /// the same layered org / group / personal check as the REST workspace routes).
-async fn doc_allowed(db: &Database, user: &database::User, doc_id: &str) -> bool {
-    match db.doc_ws_info(doc_id).await.ok().flatten() {
+async fn doc_allowed(
+    db: &Database,
+    user: &database::User,
+    doc_id: &str,
+) -> Result<bool, anyhow::Error> {
+    let info = db.doc_ws_info(doc_id).await?;
+    Ok(match info {
         Some((group_id, org, scope, created_by)) => {
             if user.role == "root" {
-                return true;
+                return Ok(true);
             }
             if Some(org) != user.org_id {
-                return false;
+                return Ok(false);
             }
             if user.role == "admin" {
-                return true;
+                return Ok(true);
             }
             match scope.as_str() {
                 "org" => true,
                 "personal" => created_by == user.id,
-                "group" => db
-                    .is_group_member(group_id, user.id)
-                    .await
-                    .unwrap_or(false),
+                "group" => db.is_group_member(group_id, user.id).await?,
                 _ => false,
             }
         }
         None => false,
-    }
+    })
 }
 
 /// Handler for the `/api/socket/{id}` endpoint.
