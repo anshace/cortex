@@ -13,10 +13,11 @@ use tokio::time::Instant;
 pub mod common;
 
 #[tokio::test]
-#[ignore = "legacy OT harness: pre-dates session auth; hangs against the DB-backed server"]
 async fn test_lost_wakeups() -> Result<()> {
     pretty_env_logger::try_init().ok();
-    let filter = server(sqlite_config(1).await);
+    let config = sqlite_config(1).await;
+    seed_doc(&config, "stress").await;
+    let filter = server(config);
 
     expect_text(&filter, "stress", "").await;
 
@@ -37,7 +38,7 @@ async fn test_lost_wakeups() -> Result<()> {
             operation.insert("a");
             let msg = json!({
                 "Edit": {
-                    "revision": revision,
+                    "revision": revision + 1, // the persisted baseline counts as an operation
                     "operation": operation
                 }
             });
@@ -73,10 +74,11 @@ async fn test_lost_wakeups() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "legacy OT harness: pre-dates session auth; hangs against the DB-backed server"]
 async fn test_large_document() -> Result<()> {
     pretty_env_logger::try_init().ok();
-    let filter = server(sqlite_config(1).await);
+    let config = sqlite_config(1).await;
+    seed_doc(&config, "stress").await;
+    let filter = server(config);
 
     expect_text(&filter, "stress", "").await;
 
