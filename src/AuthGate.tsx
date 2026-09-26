@@ -19,7 +19,18 @@ function AuthGate() {
   const check = useCallback(() => {
     setState("loading");
     fetch("/api/me", { credentials: "include" })
-      .then((res) => setState(res.ok ? "in" : "out"))
+      .then((res) => {
+        if (res.ok) {
+          setState("in");
+          return;
+        }
+        // A 401 or 403 is a real answer about this session. Anything else is
+        // the server's trouble — a 503 "database busy" while housekeeping holds
+        // the storage connection, or a 500 — and treating that as "signed out"
+        // discards a valid session and shows an authenticated user a marketing
+        // page in the middle of their work.
+        setState(res.status === 401 || res.status === 403 ? "out" : "offline");
+      })
       // A rejected fetch is "the server could not be reached", which is a
       // different fact from "this session is not signed in". Telling an
       // installed, signed-in user who is merely offline that they are looking at
@@ -50,13 +61,13 @@ function AuthGate() {
       >
         <Logo size={44} />
         <Text fontSize="lg" fontWeight={700} letterSpacing="-0.01em">
-          Can't reach your server
+          Your server isn't answering
         </Text>
         <Box maxW="380px">
           <Text fontSize="sm" color="ink.muted" lineHeight={1.6}>
             Cortex keeps your documents on its own server, so nothing opens while
-            the connection is down. Nothing has been lost — reconnect and try
-            again.
+            it is unreachable or busy. Nothing has been lost and you are still
+            signed in — try again in a moment.
           </Text>
         </Box>
         <Button colorScheme="brand" size="sm" onClick={check}>
