@@ -13,16 +13,23 @@ use tokio::time;
 pub mod common;
 
 #[tokio::test]
-#[ignore = "legacy OT harness: pre-dates session auth; hangs against the DB-backed server"]
+#[ignore = "protocol deltas unresolved: the server reports start=<revision after the edit> and sends each client a baseline History frame before it edits; the legacy assertions predate both"]
 async fn test_single_operation() -> Result<()> {
     pretty_env_logger::try_init().ok();
-    let filter = server(sqlite_config(1).await);
+    let config = sqlite_config(1).await;
+    seed_doc(&config, "foobar").await;
+    let filter = server(config);
 
     expect_text(&filter, "foobar", "").await;
 
     let mut client = connect(&filter, "foobar").await?;
     let msg = client.recv().await?;
     assert_eq!(msg, json!({ "Identity": 0 }));
+
+    // Every client now receives the document's baseline before it sends
+    // anything: an empty history for a file with no operations yet.
+    let baseline = client.recv().await?;
+    assert_eq!(baseline["History"]["operations"][0]["operation"], json!([]));
 
     let mut operation = OperationSeq::default();
     operation.insert("hello");
@@ -53,16 +60,23 @@ async fn test_single_operation() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "legacy OT harness: pre-dates session auth; hangs against the DB-backed server"]
+#[ignore = "protocol deltas unresolved: the server reports start=<revision after the edit> and sends each client a baseline History frame before it edits; the legacy assertions predate both"]
 async fn test_invalid_operation() -> Result<()> {
     pretty_env_logger::try_init().ok();
-    let filter = server(sqlite_config(1).await);
+    let config = sqlite_config(1).await;
+    seed_doc(&config, "foobar").await;
+    let filter = server(config);
 
     expect_text(&filter, "foobar", "").await;
 
     let mut client = connect(&filter, "foobar").await?;
     let msg = client.recv().await?;
     assert_eq!(msg, json!({ "Identity": 0 }));
+
+    // Every client now receives the document's baseline before it sends
+    // anything: an empty history for a file with no operations yet.
+    let baseline = client.recv().await?;
+    assert_eq!(baseline["History"]["operations"][0]["operation"], json!([]));
 
     let mut operation = OperationSeq::default();
     operation.insert("hello");
@@ -80,15 +94,22 @@ async fn test_invalid_operation() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "legacy OT harness: pre-dates session auth; hangs against the DB-backed server"]
+#[ignore = "protocol deltas unresolved: the server reports start=<revision after the edit> and sends each client a baseline History frame before it edits; the legacy assertions predate both"]
 async fn test_concurrent_transform() -> Result<()> {
     pretty_env_logger::try_init().ok();
-    let filter = server(sqlite_config(1).await);
+    let config = sqlite_config(1).await;
+    seed_doc(&config, "foobar").await;
+    let filter = server(config);
 
     // Connect the first client
     let mut client = connect(&filter, "foobar").await?;
     let msg = client.recv().await?;
     assert_eq!(msg, json!({ "Identity": 0 }));
+
+    // Every client now receives the document's baseline before it sends
+    // anything: an empty history for a file with no operations yet.
+    let baseline = client.recv().await?;
+    assert_eq!(baseline["History"]["operations"][0]["operation"], json!([]));
 
     // Insert the first operation
     let mut operation = OperationSeq::default();
@@ -200,14 +221,21 @@ async fn test_concurrent_transform() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "legacy OT harness: pre-dates session auth; hangs against the DB-backed server"]
+#[ignore = "protocol deltas unresolved: the server reports start=<revision after the edit> and sends each client a baseline History frame before it edits; the legacy assertions predate both"]
 async fn test_set_language() -> Result<()> {
     pretty_env_logger::try_init().ok();
-    let filter = server(sqlite_config(1).await);
+    let config = sqlite_config(1).await;
+    seed_doc(&config, "foobar").await;
+    let filter = server(config);
 
     let mut client = connect(&filter, "foobar").await?;
     let msg = client.recv().await?;
     assert_eq!(msg, json!({ "Identity": 0 }));
+
+    // Every client now receives the document's baseline before it sends
+    // anything: an empty history for a file with no operations yet.
+    let baseline = client.recv().await?;
+    assert_eq!(baseline["History"]["operations"][0]["operation"], json!([]));
 
     let msg = json!({ "SetLanguage": "javascript" });
     client.send(&msg).await;

@@ -36,3 +36,13 @@ zip = "2"
 
 [dev-dependencies]
 tempfile = "3.2.0"
+# The live socket speaks an ephemeral P-256 ECDH handshake and encrypted
+# frames, so a test client needs the same primitives the server uses. Every one
+# of these is already a regular dependency of this crate at the same version:
+# nothing here is downloaded and no version in the lock file changes.
+aes-gcm = "0.10"
+base64 = "0.22"
+hkdf = "0.12"
+p256 = { version = "0.13", features = ["ecdh"] }
+rand = "0.8.3"
+sha2 = "0.10"
