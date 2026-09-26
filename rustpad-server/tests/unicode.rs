@@ -10,10 +10,11 @@ use rustpad_server::server;
 use serde_json::json;
 
 #[tokio::test]
-#[ignore = "legacy OT harness: pre-dates session auth; hangs against the DB-backed server"]
 async fn test_unicode_length() -> Result<()> {
     pretty_env_logger::try_init().ok();
-    let filter = server(sqlite_config(1).await);
+    let config = sqlite_config(1).await;
+    seed_doc(&config, "unicode").await;
+    let filter = server(config);
 
     expect_text(&filter, "unicode", "").await;
 
@@ -37,7 +38,7 @@ async fn test_unicode_length() -> Result<()> {
         msg,
         json!({
             "History": {
-                "start": 0,
+                "start": 1,
                 "operations": [
                     { "id": 0, "operation": ["h🎉e🎉l👨‍👨‍👦‍👦lo"] }
                 ]
@@ -50,7 +51,7 @@ async fn test_unicode_length() -> Result<()> {
     operation.delete(14);
     let msg = json!({
         "Edit": {
-            "revision": 1,
+            "revision": 2,
             "operation": operation
         }
     });
@@ -62,7 +63,7 @@ async fn test_unicode_length() -> Result<()> {
         msg,
         json!({
             "History": {
-                "start": 1,
+                "start": 2,
                 "operations": [
                     { "id": 0, "operation": [-14] }
                 ]
@@ -76,10 +77,11 @@ async fn test_unicode_length() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "legacy OT harness: pre-dates session auth; hangs against the DB-backed server"]
 async fn test_multiple_operations() -> Result<()> {
     pretty_env_logger::try_init().ok();
-    let filter = server(sqlite_config(1).await);
+    let config = sqlite_config(1).await;
+    seed_doc(&config, "unicode").await;
+    let filter = server(config);
 
     expect_text(&filter, "unicode", "").await;
 
@@ -103,7 +105,7 @@ async fn test_multiple_operations() -> Result<()> {
         msg,
         json!({
             "History": {
-                "start": 0,
+                "start": 1,
                 "operations": [
                     { "id": 0, "operation": ["🎉😍𒀇👨‍👨‍👦‍👦"] }
                 ]
@@ -118,7 +120,7 @@ async fn test_multiple_operations() -> Result<()> {
     operation.retain(7);
     let msg = json!({
         "Edit": {
-            "revision": 1,
+            "revision": 2,
             "operation": operation
         }
     });
@@ -130,7 +132,7 @@ async fn test_multiple_operations() -> Result<()> {
         msg,
         json!({
             "History": {
-                "start": 1,
+                "start": 2,
                 "operations": [
                     { "id": 0, "operation": ["👯‍♂️", 3, "𐅣𐅤𐅥", 7] }
                 ]
@@ -146,7 +148,7 @@ async fn test_multiple_operations() -> Result<()> {
     operation.retain(8);
     let msg = json!({
         "Edit": {
-            "revision": 1,
+            "revision": 2,
             "operation": operation
         }
     });
@@ -158,7 +160,7 @@ async fn test_multiple_operations() -> Result<()> {
         msg,
         json!({
             "History": {
-                "start": 2,
+                "start": 3,
                 "operations": [
                     { "id": 0, "operation": [6, "h̷̙̤̏͊̑̍̆̃̉͝ĕ̶̠̌̓̃̓̽̃̚l̸̥̊̓̓͝͠l̸̨̠̣̟̥͠ỏ̴̳̖̪̟̱̰̥̞̙̏̓́͗̽̀̈́͛͐̚̕͝͝ ̶̡͍͙͚̞͙̣̘͙̯͇̙̠̀w̷̨̨̪͚̤͙͖̝͕̜̭̯̝̋̋̿̿̀̾͛̐̏͘͘̕͝ǒ̴̙͉͈̗̖͍̘̥̤̒̈́̒͠r̶̨̡̢̦͔̙̮̦͖͔̩͈̗̖̂̀l̶̡̢͚̬̤͕̜̀͛̌̈́̈́͑͋̈̍̇͊͝͠ď̵̛̛̯͕̭̩͖̝̙͎̊̏̈́̎͊̐̏͊̕͜͝͠͝", 11] }
                 ]
@@ -172,10 +174,12 @@ async fn test_multiple_operations() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "legacy OT harness: pre-dates session auth; hangs against the DB-backed server"]
+#[ignore = "waits on a frame that never arrives: after its edit is broadcast, the test expects a cursor acknowledgment, and the strict frame ordering this suite now uses cannot be satisfied without deciding which frames the cursor path really owes. Investigate the frame sequence rather than converting it to the skipping reader, which would hide the cursor broadcast this test exists to assert"]
 async fn test_unicode_cursors() -> Result<()> {
     pretty_env_logger::try_init().ok();
-    let filter = server(sqlite_config(1).await);
+    let config = sqlite_config(1).await;
+    seed_doc(&config, "unicode").await;
+    let filter = server(config);
 
     let mut client = connect(&filter, "unicode").await?;
     assert_eq!(client.recv().await?, json!({ "Identity": 0 }));
@@ -190,7 +194,10 @@ async fn test_unicode_cursors() -> Result<()> {
     });
     info!("sending ClientMsg {}", msg);
     client.send(&msg).await;
-    client.recv().await?;
+    // Two frames are owed here: the baseline history this client was replayed
+    // when it joined, then the history its own edit produced.
+    client.recv_frame().await?;
+    client.recv_frame().await?;
 
     let cursors = json!({
         "cursors": [0, 1, 2, 3],
@@ -208,7 +215,7 @@ async fn test_unicode_cursors() -> Result<()> {
 
     let mut client2 = connect(&filter, "unicode").await?;
     assert_eq!(client2.recv().await?, json!({ "Identity": 1 }));
-    client2.recv().await?;
+    client2.recv_frame().await?;
     assert_eq!(client2.recv().await?, cursors_resp);
 
     let msg = json!({
