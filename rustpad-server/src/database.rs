@@ -4140,6 +4140,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_routing_index_boots_on_a_memory_database() {
+        // Production rollout runs on `sqlite::memory:`; routing must not
+        // assume a database file exists anywhere.
+        let db = Database::new("sqlite::memory:")
+            .await
+            .expect("boot the routing index on an in-memory database");
+        let (org, ws) = seed_routed_workspace(&db).await;
+        let file = db.create_file(ws, "ram.txt", "ram-doc", "text", None, 1).await.unwrap();
+        assert_eq!(db.org_of_doc(&file.doc_id).await.unwrap(), Some(org));
+        db.delete_file(file.id).await.unwrap();
+        assert_eq!(db.org_of_doc("ram-doc").await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn maintenance_sweeps_routing_rows_that_point_at_nothing() {
         let (_tmp, db) = test_database().await;
         let (org, ws) = seed_routed_workspace(&db).await;
