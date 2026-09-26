@@ -230,6 +230,11 @@ pub async fn seed_doc(config: &rustpad_server::ServerConfig, doc_id: &str) -> St
         .database
         .clone()
         .expect("test config carries a database");
+    seed_doc_db(&db, doc_id).await
+}
+
+/// The same, for a suite holding a bare `Database` with no server in front of it.
+pub async fn seed_doc_db(db: &rustpad_server::database::Database, doc_id: &str) -> String {
     let root = db
         .get_user_by_email("admin")
         .await

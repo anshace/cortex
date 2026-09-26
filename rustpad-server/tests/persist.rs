@@ -27,14 +27,21 @@ fn temp_sqlite_uri() -> Result<String> {
 }
 
 #[tokio::test]
-#[ignore = "legacy OT harness: pre-dates session auth; hangs against the DB-backed server"]
 async fn test_database() -> Result<()> {
     pretty_env_logger::try_init().ok();
 
     let database = Database::new(&temp_sqlite_uri()?).await?;
+    // Content is only written where a text file names the document, so the
+    // documents this test edits have to be created the way the server creates
+    // them — an organization, a group, a workspace and then the file.
+    rustpad_server::auth::ensure_default_owner(&database).await;
+    seed_doc_db(&database, "hello").await;
 
-    assert!(database.load("hello").await.is_err());
-    assert!(database.load("world").await.is_err());
+    assert_eq!(database.load("hello").await?.text, "", "a new file starts empty");
+    assert!(
+        database.load("world").await.is_err(),
+        "a document nothing names has no row to read"
+    );
 
     let doc1 = PersistedDocument {
         text: "Hello Text".into(),
@@ -50,6 +57,13 @@ async fn test_database() -> Result<()> {
         language: Some("python".into()),
     };
 
+    // Writing content no file points at would strand it: nothing could ever
+    // read it back, and a later delete would have nothing to clean up.
+    assert!(
+        database.store("world", &doc2).await.is_err(),
+        "unrouted content must be refused"
+    );
+    seed_doc_db(&database, "world").await;
     assert!(database.store("world", &doc2).await.is_ok());
     assert_eq!(database.load("hello").await?, doc1);
     assert_eq!(database.load("world").await?, doc2);
@@ -61,11 +75,13 @@ async fn test_database() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "legacy OT harness: pre-dates session auth; hangs against the DB-backed server"]
+#[ignore = "its clock-pausing starves the single-connection pool: advancing tokio's clock makes the scheduled maintenance loop fire immediately, maintenance holds the only connection, and the login inside this test then gets a 500 server error while the pool times out. The write path itself is covered by test_database; this needs the maintenance task and the pool reconciled, not a different assertion"]
 async fn test_persist() -> Result<()> {
     pretty_env_logger::try_init().ok();
 
-    let filter = server(sqlite_config(2).await);
+    let config = sqlite_config(2).await;
+    seed_doc(&config, "persist").await;
+    let filter = server(config);
 
     expect_text(&filter, "persist", "").await;
 
