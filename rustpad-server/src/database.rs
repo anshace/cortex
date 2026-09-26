@@ -4501,4 +4501,27 @@ mod tests {
         );
         assert_eq!(db.load("orphan-doc").await.unwrap().text, "loose", "the refusal changed nothing");
     }
+
+    /// A caller that treats "this document has no row" and "the database did not
+    /// answer" as the same thing will blank a user's file on a transient failure.
+    /// The two are only distinguishable through `is_missing_document`.
+    #[tokio::test]
+    async fn a_transient_read_failure_is_never_mistaken_for_an_empty_document() {
+        let (_tmp, db) = test_database().await;
+        let (_org, ws) = seed_routed_workspace(&db).await;
+        let file = db.create_file(ws, "a.md", "doc-a", "text", None, 1).await.unwrap();
+
+        let missing = db.load("never-existed").await.unwrap_err();
+        assert!(
+            Database::is_missing_document(&missing),
+            "no row yet is the one case an empty document is the right answer"
+        );
+
+        db.pool.close().await;
+        let unavailable = db.load(&file.doc_id).await.unwrap_err();
+        assert!(
+            !Database::is_missing_document(&unavailable),
+            "an unreachable database must not be read as a document that is empty"
+        );
+    }
 }
