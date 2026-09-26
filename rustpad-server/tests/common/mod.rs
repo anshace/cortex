@@ -61,12 +61,17 @@ pub async fn sqlite_config(expiry_days: u32) -> rustpad_server::ServerConfig {
             .expect("temporary path is valid UTF-8")
     );
     let database = Database::new(&uri).await.expect("open test database");
+    // The same registry boot pairs with the control database. With
+    // `CORTEX_ORG_DBS` unset — as it is here — it resolves every org to that
+    // database, so these suites exercise the routed server, not a variant.
+    let databases = rustpad_server::databases::Databases::new(database.clone(), &uri);
     // Seed the default root account (admin/admin) so test requests can
     // authenticate; every data route is session-gated.
     rustpad_server::auth::ensure_default_owner(&database).await;
     rustpad_server::ServerConfig {
         expiry_days,
         database: Some(database),
+        databases: Some(databases),
     }
 }
 

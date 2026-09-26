@@ -22,6 +22,7 @@ use warp::{http::StatusCode, hyper::Body, reply::Reply, Filter, Rejection};
 use crate::auth::{with_auth, Forbidden};
 use crate::crypto;
 use crate::database::{ChatImageScope, ChatMessage, Database, FileRow, Group, ImportedFile, ReactionView, User, Workspace};
+use crate::databases::Databases;
 use crate::{current_document, evict_all_boards, evict_boards, evict_documents, flush_and_evict, LiveBoards, LiveDocs};
 
 /// Filter extracting the client's ECDH public key header (present when the
@@ -119,6 +120,12 @@ fn clean_path(raw: &str) -> Option<String> {
 
 fn with_db(db: Database) -> impl Filter<Extract = (Database,), Error = Infallible> + Clone {
     warp::any().map(move || db.clone())
+}
+
+fn with_databases(
+    databases: Option<Databases>,
+) -> impl Filter<Extract = (Option<Databases>,), Error = Infallible> + Clone {
+    warp::any().map(move || databases.clone())
 }
 
 fn with_docs(live: LiveDocs) -> impl Filter<Extract = (LiveDocs,), Error = Infallible> + Clone {
@@ -396,7 +403,7 @@ fn dm_org(user: &User, q: &DmQuery) -> Option<i64> {
 }
 
 /// Org, workspace, file, and chat HTTP routes.
-pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
+pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards, databases: Option<Databases>) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
     let get_org = warp::path!("org")
         .and(warp::get())
         .and(with_auth(db.clone()))
@@ -738,6 +745,7 @@ pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards) -> impl F
         .and(warp::get())
         .and(with_auth(db.clone()))
         .and(with_db(db.clone()))
+        .and(with_databases(databases.clone()))
         .and_then(admin_storage);
 
     let compact_r = warp::path!("admin" / "compact")
@@ -2551,7 +2559,7 @@ async fn plan_usage(db: &Database) -> Vec<serde_json::Value> {
     out
 }
 
-async fn admin_storage(user: User, db: Database) -> Result<impl Reply, Rejection> {
+async fn admin_storage(user: User, db: Database, databases: Option<Databases>) -> Result<impl Reply, Rejection> {
     if user.role != "root" {
         return Err(warp::reject::custom(Forbidden));
     }
@@ -2577,7 +2585,15 @@ async fn admin_storage(user: User, db: Database) -> Result<impl Reply, Rejection
             tables.push(json!({ "name": table, "rows": rows }));
         }
     }
-    Ok(warp::reply::json(&json!({
+    // Where each organization's content lives, and how current its schema is.
+    // An instance predating per-org databases has no registry, and a registry
+    // that cannot survey its files is a survey gap, not a broken storage page:
+    // either way the field is simply absent rather than a lie or an error.
+    let report = match &databases {
+        Some(registry) => registry.report().await.ok(),
+        None => None,
+    };
+    let mut body = json!({
         "db_bytes": db.db_size_bytes().await.unwrap_or(0),
         "free_bytes": db.free_bytes().await.unwrap_or(0),
         "blob_bytes": db.blob_bytes().await.unwrap_or(0),
@@ -2590,8 +2606,13 @@ async fn admin_storage(user: User, db: Database) -> Result<impl Reply, Rejection
             "plans": plan_usage(&db).await,
         }),
         "tables": tables,
-    }))
-    .into_response())
+    });
+    if let Some(report) = report {
+        if let Ok(value) = serde_json::to_value(report) {
+            body["databases"] = value;
+        }
+    }
+    Ok(warp::reply::json(&body).into_response())
 }
 
 /// Owner-only forced compaction. No external process should open the live DB.
@@ -2994,7 +3015,7 @@ mod permission_tests {
     /// Fetch a chat image as one session. The router is rebuilt per call:
     /// building a filter is cheap and it keeps the assertions one line each.
     async fn read_image(db: &Database, token: &str, id: i64) -> StatusCode {
-        let api = routes(db.clone(), Default::default(), Default::default())
+        let api = routes(db.clone(), Default::default(), Default::default(), None)
             .recover(crate::auth::handle_rejection);
         warp::test::request()
             .method("GET")
@@ -3027,7 +3048,7 @@ mod permission_tests {
             let user = db.get_user_by_email(email).await.unwrap().unwrap();
             db.create_session(token, user.id, now_secs() + 3600).await.unwrap();
         }
-        let api = routes(db.clone(), Default::default(), Default::default())
+        let api = routes(db.clone(), Default::default(), Default::default(), None)
             .recover(crate::auth::handle_rejection);
         let forbidden = warp::test::request().method("DELETE").path(&format!("/chat/{msg}"))
             .header("cookie", "authpad_session=second-token").reply(&api).await;

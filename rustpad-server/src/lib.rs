@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
@@ -13,7 +14,12 @@ use serde::Serialize;
 use tokio::time::{self, Instant};
 use warp::{filters::BoxedFilter, ws::Ws, Filter, Rejection, Reply};
 
-use crate::{board::BoardHub, database::Database, rustpad::Rustpad};
+use crate::{
+    board::BoardHub,
+    database::Database,
+    databases::Databases,
+    rustpad::Rustpad,
+};
 
 pub mod account;
 pub mod auth;
@@ -21,6 +27,7 @@ pub mod blobstore;
 mod board;
 pub mod crypto;
 pub mod database;
+pub mod databases;
 pub mod keystore;
 pub mod licence;
 mod ot;
@@ -180,6 +187,10 @@ pub struct ServerConfig {
     pub expiry_days: u32,
     /// Database object, for persistence if desired.
     pub database: Option<Database>,
+    /// The per-organization database registry the control database was paired
+    /// with at boot. `None` only in tests that build a server around a bare
+    /// database; boot always supplies it.
+    pub databases: Option<Databases>,
 }
 
 impl Default for ServerConfig {
@@ -187,6 +198,7 @@ impl Default for ServerConfig {
         Self {
             expiry_days: 1,
             database: None,
+            databases: None,
         }
     }
 }
@@ -257,13 +269,19 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         .clone()
         .expect("AuthPad requires a database; set SQLITE_URI");
 
+    let databases = config.databases.clone();
     let state = ServerState {
         documents: Default::default(),
         boards: Default::default(),
         database: config.database,
     };
     tokio::spawn(cleaner(state.clone(), config.expiry_days));
-    tokio::spawn(scheduled_maintenance(db.clone()));
+    tokio::spawn(scheduled_maintenance(
+        db.clone(),
+        databases.clone(),
+        state.documents.clone(),
+        state.boards.clone(),
+    ));
 
     let live = state.documents.clone();
     let boards = state.boards.clone();
@@ -272,8 +290,11 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
     // Public auth endpoints (login / logout / me).
     let auth_routes = auth::routes(db.clone());
     // Handlers share the live editor registry so hard deletes can disconnect
-    // editors and downloads/copies can read unsaved OT snapshots.
-    let workspace_routes = workspace::routes(db.clone(), live.clone(), boards.clone());
+    // editors and downloads/copies can read unsaved OT snapshots. The database
+    // registry rides along because the storage page reports where every
+    // organization's content actually lives.
+    let workspace_routes =
+        workspace::routes(db.clone(), live.clone(), boards.clone(), databases);
     let account_routes = account::routes(db.clone(), live, boards);
 
     // A plain db filter used by the document access checks below.
@@ -504,7 +525,12 @@ const HOUR: Duration = Duration::from_secs(3600);
 /// Runs on the server, not from a separate Docker cron/sidecar, so the same
 /// housekeeping applies to the one-container image and bare-metal installs.
 /// First run is delayed to let migrations/bootstrap finish and serve traffic.
-async fn scheduled_maintenance(db: Database) {
+async fn scheduled_maintenance(
+    db: Database,
+    databases: Option<Databases>,
+    documents: LiveDocs,
+    boards: LiveBoards,
+) {
     time::sleep(Duration::from_secs(5 * 60)).await;
     let retention = std::env::var("CORTEX_AUDIT_RETENTION_DAYS")
         .ok()
@@ -526,8 +552,34 @@ async fn scheduled_maintenance(db: Database) {
             ),
             Err(e) => error!("scheduled maintenance failed: {e}"),
         }
+        if let Some(registry) = &databases {
+            let busy = busy_orgs(&db, &documents, &boards).await;
+            registry.close_idle(|org| busy.contains(&org)).await;
+        }
         time::sleep(HOUR * 24).await;
     }
+}
+
+/// The organizations whose content is open in an editor right now.
+///
+/// A document is named by its id and a whiteboard by its file id, so both are
+/// asked the same question the rest of the server asks — which org owns it —
+/// rather than assumed to be the requester's. Whatever the answer, an org with
+/// a live editor keeps its database open: closing it would drop the pool a
+/// persister is about to write through.
+async fn busy_orgs(db: &Database, documents: &LiveDocs, boards: &LiveBoards) -> HashSet<i64> {
+    let mut orgs = HashSet::new();
+    for entry in documents.iter() {
+        if let Ok(Some(org)) = db.org_of_doc(entry.key()).await {
+            orgs.insert(org);
+        }
+    }
+    for entry in boards.iter() {
+        if let Ok(Some(org)) = db.file_org(*entry.key()).await {
+            orgs.insert(org);
+        }
+    }
+    orgs
 }
 
 /// Reclaims memory for documents.

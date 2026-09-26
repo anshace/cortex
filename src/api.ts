@@ -570,6 +570,23 @@ export type StorageStats = {
   object_bytes: number;
   /** `inline` while bytes live in the database file, `fs` once they do not. */
   blob_backend: string;
+  /** Where each organization's content actually lives, and how current its
+   *  schema is. Absent on an instance that predates per-org databases. */
+  databases?: {
+    /** "single" (one database), "files" (one file per org), or "memory". */
+    mode: string;
+    /** The schema version this binary's migrations produce. */
+    expected_version: number;
+    orgs: {
+      org_id: number;
+      uri: string;
+      schema_version: number;
+      /** True when this org's database is behind the running binary. */
+      behind: boolean;
+      size_bytes: number;
+      documents: number;
+    }[];
+  };
   /** Whether this instance checks plans at all, and one row per org. */
   licence: { enforcing: boolean; plans: OrgPlan[] };
   tables: { name: string; rows: number }[];

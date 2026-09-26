@@ -1165,6 +1165,43 @@ function OwnerApp({
                       )}
                     </Box>
                   )}
+                  {/* Where an organization's bytes physically live is an
+                      operational fact, and a schema left behind by an update is
+                      the failure nobody notices until a tenant cannot open a
+                      file. */}
+                  {storage?.databases && (
+                    <Box mt={3} pt={3} borderTop="1px solid" borderColor="surface.border">
+                      <Text textStyle="eyebrow" color="ink.subtle" mb={2}>
+                        Databases
+                      </Text>
+                      <KV
+                        label="Layout"
+                        value={
+                          storage.databases.mode === "single"
+                            ? "one database · schema " + storage.databases.expected_version
+                            : `${storage.databases.mode} · one per org · schema ${storage.databases.expected_version}`
+                        }
+                        hue={storage.databases.mode === "single" ? "state.info" : "state.ok"}
+                      />
+                      {storage.databases.mode === "single" ? (
+                        <Text fontSize="11px" color="ink.subtle" mt={2} lineHeight={1.55}>
+                          Every organization's content shares the control database, so
+                          backing up one file backs up everything. Set{" "}
+                          <Text as="span" fontFamily="mono">CORTEX_ORG_DBS=1</Text> to
+                          give each org its own database file.
+                        </Text>
+                      ) : (
+                        storage.databases.orgs.map((o) => (
+                          <KV
+                            key={o.org_id}
+                            label={`org ${o.org_id}${o.behind ? " · behind" : ""}`}
+                            value={`${o.schema_version} · ${o.documents} docs · ${humanBytes(o.size_bytes)}`}
+                            hue={o.behind ? "state.warn" : "brand.400"}
+                          />
+                        ))
+                      )}
+                    </Box>
+                  )}
                 </Box>
               </Flex>
             </Card>

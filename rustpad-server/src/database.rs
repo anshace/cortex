@@ -5,6 +5,7 @@
 //! org membership; the root owner bypasses org checks (full cross-org access).
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -440,6 +441,12 @@ fn wall_now() -> i64 {
 #[derive(Clone, Debug)]
 pub struct Database {
     pool: SqlitePool,
+    /// The URI this pool was opened with, kept because a database's *file* is
+    /// something an operator asks about (its size) and a pool cannot report it.
+    uri: String,
+    /// Identity of the pool behind this handle. Clones share it; two databases
+    /// opened separately never do, even when they name the same file.
+    pool_id: Arc<u64>,
     maintenance_lock: Arc<tokio::sync::Mutex<()>>,
     auth: Arc<AuthCache>,
     /// Where binary content lives: inline in the row, or as an object the row
@@ -449,6 +456,9 @@ pub struct Database {
     /// counted until the write that count authorized has landed.
     quota_locks: Arc<dashmap::DashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
 }
+
+/// Hands every opened database an identity no other database can share.
+static POOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // These helpers share the caller's transaction. File content, chats, reactions
 // and membership must disappear together or not at all (including on old DBs).
@@ -585,9 +595,42 @@ impl Database {
         Self::open_with(uri, blobs).await
     }
 
+    /// Open an organization's database.
+    ///
+    /// Identical to a control database in every mechanical way — same pool
+    /// construction, same embedded migrations, same blob backend — and different
+    /// in exactly the ways that only make sense for the identity store: the
+    /// three boot repairs (sealing TOTP seeds, recording inline sizes,
+    /// backfilling the routing index) do not run, because an org database holds
+    /// no credentials to seal and the routing index is a control-plane claim
+    /// about *other* databases. The process's object store is reused rather than
+    /// re-chosen: `blobstore::init` has already decided where bytes live, and a
+    /// second decision would put an org's content somewhere the control plane
+    /// then cannot find.
+    pub(crate) async fn open_org(uri: &str) -> Result<Self> {
+        Self::open_pool(uri, crate::blobstore::store().clone(), false).await
+    }
+
     /// Open a database against an explicit blob backend. Tests use this to
     /// exercise the object path without touching the process environment.
     async fn open_with(uri: &str, blobs: BlobStore) -> Result<Self> {
+        let db = Self::open_pool(uri, blobs, true).await?;
+        db.seal_existing_totp().await?;
+        db.record_inline_sizes().await?;
+        db.backfill_doc_routing().await?;
+        log::info!("blob storage backend: {}", db.blobs.mode());
+        Ok(db)
+    }
+
+    /// Pool, migrations, data key: everything a handle needs to be usable, and
+    /// nothing that reads or rewrites the rows it contains.
+    ///
+    /// `control_plane` decides whether this process's data key is established
+    /// here. The key exists to seal credentials, and credentials are a control
+    /// plane concern — an organization database has none, and asking for its key
+    /// would mean writing a sidecar next to a database that may not have a file
+    /// at all.
+    async fn open_pool(uri: &str, blobs: BlobStore, control_plane: bool) -> Result<Self> {
         // The migrator and *every* pooled connection need the same pragmas.
         // WAL allows readers to continue during edits; foreign keys stay ON
         // (SQLx's default). Only use WAL on a local disk, not a network share.
@@ -610,19 +653,106 @@ impl Database {
         sqlx::migrate!().run(&pool).await?;
         // The data key must exist before anything can be sealed, and the
         // backfill below needs it to move seeds that predate encryption.
-        keystore::ensure_for(uri).map_err(anyhow::Error::msg)?;
-        let db = Database {
+        if control_plane {
+            keystore::ensure_for(uri).map_err(anyhow::Error::msg)?;
+        }
+        Ok(Database {
             pool,
+            uri: uri.to_string(),
+            pool_id: Arc::new(POOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
             blobs,
             auth: Arc::default(),
             quota_locks: Arc::default(),
+        })
+    }
+
+    /// Reads go here. Naming the accessor instead of the field is what lets a
+    /// caller outside this module take a query without owning a pool.
+    pub fn read_only(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// Writes go here. SQLite has no read-replica topology, so this is the same
+    /// pool as [`Self::read_only`] under a name that says what the query does.
+    pub fn write(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// Whether two handles are served by one pool — the only honest way to ask
+    /// "is this the same database?" without comparing files, which a shared
+    /// in-memory database does not have.
+    pub fn shares_pool_with(&self, other: &Database) -> bool {
+        Arc::ptr_eq(&self.pool_id, &other.pool_id)
+    }
+
+    /// Bytes of the file backing this database.
+    ///
+    /// A memory database has no file, and reporting that as an error would make
+    /// every caller that sizes a database fail on exactly the installations
+    /// (read-only root filesystem) that deliberately chose memory. So: zero.
+    pub async fn file_size(&self) -> Result<i64> {
+        let Some(path) = self.file_path() else {
+            return Ok(0);
         };
-        db.seal_existing_totp().await?;
-        db.record_inline_sizes().await?;
-        db.backfill_doc_routing().await?;
-        log::info!("blob storage backend: {}", db.blobs.mode());
-        Ok(db)
+        // A database that was never written has no file yet; that is a size of
+        // zero, not a missing database.
+        Ok(tokio::fs::metadata(&path).await.map(|m| m.len() as i64).unwrap_or(0))
+    }
+
+    /// The path half of a URI, if this database is a file at all. Mirrors how
+    /// SQLx parses one (`sqlite://` prefix, then the path, then `?` params).
+    fn file_path(&self) -> Option<PathBuf> {
+        let uri = self
+            .uri
+            .trim_start_matches("sqlite://")
+            .trim_start_matches("sqlite:");
+        let (path, params) = uri.split_once('?').unwrap_or((uri, ""));
+        if path == ":memory:" || params.contains("mode=memory") {
+            return None;
+        }
+        Some(PathBuf::from(path))
+    }
+
+    /// Documents the routing index says this organization owns.
+    pub async fn count_documents_of(&self, org_id: i64) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM doc_org WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
+    }
+
+    /// Replicate one identity row into this database as display data.
+    ///
+    /// The org database needs real `users` rows because its own foreign keys
+    /// (`workspace.owner_id`, `group_member.user_id`, `message.sender_id`) point
+    /// at `users`, and SQLite cannot satisfy a foreign key across a database
+    /// boundary. What arrives is name and role: the email is a placeholder and
+    /// the password hash is `!`, a value bcrypt can never verify, so a leaked
+    /// tenant file yields no credential to attack. Updating on conflict touches
+    /// display columns only — a projection never overwrites a real account.
+    pub async fn upsert_member(
+        &self,
+        id: i64,
+        email: &str,
+        name: &str,
+        role: &str,
+        org_id: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO users (id, email, password_hash, role, name, org_id)
+               VALUES ($1, $2, '!', $3, $4, $5)
+               ON CONFLICT(id) DO UPDATE SET name = excluded.name, role = excluded.role"#,
+        )
+        .bind(id)
+        .bind(email)
+        .bind(role)
+        .bind(name)
+        .bind(org_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Move an imported row's inline bytes into this install's object store.
@@ -2396,14 +2526,13 @@ impl Database {
     /// The lock that serializes one organization's storage accounting. Distinct
     /// organizations never wait on each other.
     fn quota_gate(&self, org_id: i64) -> Arc<tokio::sync::Mutex<()>> {
-        if let Some(existing) = self.quota_locks.get(&org_id) {
-            return existing.clone();
-        }
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        // A racing insert is harmless: either lock serializes the same way, and
-        // the loser's gate is dropped unused.
-        self.quota_locks.insert(org_id, gate.clone());
-        gate
+        // `entry`, not get-then-insert: two racing callers that both miss the
+        // map would otherwise each create their own mutex, each insert over the
+        // other, and serialize nothing at all.
+        self.quota_locks
+            .entry(org_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Measure what an organization holds and decide whether `add` more bytes
@@ -4275,6 +4404,24 @@ mod tests {
         assert!(
             db.org_content_bytes(org).await.unwrap() <= limit,
             "stored bytes never pass the plan's ceiling"
+        );
+    }
+
+    /// The structural half of the same guarantee, with no timing in it: an
+    /// organization must always be handed *the same* lock, and a different
+    /// organization must not be handed that one.
+    #[tokio::test]
+    async fn one_organization_always_gets_the_same_storage_lock() {
+        use std::sync::Arc;
+        let (_tmp, db) = test_database().await;
+        let (org, _) = seed_routed_workspace(&db).await;
+        assert!(
+            Arc::ptr_eq(&db.quota_gate(org), &db.quota_gate(org)),
+            "two callers that race the first use must not get two different locks"
+        );
+        assert!(
+            !Arc::ptr_eq(&db.quota_gate(org), &db.quota_gate(org + 1)),
+            "another organization must not queue behind this one's uploads"
         );
     }
 }
