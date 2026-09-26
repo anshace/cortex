@@ -54,7 +54,6 @@ async fn test_single_operation() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "premise no longer holds: an operation that cannot apply to the document does not close the socket — the server answers with a frame and keeps the connection. Whether silently ignoring a bad operation is intended is an owner decision, so this test asserts neither behaviour yet"]
 async fn test_invalid_operation() -> Result<()> {
     pretty_env_logger::try_init().ok();
     let config = sqlite_config(1).await;
@@ -66,12 +65,22 @@ async fn test_invalid_operation() -> Result<()> {
     let mut client = connect(&filter, "foobar").await?;
     let msg = client.recv().await?;
     assert_eq!(msg, json!({ "Identity": 0 }));
+    // The joiner is replayed the persisted document's baseline before anything
+    // else; take it explicitly, because the client below is never answered.
+    assert_eq!(
+        client.recv_frame().await?,
+        json!({
+            "History": {
+                "start": 0,
+                "operations": [{ "id": u64::MAX as usize, "operation": [] }]
+            }
+        })
+    );
 
     let mut operation = OperationSeq::default();
-    // A persisted document always carries one synthetic baseline operation, so
-    // revision 1 is legal here. What the server really rejects is an operation
-    // that cannot apply to the text it was sent against: this one reaches past
-    // an empty document.
+    // A document that has never been edited still holds that one baseline
+    // operation, so revision 1 is the current revision and this edit is the one
+    // the server rejects: it reaches past the end of an empty document.
     operation.retain(5);
     operation.delete(3);
     let msg = json!({
@@ -88,7 +97,7 @@ async fn test_invalid_operation() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "sender-side offsets are corrected (a History frame reports the revision after the edit), but the joining client receives the persisted document's baseline operation inside its first History frame, so its expected operation list has to count that baseline"]
+#[ignore = "the server rejects a client that edits before seeing the document's history: an empty document's baseline operation is degenerate, and the transform crate cannot transform against an empty operation, so the joiner is disconnected instead of merged. That is defect #32, not a stale assertion — do not weaken this test to accept the close"]
 async fn test_concurrent_transform() -> Result<()> {
     pretty_env_logger::try_init().ok();
     let config = sqlite_config(1).await;
@@ -172,14 +181,16 @@ async fn test_concurrent_transform() -> Result<()> {
     info!("sending ClientMsg {}", msg);
     client2.send(&msg).await;
 
-    // Receive the existing history
+    // Receive the existing history: the persisted document's baseline
+    // operation, then both edits the first client made.
     let msg = client2.recv().await?;
     assert_eq!(
         msg,
         json!({
             "History": {
-                "start": 1,
+                "start": 0,
                 "operations": [
+                    { "id": u64::MAX as usize, "operation": [] },
                     { "id": 0, "operation": ["hello"] },
                     { "id": 0, "operation": [2, "n", -1, 2] }
                 ]
@@ -190,7 +201,7 @@ async fn test_concurrent_transform() -> Result<()> {
     // Expect to receive a transformed operation
     let transformed_op = json!({
         "History": {
-            "start": 2,
+            "start": 3,
             "operations": [
                 { "id": 1, "operation": ["~rust~", 5] },
             ]
