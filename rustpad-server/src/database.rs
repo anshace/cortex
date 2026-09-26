@@ -2601,7 +2601,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
         let (text,): (i64,) = sqlx::query_as(
-            r#"SELECT COALESCE(SUM(LENGTH(d.text)),0)
+            r#"SELECT COALESCE(SUM(LENGTH(CAST(d.text AS BLOB))),0)
                FROM document d
                JOIN file f ON f.doc_id = d.id AND f.kind = 'text'
                JOIN workspace w ON w.id = f.workspace_id
@@ -4522,6 +4522,39 @@ mod tests {
         assert!(
             !Database::is_missing_document(&unavailable),
             "an unreachable database must not be read as a document that is empty"
+        );
+    }
+
+    /// A storage plan is sold in bytes and `file.size` already reports bytes
+    /// (`LENGTH(CAST(text AS BLOB))`). The meter summed `LENGTH(text)`, which
+    /// counts characters, so an organization writing Cyrillic, accented Latin or
+    /// emoji was charged a fraction of what it stored, and the console disagreed
+    /// with the file list about the same document.
+    #[tokio::test]
+    async fn the_storage_meter_counts_utf8_bytes_not_characters() {
+        let (_tmp, db) = test_database().await;
+        let (org, ws) = seed_routed_workspace(&db).await;
+        let file = db
+            .create_file(ws, "unicode.md", "uni-doc", "text", None, 1)
+            .await
+            .unwrap();
+        let before = db.org_content_bytes(org).await.unwrap();
+
+        let text = "\u{e9}".repeat(100); // 100 characters, 200 UTF-8 bytes
+        db.store(
+            &file.doc_id,
+            &crate::database::PersistedDocument {
+                text,
+                language: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.org_content_bytes(org).await.unwrap() - before,
+            200,
+            "a byte ceiling measured in characters makes non-Latin content free"
         );
     }
 }
