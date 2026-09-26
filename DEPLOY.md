@@ -252,6 +252,19 @@ in, so an owner is never guessing why a seat or an upload was refused.
   directory logs a warning and stays inline. **When you turn this on, the object
   directory becomes part of every backup** — `.backup` of the `.db` alone no
   longer contains your users' files, though a console ZIP export still does.
+- **Per-organization databases.** `CORTEX_ORG_DBS=1` turns the storage page's
+  **Databases** section from "one database" into one row per organization, and
+  makes the server create and migrate each tenant's database at boot —
+  `CORTEX_ORG_DIR/org-<id>.db` (default `/data/orgs`), or a named shared-cache
+  memory database when the control database itself is `sqlite::memory:`. It also
+  replicates each organization's member *display* rows into that database, with
+  placeholder emails and a password hash that bcrypt can never verify: signing in
+  is always a control-plane operation. **Read the honest part:** today that flag
+  provisions, migrates and reports per-tenant databases; it does not yet move
+  document content into them, because requests are still served from the control
+  database. Turning it on does **not** give you tenant isolation, and the files
+  it creates are structure with no content — so do not delete them if you flip
+  the flag back off, and if you back up `/data` you are backing them up too.
 - If you later buy a real domain, point an A record at the Elastic IP and just
   change `DOMAIN=`.
 
