@@ -205,7 +205,9 @@ impl Databases {
         if let Some(cached) = self.inner.open.lock().await.remove(&org_id) {
             // `Pool::close` through the pool accessor: no further connections,
             // and idle ones dropped — that is what releases the file handle.
-            cached.db.read_only().close();
+            // It is async, so awaiting it is the whole point; not awaiting it
+            // leaves the close unsent.
+            cached.db.read_only().close().await;
         }
         let dir = match &self.inner.mode {
             Mode::Files(dir) => dir.clone(),
@@ -227,7 +229,7 @@ impl Databases {
                         break;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                    Err(e) if attempt < 4 => {
+                    Err(_e) if attempt < 4 => {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                     Err(e) => log::warn!("could not remove {}: {e}", path.display()),
