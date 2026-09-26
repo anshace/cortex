@@ -394,11 +394,54 @@ pub struct MaintenanceReport {
     pub pruned_audit: u64,
 }
 
+/// Seconds an identity answer may be served from memory when nothing has
+/// explicitly invalidated it. Short by design: it is the backstop for the few
+/// membership deletes that run inside free-function transaction helpers, which
+/// cannot reach the cache through `self`.
+const AUTH_TTL: i64 = 30;
+
+/// Read-through cache for the two questions nearly every request asks: which
+/// account owns this session token, and is this account a member of this group.
+///
+/// It is wiped wholesale by every identity write in this file rather than
+/// tracked per entry, because a stale authorization answer is a security bug and
+/// a forgotten invalidation must not be one. Natural session expiry is still
+/// honoured exactly — a cached session carries its own deadline, so only an
+/// administrative revocation depends on the wipe, and that is the case where
+/// immediacy matters.
+#[derive(Debug, Default)]
+struct AuthCache {
+    sessions: dashmap::DashMap<String, (User, i64)>,
+    members: dashmap::DashMap<(i64, i64), (bool, i64)>,
+    hits: std::sync::atomic::AtomicU64,
+}
+
+impl AuthCache {
+    fn wipe(&self) {
+        self.sessions.clear();
+        self.members.clear();
+    }
+
+    fn count_hit(&self) {
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Wall-clock seconds for cache lifetimes, independent of the `now` handlers pass
+/// around for auditing.
+fn wall_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// A driver for database operations wrapping a pool connection.
 #[derive(Clone, Debug)]
 pub struct Database {
     pool: SqlitePool,
     maintenance_lock: Arc<tokio::sync::Mutex<()>>,
+    auth: Arc<AuthCache>,
     /// Where binary content lives: inline in the row, or as an object the row
     /// names. Chosen once at boot and never re-decided per query.
     blobs: BlobStore,
@@ -503,6 +546,7 @@ impl Database {
             pool,
             maintenance_lock: Arc::new(tokio::sync::Mutex::new(())),
             blobs,
+            auth: Arc::default(),
         };
         db.seal_existing_totp().await?;
         db.record_inline_sizes().await?;
@@ -668,6 +712,7 @@ impl Database {
         role: &str,
         org_id: Option<i64>,
     ) -> Result<bool> {
+        self.auth.wipe();
         let result = sqlx::query(
             r#"INSERT INTO users (email, name, password_hash, role, org_id)
                VALUES ($1, $2, $3, $4, $5) ON CONFLICT(email) DO NOTHING"#,
@@ -703,6 +748,7 @@ impl Database {
 
     /// Update a user's display name.
     pub async fn update_name(&self, user_id: i64, name: &str) -> Result<()> {
+        self.auth.wipe();
         sqlx::query(r#"UPDATE users SET name = $1 WHERE id = $2"#)
             .bind(name)
             .bind(user_id)
@@ -714,6 +760,7 @@ impl Database {
     /// Change a user's login username (the `email` column). Returns Ok(false) if
     /// the username is already taken by someone else (the column is UNIQUE).
     pub async fn update_email(&self, user_id: i64, email: &str) -> Result<bool> {
+        self.auth.wipe();
         let taken: Option<(i64,)> =
             sqlx::query_as(r#"SELECT id FROM users WHERE email = $1 AND id <> $2"#)
                 .bind(email)
@@ -741,6 +788,7 @@ impl Database {
         password_hash: &str,
         keep_token: Option<&str>,
     ) -> Result<()> {
+        self.auth.wipe();
         let mut tx = self.pool.begin().await?;
         sqlx::query(r#"UPDATE users SET password_hash = $1 WHERE id = $2"#)
             .bind(password_hash)
@@ -760,6 +808,7 @@ impl Database {
     /// The seed is sealed before it is stored; a missing data key is an error,
     /// never a licence to write it in the clear.
     pub async fn set_totp_pending(&self, user_id: i64, secret: &str) -> Result<()> {
+        self.auth.wipe();
         let cipher = keystore::seal(keystore::TOTP, secret)
             .ok_or_else(|| anyhow::anyhow!("no data key available to seal a TOTP seed"))?;
         sqlx::query(
@@ -775,6 +824,7 @@ impl Database {
 
     /// Flip TOTP on after the first code is verified.
     pub async fn enable_totp(&self, user_id: i64) -> Result<()> {
+        self.auth.wipe();
         sqlx::query(r#"UPDATE users SET totp_enabled = 1 WHERE id = $1"#)
             .bind(user_id)
             .execute(&self.pool)
@@ -784,6 +834,7 @@ impl Database {
 
     /// Remove TOTP entirely (user turn-off, or owner recovery / break-glass reset).
     pub async fn clear_totp(&self, user_id: i64) -> Result<()> {
+        self.auth.wipe();
         sqlx::query(
             r#"UPDATE users SET totp_secret = NULL, totp_secret_cipher = NULL, totp_enabled = 0
                WHERE id = $1"#,
@@ -796,6 +847,7 @@ impl Database {
 
     /// Clear TOTP for every root/owner account. Host-level break-glass on boot.
     pub async fn clear_totp_for_roots(&self) -> Result<u64> {
+        self.auth.wipe();
         let r = sqlx::query(
             r#"UPDATE users SET totp_secret = NULL, totp_secret_cipher = NULL, totp_enabled = 0
                WHERE role = 'root'"#,
@@ -807,6 +859,7 @@ impl Database {
 
     /// Create a session row.
     pub async fn create_session(&self, token: &str, user_id: i64, expires_at: i64) -> Result<()> {
+        self.auth.wipe();
         sqlx::query(r#"INSERT INTO session (token, user_id, expires_at) VALUES ($1, $2, $3)"#)
             .bind(token)
             .bind(user_id)
@@ -818,20 +871,49 @@ impl Database {
 
     /// Resolve a session token to its user, only if the session is unexpired.
     pub async fn get_session_user(&self, token: &str, now: i64) -> Result<Option<User>> {
-        sqlx::query_as(
-            r#"SELECT u.id, u.email, u.name, u.password_hash, u.role, u.org_id, u.totp_secret_cipher, u.totp_enabled
+        use sqlx::Row;
+        if let Some(entry) = self.auth.sessions.get(token) {
+            let (user, valid_until) = entry.value();
+            if now < *valid_until {
+                self.auth.count_hit();
+                return Ok(Some(user.clone()));
+            }
+        }
+        let row = sqlx::query(
+            r#"SELECT u.id, u.email, u.name, u.password_hash, u.role, u.org_id,
+                      u.totp_secret_cipher, u.totp_enabled, s.expires_at AS session_expires_at
                FROM session s JOIN users u ON u.id = s.user_id
                WHERE s.token = $1 AND s.expires_at > $2"#,
         )
         .bind(token)
         .bind(now)
         .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| e.into())
+        .await?;
+        let Some(row) = row else {
+            self.auth.sessions.remove(token);
+            return Ok(None);
+        };
+        let session_expires_at: i64 = row.try_get("session_expires_at")?;
+        let user = User {
+            id: row.try_get("id")?,
+            email: row.try_get("email")?,
+            name: row.try_get("name")?,
+            password_hash: row.try_get("password_hash")?,
+            role: row.try_get("role")?,
+            org_id: row.try_get("org_id")?,
+            totp_secret_cipher: row.try_get("totp_secret_cipher")?,
+            totp_enabled: row.try_get("totp_enabled")?,
+        };
+        self.auth.sessions.insert(
+            token.to_string(),
+            (user.clone(), session_expires_at.min(now + AUTH_TTL)),
+        );
+        Ok(Some(user))
     }
 
     /// Delete all expired sessions (housekeeping, run on login).
     pub async fn purge_expired_sessions(&self, now: i64) -> Result<()> {
+        self.auth.wipe();
         sqlx::query(r#"DELETE FROM session WHERE expires_at <= $1"#)
             .bind(now)
             .execute(&self.pool)
@@ -841,6 +923,7 @@ impl Database {
 
     /// Delete a session (logout).
     pub async fn delete_session(&self, token: &str) -> Result<()> {
+        self.auth.wipe();
         sqlx::query(r#"DELETE FROM session WHERE token = $1"#)
             .bind(token)
             .execute(&self.pool)
@@ -896,6 +979,7 @@ impl Database {
         new_org: Option<Option<i64>>,
         scope: Option<i64>,
     ) -> Result<bool> {
+        self.auth.wipe();
         let mut tx = self.pool.begin().await?;
         let r = sqlx::query(
             "UPDATE users SET email = COALESCE($1, email), name = COALESCE($2, name), role = COALESCE($3, role), \
@@ -934,6 +1018,7 @@ impl Database {
         password_hash: Option<&str>,
         scope: Option<i64>,
     ) -> Result<bool> {
+        self.auth.wipe();
         let mut tx = self.pool.begin().await?;
         let r = if let Some(hash) = password_hash {
             sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2 AND role != 'root' AND ($3 IS NULL OR org_id = $3)")
@@ -966,6 +1051,7 @@ impl Database {
     /// root owner as their custodian; their chat/DM history by this user is
     /// erased. Return deleted personal document IDs for live eviction.
     pub async fn admin_delete_user(&self, id: i64, scope: Option<i64>) -> Result<Vec<String>> {
+        self.auth.wipe();
         let mut tx = self.pool.begin().await?;
         let target: Option<(String, Option<i64>)> =
             sqlx::query_as("SELECT role, org_id FROM users WHERE id = $1")
@@ -1089,6 +1175,7 @@ impl Database {
     /// Remove all org data and unassign its users in one transaction. Returns
     /// document IDs so no WebSocket can keep writing after the deletion.
     pub async fn delete_org(&self, id: i64) -> Result<Vec<String>> {
+        self.auth.wipe();
         let mut tx = self.pool.begin().await?;
         let groups: Vec<(i64,)> = sqlx::query_as("SELECT id FROM groups WHERE org_id = $1")
             .bind(id)
@@ -1163,6 +1250,7 @@ impl Database {
         now: i64,
         scope: &str,
     ) -> Result<Group> {
+        self.auth.wipe();
         let mut tx = self.pool.begin().await?;
         let row: (i64,) = sqlx::query_as(
             r#"INSERT INTO groups (org_id, name, scope, created_by, created_at)
@@ -1246,6 +1334,7 @@ impl Database {
 
     /// Add a member to a group (no-op when already a member).
     pub async fn add_group_member(&self, group_id: i64, user_id: i64, role: &str) -> Result<()> {
+        self.auth.wipe();
         sqlx::query(
             r#"INSERT OR IGNORE INTO group_member (group_id, user_id, role)
                VALUES ($1, $2, $3)"#,
@@ -1260,6 +1349,7 @@ impl Database {
 
     /// Remove a member from a group.
     pub async fn remove_group_member(&self, group_id: i64, user_id: i64) -> Result<()> {
+        self.auth.wipe();
         sqlx::query(
             r#"DELETE FROM group_member WHERE group_id = $1 AND user_id = $2"#,
         )
@@ -1272,6 +1362,15 @@ impl Database {
 
     /// True when the user is a member of the group (group scope).
     pub async fn is_group_member(&self, group_id: i64, user_id: i64) -> Result<bool> {
+        let key = (group_id, user_id);
+        let now = wall_now();
+        if let Some(entry) = self.auth.members.get(&key) {
+            let (member, valid_until) = entry.value();
+            if now < *valid_until {
+                self.auth.count_hit();
+                return Ok(*member);
+            }
+        }
         let row: (i64,) = sqlx::query_as(
             r#"SELECT count(*) FROM group_member WHERE group_id = $1 AND user_id = $2"#,
         )
@@ -1279,7 +1378,9 @@ impl Database {
         .bind(user_id)
         .fetch_one(&self.pool)
         .await?;
-        Ok(row.0 > 0)
+        let member = row.0 > 0;
+        self.auth.members.insert(key, (member, now + AUTH_TTL));
+        Ok(member)
     }
 
     /// Member user-ids of a group (empty for other scopes).
@@ -2180,6 +2281,13 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
         Ok(files + images)
+    }
+
+    /// How many identity answers came from cache rather than the database. A
+    /// number worth seeing in the console, because a cache that never hits is
+    /// only a stale-read risk.
+    pub fn auth_cache_hits(&self) -> u64 {
+        self.auth.hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Which backend content is kept in, for the owner console: `inline` while
@@ -3377,6 +3485,49 @@ mod tests {
         assert_eq!(db.org_content_bytes(2).await.unwrap(), 0);
         assert!(db.org_user_count(2).await.unwrap() == 0);
         let _ = owner;
+    }
+
+#[tokio::test]
+    async fn revoking_a_session_beats_the_identity_cache() {
+        let (_tmp, db) = test_database_inline().await;
+        db.create_user_if_absent("member", "Member", "hash", "user", Some(1))
+            .await
+            .unwrap();
+        let member = db.get_user_by_email("member").await.unwrap().unwrap();
+        db.create_org("Org", "org", 1).await.unwrap();
+        db.create_session("keep", member.id, 9_999_999_999).await.unwrap();
+        db.create_session("drop", member.id, 9_999_999_999).await.unwrap();
+
+        // Both resolutions are now cached, well inside their own expiry, so a
+        // lookup after revocation can only return None if the write wiped them.
+        assert!(db.get_session_user("drop", 1_000).await.unwrap().is_some());
+        assert!(db.get_session_user("keep", 1_000).await.unwrap().is_some());
+        db.update_password(member.id, "newhash", Some("keep")).await.unwrap();
+
+        assert!(db.get_session_user("drop", 1_000).await.unwrap().is_none());
+        assert!(db.get_session_user("keep", 1_000).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn removing_a_member_beats_the_membership_cache() {
+        let (_tmp, db) = test_database_inline().await;
+        let (owner, _ws) = seed_workspace(&db).await;
+        db.create_user_if_absent("viewer", "Viewer", "hash", "user", Some(1))
+            .await
+            .unwrap();
+        let viewer = db.get_user_by_email("viewer").await.unwrap().unwrap();
+        let group = db.create_group(1, "Team", owner, 1, "group").await.unwrap();
+
+        db.add_group_member(group.id, viewer.id, "user").await.unwrap();
+        assert!(db.is_group_member(group.id, viewer.id).await.unwrap());
+        assert!(db.is_group_member(group.id, viewer.id).await.unwrap(), "second read is cached");
+
+        db.remove_group_member(group.id, viewer.id).await.unwrap();
+        assert!(
+            !db.is_group_member(group.id, viewer.id).await.unwrap(),
+            "the cache must not keep a revoked membership alive"
+        );
+        assert!(db.auth_cache_hits() > 0, "the cache is actually being used");
     }
 
     #[tokio::test]
