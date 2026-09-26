@@ -1385,6 +1385,19 @@ async fn create_file(user: User, db: Database, body: CreateFile) -> Result<impl 
         None => return Ok(err(StatusCode::BAD_REQUEST, "invalid file name")),
     };
     let doc_id = random_doc_id();
+    // Whiteboards are a plan capability, and the file tree can start one here as
+    // easily as an upload can, so both doors have to check.
+    if path.to_ascii_lowercase().ends_with(".board") {
+        if let Some(org) = user.org_id {
+            let plan = crate::licence::plan_for(org, now_secs());
+            if !plan.allows("whiteboard", now_secs()) {
+                return Ok(err(
+                    StatusCode::FORBIDDEN,
+                    "whiteboards are not part of this organization's plan",
+                ));
+            }
+        }
+    }
     match db
         .create_file(body.workspace_id, &path, &doc_id, "text", None, now_secs())
         .await
