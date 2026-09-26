@@ -26,9 +26,17 @@ npm run dev              # Vite dev server
 npm run check            # typecheck (tsc) — run before committing frontend changes
 npm run build            # production frontend build
 npm run format           # prettier --write .
+npm test                 # the gate: cargo test --workspace (all targets)
 cargo build --release    # build server (rustpad-server)
-cargo test --workspace   # Rust tests
+cargo test --workspace   # Rust tests — this one, not --lib
 ```
+
+`cargo test --lib` is faster and **compiles none of `rustpad-server/tests/`**, so
+quoting a `--lib` count as evidence about document or archive behaviour proves
+less than it looks — the whole `tests/` directory is currently skipped anyway
+(12 `#[ignore]`d WebSocket cases). Run the workspace gate, and re-run it *after*
+committing: a backgrounded agent can change the tree between the run and the
+commit, which is how a red commit once got through looking green.
 
 Rust requires a C linker — on Windows install the "Desktop development with C++"
 workload. WASM needs `wasm-pack` + `wasm32-unknown-unknown` target.
