@@ -1571,6 +1571,27 @@ async fn upload_file(
     // route, never edited as text. ponytail: 1 MB text cap keeps huge files out
     // of the in-memory OT model; raise it if real docs get truncated to binary.
     let is_board = filename.to_lowercase().ends_with(".board");
+    // Plan limits are checked where content is added. Only blob content is
+    // metered — document text lives in the OT tables and is not counted — so a
+    // plan bounds uploaded files and chat attachments.
+    if let Some(org) = user.org_id {
+        let plan = crate::licence::plan_for(org, now_secs());
+        if is_board && !plan.allows("whiteboard", now_secs()) {
+            return Ok(err(
+                StatusCode::FORBIDDEN,
+                "whiteboards are not part of this organization's plan",
+            ));
+        }
+        if plan.storage_bytes() < i64::MAX
+            && db.org_content_bytes(org).await.unwrap_or(0) + bytes.len() as i64
+                > plan.storage_bytes()
+        {
+            return Ok(err(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "this organization has used the storage in its plan",
+            ));
+        }
+    }
     let text = if !is_board && bytes.len() <= 1_000_000 {
         std::str::from_utf8(&bytes)
             .ok()
@@ -1641,6 +1662,21 @@ async fn put_file_blob(
         Some(revision) => revision,
         None => return Ok(err(StatusCode::BAD_REQUEST, "missing file revision")),
     };
+    // A rewrite is metered on its growth, so replacing a file with a smaller one
+    // never needs headroom the org no longer requires.
+    if let Some(org) = user.org_id {
+        let plan = crate::licence::plan_for(org, now_secs());
+        if plan.storage_bytes() < i64::MAX {
+            let used = db.org_content_bytes(org).await.unwrap_or(0);
+            let after = used - file.size + raw.len() as i64;
+            if after > plan.storage_bytes() {
+                return Ok(err(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "this organization has used the storage in its plan",
+                ));
+            }
+        }
+    }
     match db
         .store_blob_at_revision(file_id, &raw, expected_revision)
         .await
@@ -2481,6 +2517,12 @@ async fn admin_storage(user: User, db: Database) -> Result<impl Reply, Rejection
         "blob_bytes": db.blob_bytes().await.unwrap_or(0),
         "object_bytes": db.object_bytes().await.unwrap_or(0),
         "blob_backend": db.blob_backend(),
+        // Plans are per org and verified offline; the console shows what this
+        // deployment is enforcing so an owner is never guessing at a refusal.
+        "licence": json!({
+            "enforcing": crate::licence::enforcing(),
+            "plans": crate::licence::plans(),
+        }),
         "tables": tables,
     }))
     .into_response())

@@ -201,6 +201,37 @@ OWNER_2FA_RESET=1 DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.
 DOMAIN=<ELASTIC_IP>.sslip.io docker compose -f docker-compose.prod.yml up -d
 ```
 
+## Plans and licences (optional)
+
+A deployment can enforce per-organization limits — seats, content storage, and
+capabilities such as whiteboards — from a **signed licence verified offline**. It
+is entirely opt-in: with no key configured, nothing about plans runs, and a
+self-hosted install behaves as if it had no limits. That is deliberate; a product
+that phones home to check entitlement is a different product.
+
+```sh
+# once, on the machine that issues licences — the private key never ships
+cargo run --release --manifest-path rustpad-server/Cargo.toml --bin licence -- keygen
+#   prints a base64 private key (save as licence.key) and its hex public key
+
+# per organization, as long as you like
+cargo run --release --manifest-path rustpad-server/Cargo.toml --bin licence -- sign \
+  --key licence.key --org 7 --plan team --seats 25 --storage 100GB \
+  --features whiteboard,chat --exp 2027-01-01
+```
+
+Then on the deployment: `CORTEX_LICENCE_PUB` holds the hex public key, and
+`CORTEX_LICENCE` the token (comma-separated for several orgs). A licence is
+`payload.signature` over the base64 payload, so it cannot be edited — changing one
+bit of seats or expiry invalidates it — and a token naming another org can never
+be replayed against a different one.
+
+What happens on a bad input is the part worth knowing: an unreadable key or a
+forged, expired or missing licence **degrades to the free tier** and logs why; it
+never denies reads or export, because a plan is a billing control and not a remote
+wipe. The Storage tab of the owner console reports which regime the instance is
+in, so an owner is never guessing why a seat or an upload was refused.
+
 ## Notes
 
 - `COOKIE_SECURE=1` is set in the prod compose (session cookie is HTTPS-only).

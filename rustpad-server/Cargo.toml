@@ -22,6 +22,9 @@ operational-transform = { version = "0.6.0", features = ["serde"] }
 parking_lot = "0.11.1"
 pretty_env_logger = "0.4.0"
 rand = "0.8.3"
+# Already in the graph through rustls; used directly for Ed25519 licence
+# verification so plan checking adds no new dependency to the image.
+ring = "0.17"
 serde = { version = "1.0.126", features = ["derive"] }
 serde_json = "1.0.64"
 sqlx = { version = "0.6.3", features = ["runtime-tokio-rustls", "sqlite"] }

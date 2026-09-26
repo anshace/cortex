@@ -2147,6 +2147,41 @@ impl Database {
         Ok(a + b)
     }
 
+    /// Accounts in one org, which is what a plan's seat count is compared
+    /// against. Root accounts are excluded: they are the operator, not a tenant.
+    pub async fn org_user_count(&self, org_id: i64) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM users WHERE org_id = $1 AND role != 'root'",
+        )
+        .bind(org_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    /// Content bytes attributed to one org: file blobs plus chat attachments.
+    /// Reads `size` so it still counts content that has moved to the object store.
+    pub async fn org_content_bytes(&self, org_id: i64) -> Result<i64> {
+        let (files,): (i64,) = sqlx::query_as(
+            r#"SELECT COALESCE(SUM(COALESCE(b.size, LENGTH(b.data))),0)
+               FROM file_blob b
+               JOIN file f ON f.id = b.file_id
+               JOIN workspace w ON w.id = f.workspace_id
+               JOIN groups g ON g.id = w.group_id
+               WHERE g.org_id = $1"#,
+        )
+        .bind(org_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let (images,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(COALESCE(size, LENGTH(data))),0) FROM chat_image WHERE org_id = $1",
+        )
+        .bind(org_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(files + images)
+    }
+
     /// Which backend content is kept in, for the owner console: `inline` while
     /// bytes sit in the database file, `fs` once they live beside it.
     pub fn blob_backend(&self) -> &'static str {
@@ -2155,7 +2190,8 @@ impl Database {
 
     /// Content bytes that live outside the database file, and so are not covered
     /// by a backup of that file alone. Zero while the inline backend is active.
-    pub async fn object_bytes(&self) -> Result<i64> {        let mut total = 0;
+    pub async fn object_bytes(&self) -> Result<i64> {
+        let mut total = 0;
         for table in ["file_blob", "chat_image"] {
             let (n,): (i64,) = sqlx::query_as(&format!(
                 "SELECT COALESCE(SUM(size),0) FROM {table} WHERE storage_key IS NOT NULL"
@@ -3322,6 +3358,25 @@ mod tests {
         let mut wal = path.as_os_str().to_os_string();
         wal.push("-wal");
         std::path::PathBuf::from(wal)
+    }
+
+    #[tokio::test]
+    async fn org_usage_answers_are_the_numbers_a_plan_is_checked_against() {
+        let (_tmp, db) = test_database().await;
+        let (owner, ws) = seed_workspace(&db).await;
+        // The seeded owner is root, so it must not consume a seat.
+        assert_eq!(db.org_user_count(1).await.unwrap(), 0);
+        db.create_user_if_absent("dev1", "Dev One", "pw", "user", Some(1))
+            .await
+            .unwrap();
+        assert_eq!(db.org_user_count(1).await.unwrap(), 1);
+
+        add_binary(&db, ws, "a.bin", b"0123456789").await;
+        assert_eq!(db.org_content_bytes(1).await.unwrap(), 10);
+        // Content attributed to another org must not leak into this one's total.
+        assert_eq!(db.org_content_bytes(2).await.unwrap(), 0);
+        assert!(db.org_user_count(2).await.unwrap() == 0);
+        let _ = owner;
     }
 
     #[tokio::test]

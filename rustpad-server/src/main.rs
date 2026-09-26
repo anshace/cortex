@@ -1,9 +1,19 @@
-use rustpad_server::{auth, database::Database, server, ServerConfig};
+use rustpad_server::{auth, database::Database, licence, server, ServerConfig};
 
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().ok();
     pretty_env_logger::init();
+
+    // Plan claims are verified once at boot. Whether they mean anything at all is
+    // decided by the presence of a public key, so a self-hosted install with no
+    // licence configuration keeps behaving as if it had no plan.
+    licence::init(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or(0),
+    );
 
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| String::from("3030"))

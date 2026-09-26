@@ -487,6 +487,17 @@ async fn admin_create(user: User, db: Database, body: NewUserReq) -> Result<impl
         return Ok(err(StatusCode::FORBIDDEN, "cannot create users in another org"));
     }
     let org_id = scope.or(body.org_id);
+    // A plan caps seats per organization. Unlicensed installs report unlimited,
+    // so this only bites where a licence key is configured.
+    if let Some(org) = org_id {
+        let plan = crate::licence::plan_for(org, now_secs());
+        if plan.seats() < i64::MAX && db.org_user_count(org).await.unwrap_or(0) >= plan.seats() {
+            return Ok(err(
+                StatusCode::FORBIDDEN,
+                "this organization has used every seat in its plan",
+            ));
+        }
+    }
     match db.create_user_if_absent(&email, name, &hash, role, org_id).await {
         Ok(true) => {
             let _ = db.audit(org_id, Some(user.id), "admin_create_user", Some(&email), now_secs()).await;

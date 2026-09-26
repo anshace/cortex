@@ -547,6 +547,15 @@ export async function toggleReaction(
 }
 
 // ----- storage stats (owner / admin) -----
+/** One org's verified plan claims, as the deployment sees them. */
+export type PlanClaim = {
+  org: number;
+  plan: string;
+  seats: number;
+  storage_bytes: number;
+  features: string[];
+  exp: number;
+};
 export type StorageStats = {
   db_bytes: number;
   free_bytes: number;
@@ -555,6 +564,8 @@ export type StorageStats = {
   object_bytes: number;
   /** `inline` while bytes live in the database file, `fs` once they do not. */
   blob_backend: string;
+  /** Whether this instance checks plans at all, and the licences it accepted. */
+  licence: { enforcing: boolean; plans: PlanClaim[] };
   tables: { name: string; rows: number }[];
 };
 export type MaintenanceReport = {

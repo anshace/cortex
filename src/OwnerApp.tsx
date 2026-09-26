@@ -1128,6 +1128,37 @@ function OwnerApp({
                       <Text as="span" fontFamily="mono">.db</Text> backup does not.
                     </Text>
                   )}
+                  {/* Plans are enforced offline from a signed licence, so the
+                      console has to say which regime this instance is running in. */}
+                  {storage?.licence && (
+                    <Box mt={3} pt={3} borderTop="1px solid" borderColor="surface.border">
+                      <Text textStyle="eyebrow" color="ink.subtle" mb={2}>
+                        Plan
+                      </Text>
+                      {storage.licence.enforcing ? (
+                        storage.licence.plans.length ? (
+                          storage.licence.plans.map((p) => (
+                            <KV
+                              key={p.org}
+                              label={`${p.plan} · org ${p.org}`}
+                              value={`${p.seats >= Number.MAX_SAFE_INTEGER ? "∞" : p.seats} seats · ${humanBytes(p.storage_bytes)}`}
+                              hue="brand.400"
+                            />
+                          ))
+                        ) : (
+                          <Text fontSize="11px" color="ink.subtle" lineHeight={1.55}>
+                            A licence key is configured but no licence matched it —
+                            every org is on the free tier.
+                          </Text>
+                        )
+                      ) : (
+                        <Text fontSize="11px" color="ink.subtle" lineHeight={1.55}>
+                          No licence key on this instance, so plans are not enforced
+                          and limits are unlimited.
+                        </Text>
+                      )}
+                    </Box>
+                  )}
                 </Box>
               </Flex>
             </Card>
