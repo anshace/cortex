@@ -87,3 +87,29 @@ workload. WASM needs `wasm-pack` + `wasm32-unknown-unknown` target.
 - RESTORE ORDER: seed the DB first, THEN start the app.
 - Keep the box clock synced (`timedatectl set-ntp true`) or TOTP breaks (±30s).
 - Don't put tests that rewrite files in the committed tree.
+
+### Per-organization storage (measured, so it doesn't get re-derived)
+
+- **`ATTACH` caps at ten.** Attaching each tenant database into the control
+  connection would need no handler changes — SQLite answers the eleventh with
+  `too many attached databases - max 10`, and `SQLITE_MAX_ATTACHED` is a
+  compile-time constant. Don't build the ten-tenant ceiling into the storage
+  layer. Nothing in the tree uses `ATTACH`.
+- **Views and foreign keys don't cross databases.** `CREATE VIEW users AS SELECT
+  … FROM ctl.users` is rejected outright, and `workspace.owner_id`,
+  `group_member.user_id`, `message.sender_id` and `session.user_id` all declare
+  `REFERENCES users(id)`. That is why identity is *replicated* into a tenant
+  database as display data only (`member-<id>@org.local`, `password_hash = '!'`)
+  rather than referenced: authentication stays a control-plane operation and a
+  leaked tenant file authenticates nobody.
+- **`doc_org` shares a transaction with the content it indexes.** `route_doc_tx`
+  runs on the same `tx` as the `file`/`file_blob` inserts (database.rs:2070/2076,
+  :2137/2143). Once `file` is tenant-resident and `doc_org` is not, no SQLite
+  transaction spans them — so splitting storage is a design decision about which
+  guarantee survives, not a mechanical sweep. Resolve that before writing the
+  control/tenant method split.
+- **`cargo test --lib` proves nothing about the live document path.** It compiles
+  none of `rustpad-server/tests/`, and every test in there is `#[ignore]`d
+  (`warp::test` cannot complete a WS upgrade on a route that awaits auth). Gate
+  document/OT work with `cargo test --manifest-path rustpad-server/Cargo.toml`
+  across all targets, and read the ignored counts.
