@@ -3,14 +3,28 @@
   <head>
     <meta charset="utf-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <link rel="apple-touch-icon" href="/pwa-192.png" />
-    <meta name="theme-color" content="#14122a" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <!-- The browser chrome follows the app's own surface, not a brand purple the
+         theme no longer uses. The unqualified tag is the fallback for engines that
+         ignore media queries; the app boots dark, so dark is the fallback value. -->
+    <meta name="theme-color" content="#0a0b0e" />
+    <meta name="theme-color" content="#0a0b0e" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#fbfbfa" media="(prefers-color-scheme: light)" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Cortex" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Cortex</title>
     <meta name="description" content="Cortex — a private, collaborative workspace." />
 
+    <meta property="og:type" content="website" />
     <meta property="og:title" content="Cortex" />
     <meta property="og:description" content="Cortex — a private, collaborative workspace." />
+    <meta property="og:image" content="/pwa-512.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="/pwa-512.png" />
   </head>
   <body>
     <div id="root"></div>

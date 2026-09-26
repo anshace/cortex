@@ -3,6 +3,8 @@ import { defineConfig } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 import wasm from "vite-plugin-wasm";
 
+import { BRAND } from "./src/brand";
+
 // In Docker dev, the backend is another service ("backend"); locally it's
 // 127.0.0.1. Overridable via VITE_PROXY_TARGET.
 const proxyTarget = process.env.VITE_PROXY_TARGET || "http://127.0.0.1:3030";
@@ -19,25 +21,35 @@ export default defineConfig({
     wasm(),
     react(),
     VitePWA({
-      registerType: "autoUpdate",
+      registerType: "prompt",
       includeAssets: ["favicon.svg", "chat-bg.svg"],
       manifest: {
-        name: "Cortex",
-        short_name: "Cortex",
-        description: "Cortex — a private, collaborative workspace.",
-        theme_color: "#14122a",
-        background_color: "#0c0a1a",
+        id: "/",
+        name: BRAND.name,
+        short_name: BRAND.name,
+        description: BRAND.description,
+        // Matches surface.bg in src/theme.ts, which is what the first paint
+        // actually shows. A splash in a colour the app never renders reads as a
+        // different product for the half-second it is up.
+        theme_color: "#0a0b0e",
+        background_color: "#0a0b0e",
         display: "standalone",
-        start_url: ".",
+        orientation: "any",
+        scope: "/",
+        start_url: "/",
+        lang: "en",
+        categories: ["productivity", "business"],
+        prefer_related_applications: false,
         icons: [
-          { src: "pwa-192.png", sizes: "192x192", type: "image/png" },
-          { src: "pwa-512.png", sizes: "512x512", type: "image/png" },
+          { src: "pwa-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
+          { src: "pwa-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
           {
             src: "pwa-maskable-512.png",
             sizes: "512x512",
             type: "image/png",
             purpose: "maskable",
           },
+          { src: "apple-touch-icon.png", sizes: "180x180", type: "image/png" },
         ],
       },
       workbox: {
@@ -45,7 +57,20 @@ export default defineConfig({
         // cache those — only precache the built assets.
         navigateFallback: "index.html",
         navigateFallbackDenylist: [/^\/api\//],
-        runtimeCaching: [],
+        // The chat wallpapers are 2.3 MB of JPEG the average user never opens.
+        // Precaching them charges every install for them; instead they are
+        // cached on first use, so picking one offline still works afterwards.
+        globIgnores: ["**/wallpaper-*.jpg"],
+        runtimeCaching: [
+          {
+            urlPattern: /\/wallpaper-[a-z-]+\.jpg$/,
+            handler: "StaleWhileRevalidate",
+            options: {
+              cacheName: "wallpapers",
+              expiration: { maxEntries: 6, maxAgeSeconds: 60 * 60 * 24 * 30 },
+            },
+          },
+        ],
         // Monaco's ts.worker and the main/editor bundles exceed the default
         // 2 MiB precache limit; allow them so offline mode actually works.
         maximumFileSizeToCacheInBytes: 8 * 1024 * 1024,

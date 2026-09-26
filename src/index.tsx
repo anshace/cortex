@@ -19,6 +19,7 @@ import "rustpad-wasm";
 import AuthGate from "./AuthGate";
 import "./index.css";
 import theme from "./theme";
+import UpdateBanner from "./UpdateBanner";
 
 // Serve Monaco from our own bundle, not the jsdelivr CDN that @monaco-editor/react
 // loads by default — the CDN is blocked by our CSP and would break offline / on a
@@ -42,6 +43,7 @@ createRoot(document.getElementById("root")!).render(
     <ColorModeScript initialColorMode={theme.config.initialColorMode} />
     <ChakraProvider theme={theme}>
       <AuthGate />
+      <UpdateBanner />
     </ChakraProvider>
   </StrictMode>,
 );
