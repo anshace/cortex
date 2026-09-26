@@ -85,7 +85,9 @@ docker run --rm -v cortex_cortex-data:/data:ro -v "$HOME/backups:/out" \
 ```
 
 Back up the **data key** with the database: restoring a `.db` whose `.key` is gone
-leaves every enrolled account unable to pass 2FA.
+leaves every enrolled account unable to pass 2FA. If `BLOB_BACKEND=fs` is set, the
+`.blobs.tar` beside it is equally required — see *Backup & restore (WAL-safe)* in
+the runbook below for the restore side, which must put all three back.
 
 A backup schedule is optional and **not** needed for database cleanup. The Rust
 server runs maintenance itself (five minutes after startup, then every 24 hours):
@@ -323,10 +325,22 @@ sudo docker run --rm -v cortex-data:/data:ro -v "$HOME/backups:/out" alpine sh -
 # Restore an offline .db backup on a NEW box BEFORE first start:
 sudo docker run --rm -v cortex-data:/data -v "$HOME/backups:/in:ro" \
   alpine sh -c 'cp /in/authpad-YYYY-MM-DD.db /data/authpad.db && \
-    cp /in/authpad-YYYY-MM-DD.key /data/authpad.db.key'
+    cp /in/authpad-YYYY-MM-DD.key /data/authpad.db.key && \
+    { [ -f /in/authpad-YYYY-MM-DD.blobs.tar ] && \
+      tar -C /data -xf /in/authpad-YYYY-MM-DD.blobs.tar; }; true'
 sudo docker run --rm -v cortex-data:/data alpine chown -R 1000:1000 /data
 # Start the app only after the database is in place.
 ```
+
+**Objects are part of the restore, not an optional extra.** With
+`BLOB_BACKEND=fs` the database rows only *name* the content (`storage_key`), so a
+`.db` restored without its `blobs/` directory opens cleanly and every uploaded
+file, image and whiteboard reads as missing. The two travel together: back up
+`blobs` with the `.db`, restore `blobs` with the `.db`, and pass the same
+`BLOB_DIR=/data/blobs` the backup ran with — objects under a different root are
+the same failure. An owner **Export everything** ZIP needs neither: it carries
+content inline and re-homes it into `BLOB_DIR` on import, which is why a ZIP is
+the portable format and a raw `.db` is not.
 
 Alternatively, restore an owner ZIP from **Data → Import archive** on a test or
 fresh instance: it replaces application data transactionally and signs everyone
