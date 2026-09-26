@@ -755,6 +755,31 @@ impl Database {
         Ok(())
     }
 
+    /// Drop every member row this list does not authorize, so a tenant database
+    /// cannot outlive the control plane's decision about who belongs to it. An
+    /// empty list clears the table: no user is authorized into an organization
+    /// that has lost all of them.
+    pub async fn remove_members_not_in(&self, authorized: &[i64]) -> Result<u64> {
+        if authorized.is_empty() {
+            return Ok(sqlx::query("DELETE FROM users")
+                .execute(&self.pool)
+                .await?
+                .rows_affected());
+        }
+        // Built from integers only, and the values themselves travel as binds —
+        // there is no string in here for anyone but us to control.
+        let placeholders: Vec<String> = (1..=authorized.len()).map(|i| format!("${i}")).collect();
+        let sql = format!(
+            "DELETE FROM users WHERE id NOT IN ({})",
+            placeholders.join(", ")
+        );
+        let mut delete = sqlx::query(&sql);
+        for id in authorized {
+            delete = delete.bind(id);
+        }
+        Ok(delete.execute(&self.pool).await?.rows_affected())
+    }
+
     /// Move an imported row's inline bytes into this install's object store.
     /// Returns the row unchanged when there is nothing to rehome.
     fn rehome_content(&self, row: &serde_json::Value) -> Result<serde_json::Value> {

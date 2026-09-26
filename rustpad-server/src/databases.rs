@@ -302,9 +302,18 @@ async fn project_members(control: &Database, org: &Database, org_id: i64) -> Res
     .bind(org_id)
     .fetch_all(control.read_only())
     .await?;
+    let authorized: Vec<i64> = rows.iter().map(|(id, ..)| *id).collect();
     for (id, name, role) in rows {
         org.upsert_member(id, &format!("member-{id}@org.local"), &name, &role, org_id)
             .await?;
+    }
+    // Additions alone leave a tenant database ahead of reality in the only way
+    // that matters: a member who left, or moved to another organization, keeps
+    // their row here forever, and this is the table the tenant's own foreign
+    // keys resolve against. Prune to exactly who the control plane authorizes.
+    let removed = org.remove_members_not_in(&authorized).await?;
+    if removed > 0 {
+        log::info!("pruned {removed} unauthorized member row(s) from org {org_id}'s database");
     }
     Ok(())
 }
@@ -520,6 +529,36 @@ mod tests {
             registry.migrate_all().await.unwrap(),
             0,
             "one database, migrated at boot by its own constructor"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_who_left_the_org_is_pruned_from_its_database() {
+        let (_t, control) = control().await;
+        add_org(&control, 9).await;
+        add_org(&control, 10).await;
+        add_member(&control, 41, 9).await;
+        add_member(&control, 42, 9).await;
+        let registry = split(control.clone(), Mode::Memory);
+        let org = registry.org(9).await.unwrap();
+
+        // The control plane changes its mind; the tenant database must follow,
+        // which a projection that only ever adds rows cannot do.
+        sqlx::query("UPDATE users SET org_id = 10 WHERE id = 42")
+            .execute(control.write())
+            .await
+            .unwrap();
+        add_member(&control, 43, 9).await;
+        registry.migrate_all().await.unwrap();
+
+        let ids: Vec<(i64,)> = sqlx::query_as("SELECT id FROM users ORDER BY id")
+            .fetch_all(org.read_only())
+            .await
+            .unwrap();
+        assert_eq!(
+            ids.into_iter().map(|(id,)| id).collect::<Vec<_>>(),
+            vec![41, 43],
+            "a tenant holds exactly who the control plane authorizes today"
         );
     }
 }
