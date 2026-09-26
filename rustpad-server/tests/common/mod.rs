@@ -91,6 +91,25 @@ impl JsonSocket {
     }
 
     pub async fn recv(&mut self) -> Result<Value> {
+        loop {
+            let msg = self.recv_frame().await?;
+            // `send_initial` replays the document's state to every joiner: a
+            // baseline `History` for a persisted document (whose single
+            // synthetic operation carries no author, so its id is the max
+            // `usize`), plus `UserInfo`/`UserCursor` for people already in the
+            // room. Those are not the messages these suites are about, and
+            // their count depends on who else is connected, so a strict
+            // one-for-each read cannot express an OT assertion. `Language` is
+            // deliberately not skipped: several tests assert it.
+            if is_initial_state(&msg) {
+                continue;
+            }
+            return Ok(msg);
+        }
+    }
+
+    /// The next frame, exactly as the server sent it, with nothing skipped.
+    pub async fn recv_frame(&mut self) -> Result<Value> {
         let msg = self.client.recv().await?;
         let text = msg.to_str().map_err(|_| anyhow!("non-string message"))?;
         let env: rustpad_server::crypto::Envelope = serde_json::from_str(text)?;
@@ -101,6 +120,23 @@ impl JsonSocket {
     pub async fn recv_closed(&mut self) -> Result<()> {
         self.client.recv_closed().await.map_err(|e| e.into())
     }
+}
+
+/// Frames `send_initial` replays to a joiner before any live traffic: the
+/// document's baseline history and the presence state of people already in the
+/// room. A baseline operation has no author, so its id is the maximum `usize`.
+fn is_initial_state(msg: &Value) -> bool {
+    if let Some(ops) = msg
+        .get("History")
+        .and_then(|h| h.get("operations"))
+        .and_then(|o| o.as_array())
+    {
+        return !ops.is_empty()
+            && ops
+                .iter()
+                .all(|op| op.get("id").and_then(|id| id.as_u64()) == Some(u64::MAX));
+    }
+    msg.get("UserInfo").is_some() || msg.get("UserCursor").is_some()
 }
 
 /// Connect a new test client WebSocket and complete the ECDH handshake.
