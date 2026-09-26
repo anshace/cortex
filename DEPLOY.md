@@ -81,7 +81,8 @@ docker run --rm -v cortex_cortex-data:/data:ro -v "$HOME/backups:/out" \
   alpine sh -c 'apk add --no-cache -q sqlite >/dev/null && \
     sqlite3 "file:/data/authpad.db?mode=ro" ".backup /out/authpad-$(date +%F).db" && \
     chmod 600 /out/authpad-$(date +%F).db && cp /data/authpad.db.key /out/authpad-$(date +%F).key && \
-    { [ -d /data/blobs ] && tar -C /data -cf /out/authpad-$(date +%F).blobs.tar blobs; } ; true'
+    { [ -d /data/blobs ] && tar -C /data -cf /out/authpad-$(date +%F).blobs.tar blobs; } && \
+    { [ -d /data/orgs ] && tar -C /data -cf /out/authpad-$(date +%F).orgs.tar orgs; } ; true'
 ```
 
 Back up the **data key** with the database: restoring a `.db` whose `.key` is gone
@@ -264,7 +265,14 @@ in, so an owner is never guessing why a seat or an upload was refused.
   document content into them, because requests are still served from the control
   database. Turning it on does **not** give you tenant isolation, and the files
   it creates are structure with no content — so do not delete them if you flip
-  the flag back off, and if you back up `/data` you are backing them up too.
+  the flag back off.
+- **`/data/orgs` belongs to the backup set whenever `CORTEX_ORG_DBS=1`.** The
+  control database's `.db` alone no longer describes everything on the volume.
+  Deleting an organization unlinks its `org-<id>.db` and the `-wal`/`-shm`
+  siblings, which is also why the two must be restored *together*: putting an
+  older control `.db` back while keeping a newer `/data/orgs` (or the reverse)
+  can leave a tenant database for an organization the control plane no longer
+  knows about. Restore both from the same moment, or restore neither.
 - If you later buy a real domain, point an A record at the Elastic IP and just
   change `DOMAIN=`.
 
@@ -333,14 +341,17 @@ sudo docker run --rm -v cortex-data:/data:ro -v "$HOME/backups:/out" alpine sh -
   'apk add --no-cache -q sqlite >/dev/null && \
    sqlite3 "file:/data/authpad.db?mode=ro" ".backup /out/authpad-$(date +%F).db" && \
    chmod 600 /out/authpad-$(date +%F).db && cp /data/authpad.db.key /out/authpad-$(date +%F).key && \
-   { [ -d /data/blobs ] && tar -C /data -cf /out/authpad-$(date +%F).blobs.tar blobs; } ; true'
+   { [ -d /data/blobs ] && tar -C /data -cf /out/authpad-$(date +%F).blobs.tar blobs; } && \
+    { [ -d /data/orgs ] && tar -C /data -cf /out/authpad-$(date +%F).orgs.tar orgs; } ; true'
 
 # Restore an offline .db backup on a NEW box BEFORE first start:
 sudo docker run --rm -v cortex-data:/data -v "$HOME/backups:/in:ro" \
   alpine sh -c 'cp /in/authpad-YYYY-MM-DD.db /data/authpad.db && \
     cp /in/authpad-YYYY-MM-DD.key /data/authpad.db.key && \
     { [ -f /in/authpad-YYYY-MM-DD.blobs.tar ] && \
-      tar -C /data -xf /in/authpad-YYYY-MM-DD.blobs.tar; }; true'
+      tar -C /data -xf /in/authpad-YYYY-MM-DD.blobs.tar; } && \
+    { [ -f /in/authpad-YYYY-MM-DD.orgs.tar ] && \
+      tar -C /data -xf /in/authpad-YYYY-MM-DD.orgs.tar; }; true'
 sudo docker run --rm -v cortex-data:/data alpine chown -R 1000:1000 /data
 # Start the app only after the database is in place.
 ```
