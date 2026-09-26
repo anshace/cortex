@@ -4449,4 +4449,56 @@ mod tests {
             "another organization must not queue behind this one's uploads"
         );
     }
+
+    /// The OT write path is the most data-critical code in the server, and the
+    /// UPDATE-only persist is what stops a persister holding a pre-delete
+    /// snapshot from bringing a document back. Nothing covered it: the tests
+    /// that used to were the ignored WebSocket harness (#28).
+    #[tokio::test]
+    async fn a_persisted_snapshot_never_resurrects_a_deleted_document() {
+        let (_tmp, db) = test_database().await;
+        let (_org, ws) = seed_routed_workspace(&db).await;
+        let file = db.create_file(ws, "note.md", "live-doc", "text", None, 1).await.unwrap();
+        db.store(
+            &file.doc_id,
+            &crate::database::PersistedDocument { text: "typed while open".into(), language: Some("markdown".into()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.load(&file.doc_id).await.unwrap().text, "typed while open");
+
+        db.delete_file(file.id).await.unwrap();
+        let stale = db
+            .store(&file.doc_id, &crate::database::PersistedDocument { text: "ghost".into(), language: None })
+            .await;
+        assert!(
+            stale.is_err(),
+            "an UPDATE-only persist must refuse to recreate a deleted document"
+        );
+        assert!(db.load(&file.doc_id).await.is_err(), "the document must stay gone");
+        assert!(
+            db.store_document_text(&file.doc_id, "ghost").await.is_err(),
+            "the direct write path carries the same guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisting_refuses_a_document_no_file_points_at() {
+        let (_tmp, db) = test_database().await;
+        // A row that exists but is unreachable — an interrupted create, or a
+        // hand-edited database. Reading it is harmless; writing it back would
+        // hide the fact that nothing owns it.
+        sqlx::query("INSERT INTO document (id, text, language) VALUES ('orphan-doc', 'loose', NULL)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(db.load("orphan-doc").await.unwrap().text, "loose");
+        assert!(
+            db.store("orphan-doc", &crate::database::PersistedDocument { text: "written".into(), language: None })
+                .await
+                .is_err(),
+            "only a document a text file still names may be persisted"
+        );
+        assert_eq!(db.load("orphan-doc").await.unwrap().text, "loose", "the refusal changed nothing");
+    }
 }
