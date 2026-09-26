@@ -547,12 +547,18 @@ export async function toggleReaction(
 }
 
 // ----- storage stats (owner / admin) -----
-/** One org's verified plan claims, as the deployment sees them. */
-export type PlanClaim = {
+/** One organization's plan next to what it has used. A `null` limit means
+ *  unlimited, which is not the same claim as zero. */
+export type OrgPlan = {
   org: number;
+  org_name: string;
   plan: string;
-  seats: number;
-  storage_bytes: number;
+  /** False when these are the free-tier defaults, not a verified licence. */
+  licensed: boolean;
+  seats: number | null;
+  seats_used: number;
+  storage_bytes: number | null;
+  storage_used: number;
   features: string[];
   exp: number;
 };
@@ -564,8 +570,8 @@ export type StorageStats = {
   object_bytes: number;
   /** `inline` while bytes live in the database file, `fs` once they do not. */
   blob_backend: string;
-  /** Whether this instance checks plans at all, and the licences it accepted. */
-  licence: { enforcing: boolean; plans: PlanClaim[] };
+  /** Whether this instance checks plans at all, and one row per org. */
+  licence: { enforcing: boolean; plans: OrgPlan[] };
   tables: { name: string; rows: number }[];
 };
 export type MaintenanceReport = {

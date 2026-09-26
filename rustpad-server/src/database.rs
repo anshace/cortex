@@ -2260,8 +2260,10 @@ impl Database {
         Ok(n)
     }
 
-    /// Content bytes attributed to one org: file blobs plus chat attachments.
-    /// Reads `size` so it still counts content that has moved to the object store.
+    /// Every content byte an organization owns: binary blobs, chat attachments
+    /// and document text. Text is counted because a ceiling that only measures
+    /// uploads is trivially escaped by typing. Reads `size`, so content that has
+    /// moved to the object store is still counted.
     pub async fn org_content_bytes(&self, org_id: i64) -> Result<i64> {
         let (files,): (i64,) = sqlx::query_as(
             r#"SELECT COALESCE(SUM(COALESCE(b.size, LENGTH(b.data))),0)
@@ -2280,7 +2282,18 @@ impl Database {
         .bind(org_id)
         .fetch_one(&self.pool)
         .await?;
-        Ok(files + images)
+        let (text,): (i64,) = sqlx::query_as(
+            r#"SELECT COALESCE(SUM(LENGTH(d.text)),0)
+               FROM document d
+               JOIN file f ON f.doc_id = d.id AND f.kind = 'text'
+               JOIN workspace w ON w.id = f.workspace_id
+               JOIN groups g ON g.id = w.group_id
+               WHERE g.org_id = $1"#,
+        )
+        .bind(org_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(files + images + text)
     }
 
     /// How many identity answers came from cache rather than the database. A
@@ -3481,6 +3494,21 @@ mod tests {
 
         add_binary(&db, ws, "a.bin", b"0123456789").await;
         assert_eq!(db.org_content_bytes(1).await.unwrap(), 10);
+        // Typed content counts too, or a text editor alone escapes the ceiling.
+        let note = db
+            .create_file(ws, "note.md", "note-doc", "text", None, 1)
+            .await
+            .unwrap();
+        db.store(
+            &note.doc_id,
+            &super::PersistedDocument {
+                text: "four words".into(),
+                language: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.org_content_bytes(1).await.unwrap(), 20);
         // Content attributed to another org must not leak into this one's total.
         assert_eq!(db.org_content_bytes(2).await.unwrap(), 0);
         assert!(db.org_user_count(2).await.unwrap() == 0);

@@ -2498,6 +2498,35 @@ async fn audit_log(user: User, db: Database) -> Result<impl Reply, Rejection> {
 }
 
 /// Owner-only instance-wide storage readout (never expose other orgs' usage).
+/// Every organization's plan beside what it has actually used, so an owner sees
+/// the headroom before a request is refused rather than after. A limit of `null`
+/// means unlimited — either no licence key is configured, or the plan simply has
+/// no cap — which is deliberately not the same as zero.
+async fn plan_usage(db: &Database) -> Vec<serde_json::Value> {
+    let now = now_secs();
+    let orgs = db.list_orgs().await.unwrap_or_default();
+    let mut out = Vec::with_capacity(orgs.len());
+    for org in orgs {
+        let plan = crate::licence::plan_for(org.id, now);
+        let unlimited = |value: i64| -> Option<i64> {
+            (value != i64::MAX).then_some(value)
+        };
+        out.push(json!({
+            "org": org.id,
+            "org_name": org.name,
+            "plan": plan.name(),
+            "licensed": !plan.unlicensed,
+            "seats": unlimited(plan.seats()),
+            "seats_used": db.org_user_count(org.id).await.unwrap_or(0),
+            "storage_bytes": unlimited(plan.storage_bytes()),
+            "storage_used": db.org_content_bytes(org.id).await.unwrap_or(0),
+            "features": plan.claims.features.clone(),
+            "exp": plan.claims.exp,
+        }));
+    }
+    out
+}
+
 async fn admin_storage(user: User, db: Database) -> Result<impl Reply, Rejection> {
     if user.role != "root" {
         return Err(warp::reject::custom(Forbidden));
@@ -2534,7 +2563,7 @@ async fn admin_storage(user: User, db: Database) -> Result<impl Reply, Rejection
         // deployment is enforcing so an owner is never guessing at a refusal.
         "licence": json!({
             "enforcing": crate::licence::enforcing(),
-            "plans": crate::licence::plans(),
+            "plans": plan_usage(&db).await,
         }),
         "tables": tables,
     }))

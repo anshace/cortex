@@ -1137,14 +1137,20 @@ function OwnerApp({
                       </Text>
                       {storage.licence.enforcing ? (
                         storage.licence.plans.length ? (
-                          storage.licence.plans.map((p) => (
-                            <KV
-                              key={p.org}
-                              label={`${p.plan} · org ${p.org}`}
-                              value={`${p.seats >= Number.MAX_SAFE_INTEGER ? "∞" : p.seats} seats · ${humanBytes(p.storage_bytes)}`}
-                              hue="brand.400"
-                            />
-                          ))
+                          storage.licence.plans.map((p) => {
+                            const full =
+                              (p.seats !== null && p.seats_used >= p.seats) ||
+                              (p.storage_bytes !== null &&
+                                p.storage_used >= p.storage_bytes);
+                            return (
+                              <KV
+                                key={p.org}
+                                label={`${p.org_name} · ${p.licensed ? p.plan : `${p.plan} (default)`}`}
+                                value={`${p.seats_used}/${p.seats ?? "∞"} seats · ${humanBytes(p.storage_used)}/${p.storage_bytes ? humanBytes(p.storage_bytes) : "∞"}`}
+                                hue={full ? "state.warn" : "brand.400"}
+                              />
+                            );
+                          })
                         ) : (
                           <Text fontSize="11px" color="ink.subtle" lineHeight={1.55}>
                             A licence key is configured but no licence matched it —
