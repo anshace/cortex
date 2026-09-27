@@ -3569,12 +3569,6 @@ impl Database {
                 Some(now - retention_days.clamp(1, 36_500) * 86400),
             )
             .await?;
-        // Tenant content is swept only after every control-plane statement has
-        // committed: the routing index is the authority on what a tenant owns, so
-        // an unreachable row is reclaimed here rather than by extending the
-        // transaction that a request would otherwise have to wait behind.
-        orphan_documents += self.sweep_tenant_content().await;
-
         // Content an organization's database is still holding after the control
         // plane let it go. A routed delete drops rows *after* the commit, so the
         // residue of an interruption is a row nothing names — and this is what
