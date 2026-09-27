@@ -1624,7 +1624,7 @@ dependencies = [
 
 [[package]]
 name = "rustpad-server"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "rustpad-wasm"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "bytecount",
  "console_error_panic_hook",
