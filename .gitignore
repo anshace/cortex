@@ -25,3 +25,6 @@ archive/
 
 # Local UI mockup scratch (Vite scaffolds) — never commit
 REASERCH/
+
+# Agent worktree checkouts and their build caches.
+.qoder/
