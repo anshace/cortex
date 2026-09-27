@@ -33,6 +33,11 @@ async fn main() {
     // all of them. Built before anything can serve a request, so the first
     // tenant to open a file never waits on a storage decision.
     let databases = Databases::new(database.clone(), &sqlite_uri);
+    // The control database is what every handler is handed, so it is what has to
+    // know where a document's content lives. The dependency is circular — the
+    // registry holds this handle — so the registry can only be attached after
+    // both exist, which is what the line below is for.
+    database.attach_registries(databases.clone());
     match databases.migrate_all().await {
         Ok(moved) => {
             if moved > 0 {
@@ -43,6 +48,18 @@ async fn main() {
         // and the console says so per org. It is not a reason to keep the other
         // hundred organizations from signing in.
         Err(e) => log::error!("organization database migration failed: {e}"),
+    }
+    // Content an older build wrote into the control database has to move before
+    // a routed read can find it, or an instance that turns the flag on shows its
+    // users empty files. Restartable by design: a failure here says "try again",
+    // and every row still here is found by the next boot.
+    match database.migrate_content_to_orgs().await {
+        Ok(moved) => {
+            if moved > 0 {
+                log::info!("moved {moved} existing document(s) into their organization databases");
+            }
+        }
+        Err(e) => log::error!("document content migration failed: {e}"),
     }
 
     // First run only: create the default owner account (admin/admin, override
