@@ -805,3 +805,26 @@ export async function adminImportAll(file: File): Promise<void> {
   });
   await json(res);
 }
+
+// Download one organization's rows and content. Same archive shape as
+// `adminExportAll`, scoped to a single tenant and with its sealed content
+// decrypted on the way out — which is what makes it readable to an install that
+// has never seen this tenant's data key. It restores only where nothing else
+// lives: an import replaces everything, so an instance holding any other
+// organization refuses it.
+export async function adminExportOrg(id: number): Promise<void> {
+  const res = await fetch(`/api/admin/export-org?org=${id}`, {
+    credentials: "include",
+  });
+  if (!res.ok) await json(res);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const date = new Date().toISOString().slice(0, 10);
+  a.download = `cortex-org-${id}-${date}.zip`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}

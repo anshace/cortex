@@ -90,6 +90,58 @@ leaves every enrolled account unable to pass 2FA. If `BLOB_BACKEND=fs` is set, t
 `.blobs.tar` beside it is equally required — see *Backup & restore (WAL-safe)* in
 the runbook below for the restore side, which must put all three back.
 
+**One organization can be archived on its own.** The download action on an
+organization's row in **Organizations** (root only) produces the same ZIP shape,
+scoped to that tenant: the accounts that archive needs to be signable-into, its
+groups, workspaces, files, documents, chat, and the content of its uploads and
+pastes. Two consequences. That archive holds the tenant's content **decrypted**,
+because a restoring install has never seen this instance's organization keys and
+sealed bytes in an archive would be bytes nobody can ever read again — so treat the
+file as the plaintext it is. And it restores only onto an instance holding **no
+other organization**: importing replaces everything, and renumbering the archive's
+row ids to sit beside an existing tenant is how one organization ends up inheriting
+another's rows, so the server refuses the mismatch and names the organizations in
+the way. **Data → Export everything** remains the artifact for a whole-instance
+restore, and it is the one to schedule.
+
+### What deleting an organization destroys
+
+With `BLOB_BACKEND=fs`, each organization's content is sealed under its own data
+key before it reaches the object directory. The keys live in the `org_keys` table,
+each one wrapped by `<database>.key`, and every object name records the
+organization whose key seals it (`o<org>-<hash>`). Deleting the organization removes
+its key row in the same transaction that removes its rows — the objects are then
+unlinked as cleanup, but the key is the deletion. **This destroys recoverability,
+not existence**, and the difference matters three times over:
+
+- **A backup taken before the deletion resurrects the content.** Restore an older
+  control database together with its `blobs/` and its `.key` and everything that was
+  shredded is readable again. If a tenant's data has to be *gone*, the archives that
+  predate the deletion have to go too; crypto-shredding is not a way of deleting
+  backups you no longer hold.
+- **`<database>.key` protects more than 2FA now.** Losing it no longer only breaks
+  authenticator enrolments — no organization's stored content can be unsealed
+  without it. The key and the database are one backup unit; moving a database to a
+  new host without its key is a restore of unreadable bytes. Do not set
+  `CORTEX_DATA_KEY` to a different value on an install that already has sealed
+  objects, and do not let an existing `<database>.key` go missing in favour of the
+  environment variable.
+- **A read that fails after a deletion is the shred working.** Content whose key is
+  gone reports that the organization's data key is missing; it does not return an
+  empty file, and a read never creates a key as a favour. A blank download would be
+  the same data loss with the failure hidden — so that error on a file you did not
+  delete is a clue about the key, not about the file.
+
+Sealing costs one thing that was previously free: content is encrypted with a fresh
+random nonce, so identical bytes stored twice are now **two objects**. A file copied
+inside the app still shares one object by reference, so copying remains a
+metadata-only operation, but the space that value-dedup used to absorb is real now.
+The console's byte figures are the content's own length, so disk usage runs ahead of
+them by that framing and those copies. An install on the default inline backend
+(`BLOB_BACKEND` unset) seals nothing and mints no organization keys — its content is
+destroyed by the row deletion that already removes it, which is the same guarantee it
+had before any of this existed.
+
 A backup schedule is optional and **not** needed for database cleanup. The Rust
 server runs maintenance itself (five minutes after startup, then every 24 hours):
 prunes expired sessions/orphans/old audit entries, checkpoints WAL and VACUUMs
@@ -404,7 +456,10 @@ the portable format and a raw `.db` is not.
 
 Alternatively, restore an owner ZIP from **Data → Import archive** on a test or
 fresh instance: it replaces application data transactionally and signs everyone
-out. The ZIP contains password hashes, and 2FA seeds only in sealed form; store it
+out. A single-organization ZIP imports through the same door and is refused unless
+this instance holds no *other* organization — see *What deleting an organization
+destroys* above for what that archive does and does not protect. The ZIP contains
+password hashes, and 2FA seeds only in sealed form; store it
 encrypted, and carry the data key with the database — a restore onto an install
 with a different `<database>.key` leaves every enrolment unverifiable. Test a
 restore periodically. This online backup command is separate

@@ -565,6 +565,12 @@ function OwnerApp({
                             run(() => api.adminRenameOrg(o.id, v), "Renamed"),
                         })
                       }
+                      onExport={() =>
+                        run(
+                          () => api.adminExportOrg(o.id),
+                          "Organization archive downloaded"
+                        )
+                      }
                       onDelete={() =>
                         setConfirm({
                           title: `Delete "${o.name}"?`,
@@ -1639,11 +1645,13 @@ function OrgCard({
   org,
   onOpen,
   onRename,
+  onExport,
   onDelete,
 }: {
   org: AdminOrg;
   onOpen: () => void;
   onRename: () => void;
+  onExport: () => void;
   onDelete: () => void;
 }) {
   return (
@@ -1673,6 +1681,11 @@ function OrgCard({
         <RowActions
           items={[
             { label: "Rename organization", icon: VscEdit, onClick: onRename },
+            {
+              label: "Export this organization",
+              icon: VscCloudDownload,
+              onClick: onExport,
+            },
             { label: "Delete organization", icon: VscTrash, danger: true, onClick: onDelete },
           ]}
         />

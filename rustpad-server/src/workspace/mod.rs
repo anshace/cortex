@@ -797,9 +797,21 @@ pub(crate) fn routes(db: Database, live: LiveDocs, boards: LiveBoards, databases
         .and(with_boards(boards.clone()))
         .and_then(admin_import_all);
 
+    // One organization's rows and content, in the same archive shape, for a
+    // handover or a backup that must not carry the other tenants along.
+    let admin_export_org_r = warp::path!("admin" / "export-org")
+        .and(warp::get())
+        .and(with_auth(db.clone()))
+        .and(with_db(db.clone()))
+        .and(warp::query::<OrgQuery>())
+        .and_then(admin_export_org);
+
     // Boxed separately: the main chain sits right at the compiler's nesting
     // limit, so each additional route must erase its type before joining.
-    let admin_all_r = admin_export_all_r.or(admin_import_all_r).boxed();
+    let admin_all_r = admin_export_all_r
+        .or(admin_import_all_r)
+        .or(admin_export_org_r)
+        .boxed();
 
     // Chat images (pasted into chat) — stored separately from workspace files.
     let post_chat_image = warp::path!("chat-image")
@@ -2703,6 +2715,25 @@ async fn admin_audit_clear(user: User, db: Database) -> Result<impl Reply, Rejec
     }
 }
 
+/// An archive manifest as one zip holding a single `manifest.json`.
+fn zip_manifest(manifest: &serde_json::Value) -> Option<Vec<u8>> {
+    let body = serde_json::to_vec(manifest).ok()?;
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        use std::io::Write as _;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        if zip.start_file("manifest.json", options).is_err()
+            || zip.write_all(&body).is_err()
+            || zip.finish().is_err()
+        {
+            return None;
+        }
+    }
+    Some(buf)
+}
+
 /// Whole-instance export (root only): every migrated table plus blobs,
 /// packaged as a single zip with a manifest.json.
 async fn admin_export_all(user: User, db: Database) -> Result<impl Reply, Rejection> {
@@ -2718,31 +2749,14 @@ async fn admin_export_all(user: User, db: Database) -> Result<impl Reply, Reject
     };
     let manifest = json!({
         "cortex_export": 1,
+        "scope": "instance",
         "exported_at": now_secs(),
         "tables": serde_json::Value::Object(tables_obj),
     });
-    let body = match serde_json::to_vec(&manifest) {
-        Ok(b) => b,
-        Err(_) => {
-            return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "export failed"));
-        }
+    let buf = match zip_manifest(&manifest) {
+        Some(buf) => buf,
+        None => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "export failed")),
     };
-    let mut buf: Vec<u8> = Vec::new();
-    {
-        use std::io::Write as _;
-        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        if zip.start_file("manifest.json", options).is_err()
-            || zip.write_all(&body).is_err()
-            || zip.finish().is_err()
-        {
-            return Ok(err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to create archive",
-            ));
-        }
-    }
     let _ = db
         .audit(
             user.org_id,
@@ -2754,6 +2768,79 @@ async fn admin_export_all(user: User, db: Database) -> Result<impl Reply, Reject
         .await;
     let resp = warp::http::Response::builder()
         .header("content-disposition", "attachment; filename=\"cortex-export.zip\"")
+        .header("content-type", "application/zip")
+        .body(Body::from(buf))
+        .expect("valid response");
+    Ok(resp.into_response())
+}
+
+/// Single-organization export (root only): one tenant's rows and content, in the
+/// same archive shape as a whole-instance export, scoped by `?org=`.
+///
+/// The filename carries no tenant data: an organization's name is user input, and
+/// a header value is not where an unescaped string belongs.
+async fn admin_export_org(
+    user: User,
+    db: Database,
+    q: OrgQuery,
+) -> Result<impl Reply, Rejection> {
+    if user.role != "root" {
+        return Err(warp::reject::custom(Forbidden));
+    }
+    let Some(org_id) = q.org else {
+        return Ok(err(
+            StatusCode::BAD_REQUEST,
+            "exporting one organization has to name it (?org=)",
+        ));
+    };
+    // Checked as a lookup, not by reading the export's error: "no such organization"
+    // is a 404 for the console, while anything the export itself refuses is a
+    // server-side failure the operator has to see as one.
+    match db.get_org(org_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Ok(err(StatusCode::NOT_FOUND, "no such organization")),
+        Err(e) => {
+            warn!("admin_export_org lookup {org_id}: {e}");
+            return Ok(err(StatusCode::SERVICE_UNAVAILABLE, "could not read organizations"));
+        }
+    }
+    let tables_obj = match db.export_org_snapshot(org_id).await {
+        Ok(tables) => tables,
+        Err(e) => {
+            // A missing data key lands here: the content exists but this install
+            // cannot read it, so the archive is refused rather than half-written.
+            warn!("admin_export_org snapshot {org_id}: {e}");
+            return Ok(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "export failed; this organization's content could not be read in full",
+            ));
+        }
+    };
+    let manifest = json!({
+        "cortex_export": 1,
+        "scope": "org",
+        "org_id": org_id,
+        "exported_at": now_secs(),
+        "tables": serde_json::Value::Object(tables_obj),
+    });
+    let buf = match zip_manifest(&manifest) {
+        Some(buf) => buf,
+        None => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "export failed")),
+    };
+    let _ = db
+        .audit(
+            Some(org_id),
+            Some(user.id),
+            "export_org",
+            Some(&format!("organization {org_id} export")),
+            now_secs(),
+        )
+        .await;
+    let resp = warp::http::Response::builder()
+        .header(
+            "content-disposition",
+            "attachment; filename=\"cortex-org-export.zip\"",
+        )
         .header("content-type", "application/zip")
         .body(Body::from(buf))
         .expect("valid response");
@@ -2791,6 +2878,45 @@ async fn admin_import_all(
     };
     if manifest["cortex_export"] != json!(1) {
         return Ok(err(StatusCode::BAD_REQUEST, "unrecognized export format"));
+    }
+    // A single-organization archive replaces everything in this instance the same
+    // way a whole-instance one does, and it cannot be merged: row ids travel as they
+    // were, so renumbering them to fit alongside an existing tenant is what would
+    // let one organization inherit another's rows. So it is only accepted where the
+    // archive can be the whole truth — an instance with no other organization.
+    if manifest["scope"] == json!("org") {
+        let Some(org_id) = manifest["org_id"].as_i64() else {
+            return Ok(err(
+                StatusCode::BAD_REQUEST,
+                "organization archive names no organization",
+            ));
+        };
+        let others = match db.orgs_other_than(org_id).await {
+            Ok(others) => others,
+            Err(e) => {
+                warn!("admin_import_all org guard: {e}");
+                return Ok(err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "could not check this instance's organizations",
+                ));
+            }
+        };
+        if !others.is_empty() {
+            let names: Vec<String> = others
+                .iter()
+                .map(|(id, name)| format!("{name} (#{id})"))
+                .collect();
+            warn!("admin_import_all refused an organization archive beside {}", names.len());
+            return Ok(err(
+                StatusCode::CONFLICT,
+                &format!(
+                    "this archive holds one organization and a restore replaces everything; \
+                     this instance also holds {} — export the whole instance instead ({})",
+                    names.len(),
+                    names.join(", ")
+                ),
+            ));
+        }
     }
     let tables = manifest["tables"].as_object();
     let mut restore: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
