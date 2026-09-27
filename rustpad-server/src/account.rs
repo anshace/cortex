@@ -54,8 +54,16 @@ fn manager_scope(user: &User) -> Result<Option<i64>, Rejection> {
 /// Refresh a role/org after acquiring the access gate. Request authentication
 /// may have run before a concurrent owner/admin changed the actor's scope.
 async fn current_actor(db: &Database, user: &User) -> Result<User, Rejection> {
-    db.admin_target(user.id).await.ok().flatten()
-        .ok_or_else(|| warp::reject::custom(Forbidden))
+    // A row that is genuinely absent means the scope changed under this request,
+    // so Forbidden is the honest answer. A lookup that failed says nothing about
+    // anyone's permissions, and refusing the request as "forbidden" teaches the
+    // operator to chase access rules while the database was merely busy.
+    let current = db
+        .admin_target(user.id)
+        .await
+        .map_err(|err| warp::reject::custom(crate::auth::DatabaseBusy(err)))?
+        .ok_or_else(|| warp::reject::custom(Forbidden))?;
+    Ok(current)
 }
 
 /// Read authorization first for a clear error; scoped DB writes check again
@@ -66,7 +74,10 @@ async fn checked_target(db: &Database, actor: &User, target: i64) -> Result<User
         // Profile manages self-service; an admin must not reset their own 2FA.
         return Err(warp::reject::custom(Forbidden));
     }
-    let target = db.admin_target(target).await.ok().flatten()
+    let target = db
+        .admin_target(target)
+        .await
+        .map_err(|err| warp::reject::custom(crate::auth::DatabaseBusy(err)))?
         .ok_or_else(|| warp::reject::custom(Forbidden))?;
     if target.role == "root" || (scope.is_some() && target.org_id != scope) {
         return Err(warp::reject::custom(Forbidden));
@@ -614,8 +625,19 @@ fn now_secs() -> i64 {
 
 async fn org_list(user: User, db: Database) -> Result<impl Reply, Rejection> {
     require_root(&user)?;
-    let orgs = db.list_orgs().await.unwrap_or_default();
-    Ok(warp::reply::json(&json!({ "orgs": orgs })))
+    // An empty list is a fact about the installation, so it must not be the
+    // answer to a database that could not be read — that tells the owner every
+    // organization is gone.
+    let orgs = match db.list_orgs().await {
+        Ok(orgs) => orgs,
+        Err(_) => {
+            return Ok(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the organization list could not be read; try again shortly",
+            ))
+        }
+    };
+    Ok(warp::reply::json(&json!({ "orgs": orgs })).into_response())
 }
 
 async fn org_create(user: User, db: Database, body: CreateOrg) -> Result<impl Reply, Rejection> {
