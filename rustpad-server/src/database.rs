@@ -1026,9 +1026,25 @@ impl Database {
         Ok(delete.execute(&self.pool).await?.rows_affected())
     }
 
-    /// Move an imported row's inline bytes into this install's object store.
-    /// Returns the row unchanged when there is nothing to rehome.
-    fn rehome_content(&self, row: &serde_json::Value) -> Result<serde_json::Value> {
+    /// Move an imported row's inline bytes into this install's object store,
+    /// sealed for the organization that owns them. Returns the row unchanged when
+    /// there is nothing to rehome.
+    ///
+    /// Sealing here is what keeps a restore honest: content that arrived through
+    /// an archive and stayed in the clear would outlive the deletion of the key
+    /// that was supposed to destroy it.
+    ///
+    /// Nothing here may query the database outside `tx`. Import runs inside a
+    /// transaction on the install's only pooled connection, so a query on the pool
+    /// would wait for that transaction forever — which is exactly how the first
+    /// version of this feature deadlocked two existing tests.
+    async fn rehome_content(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        row: &serde_json::Value,
+        org_of_file: &HashMap<i64, i64>,
+        deks: &mut HashMap<i64, [u8; 32]>,
+    ) -> Result<serde_json::Value> {
         let serde_json::Value::Object(map) = row else {
             return Ok(row.clone());
         };
@@ -1038,14 +1054,93 @@ impl Database {
             Some(serde_json::Value::Null) | None => return Ok(serde_json::Value::Object(map)),
             _ => bail!("malformed export: content row holds a non-string data value"),
         };
-        if let Some(key) = self.blobs.store(&bytes) {
+        // A chat image names its own organization. A blob does not, so it is
+        // found through the file that holds it — from the archive's rows, which
+        // are in memory and already complete.
+        let org_id = match map.get("org_id").and_then(|value| value.as_i64()) {
+            Some(org_id) => Some(org_id),
+            None => map
+                .get("file_id")
+                .and_then(|value| value.as_i64())
+                .and_then(|file_id| org_of_file.get(&file_id).copied()),
+        };
+        let dek = match org_id {
+            Some(org_id) => match deks.get(&org_id) {
+                Some(dek) => Some(*dek),
+                None => {
+                    let created = self.org_dek_in(tx, org_id).await?;
+                    if let Some(dek) = created {
+                        deks.insert(org_id, dek);
+                    }
+                    created
+                }
+            },
+            None => None,
+        };
+        let placed = match (dek, org_id) {
+            (Some(dek), Some(org_id)) if !self.blobs.is_inline() => {
+                let sealed = keystore::seal_bytes(&dek, &bytes);
+                let name = Self::sealed_object_name(org_id, &sealed);
+                self.blobs.put(&name, &sealed).then_some((name, bytes.len()))
+            }
+            _ => self
+                .blobs
+                .store(&bytes)
+                .map(|key| (key, bytes.len())),
+        };
+        if let Some((key, size)) = placed {
             // An empty value, not a null: the column is NOT NULL, and reads
             // always prefer the key.
             map.insert("data".into(), serde_json::json!(""));
             map.insert("storage_key".into(), serde_json::Value::String(key));
-            map.insert("size".into(), serde_json::json!(bytes.len()));
+            map.insert("size".into(), serde_json::json!(size));
         }
         Ok(serde_json::Value::Object(map))
+    }
+
+    /// `file_id -> org_id`, joined from the archive's own rows.
+    ///
+    /// Import cannot ask the database: the rows it would join through are being
+    /// inserted by the same transaction that needs the answer. The archive carries
+    /// every row of every table, so the join is done in memory instead.
+    fn archive_file_orgs(tables: &[(String, Vec<serde_json::Value>)]) -> HashMap<i64, i64> {
+        let column_map = |table: &str, key: &str, value: &str| -> HashMap<i64, i64> {
+            let mut out = HashMap::new();
+            let Some((_, rows)) = tables.iter().find(|(name, _)| name == table) else {
+                return out;
+            };
+            for row in rows {
+                let (Some(k), Some(v)) = (
+                    row.get(key).and_then(|v| v.as_i64()),
+                    row.get(value).and_then(|v| v.as_i64()),
+                ) else {
+                    continue;
+                };
+                out.insert(k, v);
+            }
+            out
+        };
+        let group_of_workspace = column_map("workspace", "id", "group_id");
+        let org_of_group = column_map("groups", "id", "org_id");
+        let file_rows = tables.iter().find(|(name, _)| name == "file");
+        let mut out = HashMap::new();
+        if let Some((_, rows)) = file_rows {
+            for row in rows {
+                let (Some(file_id), Some(workspace_id)) = (
+                    row.get("id").and_then(|v| v.as_i64()),
+                    row.get("workspace_id").and_then(|v| v.as_i64()),
+                ) else {
+                    continue;
+                };
+                if let Some(org_id) = group_of_workspace
+                    .get(&workspace_id)
+                    .and_then(|group_id| org_of_group.get(group_id))
+                {
+                    out.insert(file_id, *org_id);
+                }
+            }
+        }
+        out
     }
 
     /// Record the byte length of every blob on the row that holds it, so a size
@@ -1068,12 +1163,15 @@ impl Database {
     /// is how lost data stays undiscovered.
     async fn blob_content(&self, data: Vec<u8>, key: Option<String>) -> Result<Vec<u8>> {
         match key {
-            Some(key) => self.blobs.get(&key).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "stored object {key} is missing from the {} backend",
-                    self.blobs.mode()
-                )
-            }),
+            Some(key) => {
+                let stored = self.blobs.get(&key).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "stored object {key} is missing from the {} backend",
+                        self.blobs.mode()
+                    )
+                })?;
+                self.unseal(&key, stored).await
+            }
             None => Ok(data),
         }
     }
@@ -2021,6 +2119,28 @@ impl Database {
             bail!("org not found");
         }
         tx.commit().await?;
+        // The key row went with the `org` row by cascade at that commit. That is
+        // the point of no return: the organization's objects are now bytes nobody
+        // can read, here and in every backup that holds them. Unlinking them is
+        // hygiene, not the shred — a name is a hash, an orphan leaks nothing, and
+        // restoring an older control database would have brought the key back
+        // anyway, which is the fact DEPLOY.md tells operators not to forget.
+        let prefix = format!("o{id}-");
+        let orphans: Vec<String> = self
+            .blobs
+            .object_keys()
+            .into_iter()
+            .filter(|key| key.starts_with(&prefix))
+            .collect();
+        for key in &orphans {
+            self.blobs.delete(key).ok();
+        }
+        if !orphans.is_empty() {
+            log::info!(
+                "discarded {} object(s) of organization {id}",
+                orphans.len()
+            );
+        }
         // Empty the tenant's database as well as unlinking it: whoever deletes
         // the organization goes on to `discard` its file, and an install that
         // reuses the id must not inherit the old rows through a file it is
@@ -3135,15 +3255,177 @@ impl Database {
     /// empty placeholder rather than a null. Reads always prefer the key, and the
     /// `size` column is what byte accounting uses, so the placeholder is never
     /// mistaken for content.
-    fn place(&self, data: &[u8]) -> (Vec<u8>, Option<String>, i64) {
-        let key = self.blobs.store(data);
+    /// Decide where new bytes go, sealing them for the owning organization when
+    /// this install can. With an object backend the bytes are stored once and the
+    /// row keeps only the name; with the inline backend the row keeps the bytes,
+    /// exactly as before.
+    ///
+    /// Inline bytes are deliberately not sealed. They live in a row that deleting
+    /// the organization already removes, so a key would buy no destruction and
+    /// add one way to lose content permanently. Sealing exists for objects, which
+    /// outlive the rows that name them — including in backups.
+    ///
+    /// The row's `data` column is NOT NULL in the schema, so a keyed row keeps an
+    /// empty placeholder rather than a null. Reads always prefer the key, and the
+    /// `size` column is what byte accounting uses, so the placeholder is never
+    /// mistaken for content.
+    async fn place_for(
+        &self,
+        org_id: Option<i64>,
+        data: &[u8],
+    ) -> Result<(Vec<u8>, Option<String>, i64)> {
+        // Only an install that puts bytes in objects can seal them, and only one
+        // that is about to seal may mint a key. A row-based install that created a
+        // data key would hold a key over content it never encrypted — and a
+        // shredding story about protecting bytes it still has in the clear.
+        let dek = match (org_id, self.blobs.is_inline()) {
+            (Some(org_id), false) => self.org_dek(org_id).await?,
+            (_, true) | (None, _) => None,
+        };
+        let key = match (org_id, dek) {
+            (Some(org_id), Some(dek)) => {
+                let sealed = keystore::seal_bytes(&dek, data);
+                let name = Self::sealed_object_name(org_id, &sealed);
+                self.blobs.put(&name, &sealed).then_some(name)
+            }
+            // No organization, no key, or an inline row: store content exactly as
+            // this install always has, so nothing written before organization keys
+            // existed becomes unreadable on upgrade.
+            _ => self.blobs.store(data),
+        };
         let inline = if key.is_some() { Vec::new() } else { data.to_vec() };
-        (inline, key, data.len() as i64)
+        Ok((inline, key, data.len() as i64))
+    }
+
+    /// The organization's data key, created on first use.
+    ///
+    /// `None` means this install has no master key, so it can neither seal content
+    /// nor shred it; bytes are stored as they were before this existed.
+    async fn org_dek(&self, org_id: i64) -> Result<Option<[u8; 32]>> {
+        if let Some((_, wrapped)) = self.org_dek_stored(org_id).await? {
+            return Ok(keystore::unwrap_dek(&wrapped));
+        }
+        let Some(wrapped) = keystore::wrap_dek(&keystore::new_dek()) else {
+            return Ok(None);
+        };
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or_default();
+        sqlx::query("INSERT OR IGNORE INTO org_keys (org_id, dek_cipher, created_at) VALUES ($1, $2, $3)")
+            .bind(org_id)
+            .bind(&wrapped)
+            .bind(created_at)
+            .execute(&self.pool)
+            .await?;
+        // Two racing writers both insert-or-ignore and re-read, so the loser
+        // adopts the winner's key rather than installing a second one whose
+        // objects the first could never open.
+        let (_, stored) = self.org_dek_stored(org_id).await?.ok_or_else(|| {
+            anyhow::anyhow!("organization {org_id}'s data key vanished while being created")
+        })?;
+        Ok(keystore::unwrap_dek(&stored))
+    }
+
+    /// The same, through an open transaction. Import needs this: the pool has one
+    /// connection, and a query for a key while a transaction holds it would wait
+    /// for that same transaction forever.
+    async fn org_dek_in(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        org_id: i64,
+    ) -> Result<Option<[u8; 32]>> {
+        if let Some((_, wrapped)) =
+            sqlx::query_as::<_, (i64, String)>(
+                "SELECT org_id, dek_cipher FROM org_keys WHERE org_id = $1",
+            )
+            .bind(org_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            return Ok(keystore::unwrap_dek(&wrapped));
+        }
+        let Some(wrapped) = keystore::wrap_dek(&keystore::new_dek()) else {
+            return Ok(None);
+        };
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or_default();
+        sqlx::query("INSERT OR IGNORE INTO org_keys (org_id, dek_cipher, created_at) VALUES ($1, $2, $3)")
+            .bind(org_id)
+            .bind(&wrapped)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await?;
+        let (_, stored) = sqlx::query_as::<_, (i64, String)>(
+            "SELECT org_id, dek_cipher FROM org_keys WHERE org_id = $1",
+        )
+        .bind(org_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("organization {org_id}'s data key vanished while being created"))?;
+        Ok(keystore::unwrap_dek(&stored))
+    }
+
+    /// The stored (wrapped) key, without creating one. Reads must use this: a read
+    /// that minted a fresh key would turn a shredded organization's objects into a
+    /// mystery instead of the clear failure they are.
+    async fn org_dek_stored(&self, org_id: i64) -> Result<Option<(i64, String)>> {
+        Ok(
+            sqlx::query_as::<_, (i64, String)>(
+                "SELECT org_id, dek_cipher FROM org_keys WHERE org_id = $1",
+            )
+            .bind(org_id)
+            .fetch_optional(&self.pool)
+            .await?,
+        )
+    }
+
+    /// The object-store name for sealed content.
+    ///
+    /// The organization is part of the name, so a reader knows which key to ask for
+    /// without a query, and two organizations holding identical bytes stop sharing
+    /// an object — which is the entire point: a shared object is content that
+    /// survives the deletion of either owner's key.
+    fn sealed_object_name(org_id: i64, sealed: &[u8]) -> String {
+        format!("o{org_id}-{}", crate::blobstore::content_key(sealed))
+    }
+
+    /// The organization an object name belongs to, or `None` for an object written
+    /// before names carried one.
+    fn sealed_object_org(key: &str) -> Option<i64> {
+        let body = key.strip_prefix('o')?;
+        let (org, _) = body.split_once('-')?;
+        org.parse().ok()
+    }
+
+    /// Stored bytes, unsealed if they are sealed. An organization whose key is
+    /// gone gets an error, never empty bytes: silent blanks are how destroyed data
+    /// stays undiscovered until someone notices a file is missing.
+    async fn unseal(&self, key: &str, stored: Vec<u8>) -> Result<Vec<u8>> {
+        if !keystore::is_sealed(&stored) {
+            return Ok(stored);
+        }
+        let Some(org_id) = Self::sealed_object_org(key) else {
+            bail!("stored object {key} is sealed but its name names no organization");
+        };
+        let Some((_, wrapped)) = self.org_dek_stored(org_id).await? else {
+            bail!("organization {org_id}'s data key is gone, so its stored content cannot be read");
+        };
+        let dek = keystore::unwrap_dek(&wrapped).ok_or_else(|| {
+            anyhow::anyhow!("organization {org_id}'s data key cannot be unwrapped by this install")
+        })?;
+        keystore::open_bytes(&dek, &stored).ok_or_else(|| {
+            anyhow::anyhow!("stored object {key} does not match organization {org_id}'s key")
+        })
     }
 
     /// Store raw bytes for a binary file.
     pub async fn store_blob(&self, file_id: i64, data: &[u8]) -> Result<()> {
-        let (inline, key, size) = self.place(data);
+        let (inline, key, size) = self
+            .place_for(self.file_org(file_id).await?, data)
+            .await?;
         sqlx::query(
             r#"INSERT INTO file_blob (file_id, data, storage_key, size) VALUES ($1, $2, $3, $4)
                ON CONFLICT(file_id) DO UPDATE SET
@@ -3171,7 +3453,9 @@ impl Database {
         data: &[u8],
         expected_revision: i64,
     ) -> Result<Option<i64>> {
-        let (inline, key, size) = self.place(data);
+        let (inline, key, size) = self
+            .place_for(self.file_org(file_id).await?, data)
+            .await?;
         let row: Option<(i64,)> = sqlx::query_as(
             r#"UPDATE file_blob
                SET data = $1, storage_key = $2, size = $3, revision = revision + 1
@@ -4171,7 +4455,7 @@ impl Database {
         data: &[u8],
         now: i64,
     ) -> Result<i64> {
-        let (inline, key, size) = self.place(data);
+        let (inline, key, size) = self.place_for(Some(org_id), data).await?;
         let row: (i64,) = sqlx::query_as(
             r#"INSERT INTO chat_image
                  (org_id, mime, data, created_at, uploaded_by, group_id, dm_with, storage_key, size)
@@ -4241,6 +4525,31 @@ impl Database {
     /// transaction. Exporting tables one-by-one without a snapshot can produce
     /// dangling file/blob/user references during concurrent edits and deletes.
     /// The session table is deliberately excluded (auth tokens never travel).
+    /// Every organization's data key, resolved before the export transaction
+    /// opens: the pool has one connection, so a query from inside that
+    /// transaction would wait for itself forever.
+    ///
+    /// An archive must carry bytes the restoring install can read. Its keys are
+    /// its own, so shipping sealed objects would produce a backup that imports
+    /// ciphertext and re-seals it as if it were content — a restore that quietly
+    /// destroys what it restored.
+    async fn export_deks(&self) -> Result<HashMap<i64, [u8; 32]>> {
+        let rows = sqlx::query_as::<_, (i64, String)>("SELECT org_id, dek_cipher FROM org_keys")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = HashMap::new();
+        for (org_id, wrapped) in rows {
+            if let Some(dek) = keystore::unwrap_dek(&wrapped) {
+                out.insert(org_id, dek);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read a consistent whole-instance snapshot in one SQLite read
+    /// transaction. Exporting tables one-by-one without a snapshot can produce
+    /// dangling file/blob/user references during concurrent edits and deletes.
+    /// The session table is deliberately excluded (auth tokens never travel).
     pub async fn export_snapshot(&self) -> Result<serde_json::Map<String, serde_json::Value>> {
         // The organizations' content is read *before* this database's transaction
         // opens, for two reasons that are both load-bearing. Mechanically, the
@@ -4250,6 +4559,8 @@ impl Database {
         // archive does not need, while reading it last could produce an archive
         // naming a file whose content it does not carry.
         let mut tenant_content = self.exported_tenant_content().await?;
+        // Resolved before the transaction opens; see [`Self::export_deks`].
+        let deks = self.export_deks().await?;
         let mut tx = self.pool.begin().await?;
         let mut out = serde_json::Map::new();
         for table in Self::MIGRATE_TABLES {
@@ -4262,13 +4573,7 @@ impl Database {
                 // it stays readable by an install on the inline backend and by a
                 // build that predates the object store entirely.
                 if *table == "file_blob" || *table == "chat_image" {
-                    if let Some(serde_json::Value::String(key)) = obj.remove("storage_key") {
-                        let bytes = self.blobs.get(&key).ok_or_else(|| {
-                            anyhow::anyhow!("cannot export {table}: stored object {key} is missing")
-                        })?;
-                        obj.insert("data".into(), serde_json::to_value(B64.encode(bytes))?);
-                        obj.insert("storage_key".into(), serde_json::Value::Null);
-                    }
+                    self.archive_content_row(table, &mut obj, &deks)?;
                 }
                 values.push(serde_json::Value::Object(obj));
             }
@@ -4278,6 +4583,198 @@ impl Database {
             out.insert((*table).to_string(), serde_json::Value::Array(values));
         }
         tx.rollback().await?;
+        Ok(out)
+    }
+
+    /// One organization's rows, in the same table shape a whole-instance archive
+    /// uses, so the same import code can read either.
+    ///
+    /// The point is a handover or a backup that leaves the other tenants alone. The
+    /// cost is that a single-organization archive can only *replace* a dataset: row
+    /// ids are kept as they were, because renumbering them across fourteen tables
+    /// and rewriting every reference is how one tenant ends up inheriting another's
+    /// rows. So [`Self::orgs_other_than`] guards the restore, and an instance that
+    /// holds any other organization refuses the archive instead of merging badly.
+    pub async fn export_org_snapshot(
+        &self,
+        org_id: i64,
+    ) -> Result<serde_json::Map<String, serde_json::Value>> {
+        let known: Option<(i64,)> = sqlx::query_as("SELECT id FROM org WHERE id = $1")
+            .bind(org_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if known.is_none() {
+            bail!("organization {org_id} does not exist");
+        }
+        // The documents this tenant's files name, resolved here because the tenant's
+        // content lives in another database and the predicate belongs to this one.
+        let doc_ids: HashSet<String> = sqlx::query_as::<_, (String,)>(
+            r#"SELECT f.doc_id FROM file f
+               JOIN workspace w ON w.id = f.workspace_id
+               JOIN groups g ON g.id = w.group_id
+               WHERE g.org_id = $1"#,
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(doc_id,)| doc_id)
+        .collect();
+        let mut tenant_content = self.exported_org_content(org_id, &doc_ids).await?;
+        let deks = self.export_deks().await?;
+        let mut tx = self.pool.begin().await?;
+        let mut out = serde_json::Map::new();
+        for table in Self::MIGRATE_TABLES {
+            let rows = sqlx::query(&format!(
+                "SELECT * FROM {table} WHERE {}",
+                Self::org_scope_sql(table)
+            ))
+            .bind(org_id)
+            .fetch_all(&mut tx)
+            .await?;
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut obj = row_to_json(&row)?;
+                if *table == "file_blob" || *table == "chat_image" {
+                    self.archive_content_row(table, &mut obj, &deks)?;
+                }
+                values.push(serde_json::Value::Object(obj));
+            }
+            if *table == "document" {
+                values.append(&mut tenant_content);
+            }
+            out.insert((*table).to_string(), serde_json::Value::Array(values));
+        }
+        tx.rollback().await?;
+        Ok(out)
+    }
+
+    /// How one table is filtered to a single organization, with `$1` bound to the
+    /// organization id. Every path runs through `groups`, because a group is what
+    /// an organization actually contains: workspaces hang off groups, files off
+    /// workspaces, and content off files — which is the same reachability
+    /// [`delete_group_tx`] uses when it destroys them.
+    fn org_scope_sql(table: &str) -> String {
+        let group_ids = "SELECT id FROM groups WHERE org_id = $1".to_string();
+        let workspace_ids = format!("SELECT id FROM workspace WHERE group_id IN ({group_ids})");
+        let file_ids = format!("SELECT id FROM file WHERE workspace_id IN ({workspace_ids})");
+        match table {
+            // `org` is the organization itself; every other tenant-shaped table
+            // names it in a column.
+            "org" => "id = $1".to_string(),
+            "groups" | "doc_org" | "message" | "dm" | "chat_image" | "audit" => {
+                "org_id = $1".to_string()
+            }
+            // The tenant's members by assignment and by enrollment, plus this
+            // install's owners: an archive nobody can sign in with is not a
+            // restorable backup, and `import_replace_all` requires an owner row.
+            "users" => format!(
+                "org_id = $1 OR role = 'root' OR id IN \
+                 (SELECT user_id FROM group_member WHERE group_id IN ({group_ids}))"
+            ),
+            "group_member" | "workspace" => format!("group_id IN ({group_ids})"),
+            "file" => format!("workspace_id IN ({workspace_ids})"),
+            "document" => format!(
+                "id IN (SELECT doc_id FROM file WHERE workspace_id IN ({workspace_ids}))"
+            ),
+            "file_blob" => format!("file_id IN ({file_ids})"),
+            "reaction" => format!(
+                "msg_id IN (SELECT id FROM message WHERE org_id = $1 \
+                 UNION SELECT id FROM dm WHERE org_id = $1)"
+            ),
+            // Fail closed. A table added to `MIGRATE_TABLES` without a scope rule of
+            // its own would otherwise be exported whole into a single-tenant
+            // archive, which is the one mistake this function exists to prevent.
+            _ => "0 = 1".to_string(),
+        }
+    }
+
+    /// Put a content row into the shape an archive carries: bytes inline, the
+    /// object name gone, and sealed content unsealed on the way out.
+    ///
+    /// Unsealing is not a courtesy — it is the only version of this that survives a
+    /// restore. The target install holds different organization keys, so an archive
+    /// of sealed bytes would import ciphertext and re-seal it as though it were
+    /// content, which is a backup that quietly destroys what it restored. A key that
+    /// cannot be unwrapped refuses the export rather than shipping what it cannot
+    /// read.
+    fn archive_content_row(
+        &self,
+        table: &str,
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        deks: &HashMap<i64, [u8; 32]>,
+    ) -> Result<()> {
+        let Some(serde_json::Value::String(key)) = obj.remove("storage_key") else {
+            obj.insert("storage_key".into(), serde_json::Value::Null);
+            return Ok(());
+        };
+        let stored = self.blobs.get(&key).ok_or_else(|| {
+            anyhow::anyhow!("cannot export {table}: stored object {key} is missing")
+        })?;
+        let bytes = if keystore::is_sealed(&stored) {
+            let org_id = Self::sealed_object_org(&key).ok_or_else(|| {
+                anyhow::anyhow!("cannot export {table}: sealed object {key} names no organization")
+            })?;
+            let dek = *deks.get(&org_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot export {table}: organization {org_id}'s data key is unavailable, \
+                     so its content cannot be read for the archive"
+                )
+            })?;
+            keystore::open_bytes(&dek, &stored).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot export {table}: object {key} does not match organization \
+                     {org_id}'s key"
+                )
+            })?
+        } else {
+            stored
+        };
+        obj.insert("data".into(), serde_json::to_value(B64.encode(bytes))?);
+        obj.insert("storage_key".into(), serde_json::Value::Null);
+        Ok(())
+    }
+
+    /// The organizations this instance holds apart from `org_id`.
+    ///
+    /// A single-organization archive replaces everything when it is imported, so any
+    /// other organization here would have its identity rows deleted while its
+    /// content stayed on disk — a workspace whose every document opens blank. The
+    /// count is what the import refuses on.
+    pub async fn orgs_other_than(&self, org_id: i64) -> Result<Vec<(i64, String)>> {
+        Ok(sqlx::query_as::<_, (i64, String)>(
+            "SELECT id, name FROM org WHERE id <> $1 ORDER BY id",
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The documents a routed tenant holds for the given ids, in archive shape.
+    ///
+    /// A tenant database is never opened *for* an export: an install whose tenant
+    /// file does not exist yet holds no content, and provisioning one to discover
+    /// that would leave a database behind for a read.
+    async fn exported_org_content(
+        &self,
+        org_id: i64,
+        doc_ids: &HashSet<String>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let Some(registries) = self.registries.get().filter(|r| r.is_split()) else {
+            return Ok(Vec::new());
+        };
+        if !registries.openable_org_ids().await?.contains(&org_id) {
+            return Ok(Vec::new());
+        }
+        let content = registries.org(org_id).await?;
+        let rows = sqlx::query("SELECT * FROM document").fetch_all(content.read_only()).await?;
+        let mut out = Vec::new();
+        for row in &rows {
+            let id: String = row.try_get("id")?;
+            if doc_ids.contains(&id) {
+                out.push(serde_json::Value::Object(row_to_json(row)?));
+            }
+        }
         Ok(out)
     }
 
@@ -4330,6 +4827,12 @@ impl Database {
                 .execute(&mut tx)
                 .await?;
         }
+        // Sealing an imported row needs the organization that owns its bytes and
+        // that organization's key. Neither can be asked of the pool while this
+        // transaction holds it, so the archive's own rows answer the first question
+        // and one map, filled as we go, answers the second.
+        let org_of_file = Self::archive_file_orgs(tables);
+        let mut deks: HashMap<i64, [u8; 32]> = HashMap::new();
         for (table, rows) in tables {
             // An archive carries bytes inline; on an install using the object
             // store, content rows are rehomed into objects as they come in so the
@@ -4339,7 +4842,7 @@ impl Database {
             {
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
-                    out.push(self.rehome_content(row)?);
+                    out.push(self.rehome_content(&mut tx, row, &org_of_file, &mut deks).await?);
                 }
                 out
             } else {
@@ -4422,6 +4925,13 @@ impl Database {
         if owners == 0 {
             bail!("export has no owner account");
         }
+        // An import deletes every organization and re-inserts the archive's, which
+        // can leave a data key belonging to an organization that no longer exists
+        // here. Such a key shreds nothing and explains nothing, so the invariant
+        // kept is: a stored key means a live organization.
+        sqlx::query("DELETE FROM org_keys WHERE org_id NOT IN (SELECT id FROM org)")
+            .execute(&mut tx)
+            .await?;
         let (violations,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
             .fetch_one(&mut tx)
             .await?;
@@ -4463,8 +4973,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::{
-        insert_content, BlobStore, ChatImageScope, Database, Databases, PersistedDocument,
-        Workspace, B64,
+        insert_content, keystore, BlobStore, ChatImageScope, Database, Databases,
+        PersistedDocument, Workspace, B64,
     };
     use base64::Engine;
 
@@ -4543,31 +5053,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identical_content_shares_one_object_until_the_last_row_goes() {
+    async fn identical_bytes_become_two_objects_while_a_copy_shares_one() {
+        use std::collections::HashMap;
         let (_tmp, db) = test_database().await;
         let (_, ws) = seed_workspace(&db).await;
         let first = add_binary(&db, ws, "a.png", b"duplicate bytes").await;
         let second = add_binary(&db, ws, "b.png", b"duplicate bytes").await;
 
-        assert_eq!(db.blobs.object_keys().len(), 1, "same content is one object");
+        // Content is sealed with a fresh nonce, so two copies of the same bytes no
+        // longer land on one object. Sharing by value is what a shred cannot undo:
+        // one object standing for two owners survives the deletion of either key.
+        assert_eq!(
+            db.blobs.object_keys().len(),
+            2,
+            "identical bytes seal to different objects"
+        );
+        assert_eq!(
+            db.load_blob(first).await.unwrap().as_deref(),
+            Some(b"duplicate bytes".as_ref())
+        );
         assert_eq!(
             db.load_blob(second).await.unwrap().as_deref(),
             Some(b"duplicate bytes".as_ref())
         );
 
-        // Deleting one referrer must not pull the object out from under the other
-        // — which is what makes copying a file a metadata-only operation.
+        // Sharing still happens by reference, which is what keeps a file copy a
+        // metadata-only operation: the new row names the object the old one has.
+        let copied = db
+            .transfer_files(
+                ws,
+                &[(first, "c.png".into())],
+                true,
+                true,
+                &HashMap::new(),
+                1,
+            )
+            .await
+            .unwrap();
+        let copy_id = copied[0].id;
+        assert_eq!(db.blobs.object_keys().len(), 2, "a copy stores no new bytes");
+
+        // Deleting one referrer must not pull the object out from under the other.
         db.delete_file(first).await.unwrap();
         db.maintain(2_000_000_000, 180, false).await.unwrap();
-        assert_eq!(db.blobs.object_keys().len(), 1, "still referenced elsewhere");
+        assert_eq!(db.blobs.object_keys().len(), 2, "still referenced by the copy");
         assert_eq!(
-            db.load_blob(second).await.unwrap().as_deref(),
+            db.load_blob(copy_id).await.unwrap().as_deref(),
             Some(b"duplicate bytes".as_ref())
         );
 
-        db.delete_file(second).await.unwrap();
+        db.delete_file(copy_id).await.unwrap();
         let report = db.maintain(2_000_000_000, 180, false).await.unwrap();
         assert!(report.released_objects >= 1, "the last delete frees the object");
+        assert_eq!(db.blobs.object_keys().len(), 1);
+
+        db.delete_file(second).await.unwrap();
+        db.maintain(2_000_000_000, 180, false).await.unwrap();
         assert!(db.blobs.object_keys().is_empty());
     }
 
@@ -4585,6 +5126,14 @@ mod tests {
                 .unwrap();
         assert_eq!(inline_data, b"kept inline");
         assert!(key.is_none(), "the inline backend names no objects");
+        // And no key either. An install that keeps bytes in rows has nothing sealed
+        // for a key to destroy, so minting one would be a shredding claim about
+        // content it still holds in the clear.
+        let (keys,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM org_keys")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(keys, 0, "an inline install mints no organization keys");
         assert_eq!(db.load_blob(id).await.unwrap().as_deref(), Some(b"kept inline".as_ref()));
         assert_eq!(db.blob_bytes().await.unwrap(), 11);
         assert_eq!(db.object_bytes().await.unwrap(), 0);
@@ -4602,6 +5151,179 @@ mod tests {
         let encoded = row["data"].as_str().expect("export must materialize content");
         assert_eq!(B64.decode(encoded).unwrap(), b"archive me please");
         assert!(row["storage_key"].is_null(), "an archive names no objects");
+    }
+
+    /// Two tenants, each with a note, an upload and a pasted image — three content
+    /// paths, because a scoped archive can be wrong about any one of them alone.
+    ///
+    /// Every byte is tagged with its tenant, so "did the other tenant leak" is a
+    /// string search rather than a set of id comparisons that has to be remembered
+    /// whenever a table is added.
+    async fn seed_two_tenants_with_content(db: &Database) -> (i64, i64) {
+        db.create_user_if_absent("owner", "Owner", "pw", "root", None)
+            .await
+            .unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let (org_a, group_a, ws_a) = seed_org(db, owner.id, "Alpha").await;
+        let (org_b, group_b, ws_b) = seed_org(db, owner.id, "Beta").await;
+        for (org, group, ws, tag) in [
+            (org_a, group_a, ws_a.id, "alpha"),
+            (org_b, group_b, ws_b.id, "beta"),
+        ] {
+            let doc_id = format!("doc-{tag}");
+            db.create_file(ws, &format!("{tag}.md"), &doc_id, "text", None, 1)
+                .await
+                .unwrap();
+            db.store(
+                &doc_id,
+                &PersistedDocument {
+                    text: format!("{tag} secret text"),
+                    language: Some("markdown".into()),
+                },
+            )
+            .await
+            .unwrap();
+            add_binary(db, ws, &format!("{tag}.png"), format!("{tag} bytes").as_bytes()).await;
+            db.create_chat_image(
+                org,
+                owner.id,
+                ChatImageScope { group_id: Some(group), dm_with: None },
+                Some("image/png"),
+                format!("{tag} paste").as_bytes(),
+                1,
+            )
+            .await
+            .unwrap();
+        }
+        (org_a, org_b)
+    }
+
+    #[tokio::test]
+    async fn a_single_organization_archive_carries_only_that_organization() {
+        let (_tmp, db) = test_database().await;
+        let (org_a, _org_b) = seed_two_tenants_with_content(&db).await;
+
+        let snapshot = db.export_org_snapshot(org_a).await.unwrap();
+        let text = serde_json::to_string(&snapshot).unwrap();
+        // Content travels base64-encoded, so that is the form worth searching for:
+        // it is what "the archive carries this tenant's bytes" means, and it is the
+        // same form a sealed object's bytes would arrive in if unsealing had not
+        // happened.
+        let alpha = [B64.encode(b"alpha bytes"), B64.encode(b"alpha paste")];
+        let beta = [B64.encode(b"beta bytes"), B64.encode(b"beta paste")];
+        // The other tenant's identity and its bytes are both absent: a note that was
+        // never in scope, content that was never in scope, and the tenant's own name.
+        let mut absent =
+            vec!["doc-beta".to_string(), "beta secret text".to_string(), "Beta".to_string()];
+        absent.extend(beta.iter().cloned());
+        for needle in &absent {
+            assert!(
+                !text.contains(needle.as_str()),
+                "the archive carries the other organization: {needle}"
+            );
+        }
+        // And this tenant's content is here in the clear, which is the only shape a
+        // restoring install can use: it holds different organization keys, so sealed
+        // bytes in an archive are bytes nobody can ever read again.
+        assert!(
+            text.contains("alpha secret text"),
+            "the archive lost its own note"
+        );
+        for needle in &alpha {
+            assert!(
+                text.contains(needle.as_str()),
+                "the archive lost its own content, or shipped it sealed: {needle}"
+            );
+        }
+
+        let orgs = snapshot["org"].as_array().unwrap();
+        assert_eq!(orgs.len(), 1, "one organization, one row");
+        assert_eq!(orgs[0]["id"].as_i64(), Some(org_a));
+        // Users are the one table that is deliberately wider than the tenant: its
+        // members plus this install's owners, so the archive can be signed into.
+        for row in snapshot["users"].as_array().unwrap() {
+            let belongs = row["org_id"].is_null()
+                || row["org_id"].as_i64() == Some(org_a)
+                || row["role"].as_str() == Some("root");
+            assert!(belongs, "a foreign tenant's account travelled with the archive: {row}");
+        }
+        assert_eq!(snapshot["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["workspace"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["file"].as_array().unwrap().len(), 2, "a note and an upload");
+        assert_eq!(snapshot["file_blob"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["chat_image"].as_array().unwrap().len(), 1);
+        let docs: Vec<String> = snapshot["document"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(docs, vec!["doc-alpha".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_organization_archive_restores_onto_an_instance_holding_nothing_else() {
+        let (_tmp, source) = test_database().await;
+        let (org_a, org_b) = seed_two_tenants_with_content(&source).await;
+        let snapshot = source.export_org_snapshot(org_a).await.unwrap();
+        let tables: Vec<(String, Vec<serde_json::Value>)> = Database::MIGRATE_TABLES
+            .iter()
+            .map(|name| ((*name).to_string(), snapshot[*name].as_array().unwrap().clone()))
+            .collect();
+
+        let (_tmp2, target) = test_database().await;
+        assert!(
+            target.orgs_other_than(org_a).await.unwrap().is_empty(),
+            "a fresh instance must pass the guard its own archive relies on"
+        );
+        target.import_replace_all(&tables).await.unwrap();
+
+        assert_eq!(
+            target.load("doc-alpha").await.unwrap().text,
+            "alpha secret text",
+            "the tenant's note reads back after the trip"
+        );
+        let (orgs,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM org")
+            .fetch_one(&target.pool)
+            .await
+            .unwrap();
+        assert_eq!(orgs, 1, "the archive brought one organization, not two");
+        let (foreign,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM org WHERE id = $1")
+            .bind(org_b)
+            .fetch_one(&target.pool)
+            .await
+            .unwrap();
+        assert_eq!(foreign, 0);
+        // Its content went back into this install's object store, under this
+        // install's key for this organization — not as the archive's plaintext.
+        let keys = target.blobs.object_keys();
+        assert_eq!(keys.len(), 2, "an upload and a paste");
+        assert!(
+            keys.iter().all(|key| key.starts_with(&format!("o{org_a}-"))),
+            "restored content is sealed for the tenant that owns it: {keys:?}"
+        );
+        let (file_id,): (i64,) = sqlx::query_as("SELECT file_id FROM file_blob")
+            .fetch_one(&target.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            target.load_blob(file_id).await.unwrap().as_deref(),
+            Some(b"alpha bytes".as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_org_guard_names_the_tenants_a_single_organization_archive_would_destroy() {
+        let (_tmp, db) = test_database().await;
+        let (org_a, org_b) = seed_two_tenants_with_content(&db).await;
+        let others = db.orgs_other_than(org_a).await.unwrap();
+        assert_eq!(others.len(), 1, "one tenant is one refusal");
+        assert_eq!(others[0].0, org_b);
+        assert_eq!(others[0].1, "Beta", "and the refusal names it");
+        assert_eq!(db.orgs_other_than(org_b).await.unwrap().len(), 1);
+        // Restoring tenant A's own archive onto tenant A's instance is a restore,
+        // not a collision: the same id is not "another organization".
+        assert!(db.orgs_other_than(org_a).await.unwrap().iter().all(|(id, _)| *id != org_a));
     }
 
     #[tokio::test]
@@ -4663,12 +5385,100 @@ mod tests {
         target.import_replace_all(&tables).await.unwrap();
         let keys = target.blobs.object_keys();
         assert_eq!(keys.len(), 1, "the import rehomed the content");
+        // Rehomed means sealed for the organization the archive says owns it. An
+        // import that stored the archive's plaintext instead would read back fine
+        // here and be unshreddable forever after.
+        let (org_id,): (i64,) = sqlx::query_as("SELECT id FROM org")
+            .fetch_one(&target.pool)
+            .await
+            .unwrap();
+        assert!(
+            keys[0].starts_with(&format!("o{org_id}-")),
+            "the imported object is named for its organization: {keys:?}"
+        );
+        let stored = target.blobs.get(&keys[0]).expect("object is on disk");
+        assert!(
+            keystore::is_sealed(&stored),
+            "imported content must not sit in the object store in the clear"
+        );
+        assert!(!stored.windows(b"bytes that travel".len()).any(|w| w == b"bytes that travel"));
+        let (key_rows,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM org_keys WHERE org_id = (SELECT id FROM org LIMIT 1)",
+        )
+        .fetch_one(&target.pool)
+        .await
+        .unwrap();
+        assert_eq!(key_rows, 1, "the organization's key came with its content");
         let files: Vec<(i64,)> =
             sqlx::query_as("SELECT file_id FROM file_blob").fetch_all(&target.pool).await.unwrap();
         assert_eq!(
             target.load_blob(files[0].0).await.unwrap().as_deref(),
             Some(b"bytes that travel".as_ref())
         );
+    }
+
+    #[tokio::test]
+    async fn a_read_never_mints_an_organization_key() {
+        let (_tmp, db) = test_database().await;
+        let (org, ws) = seed_routed_workspace(&db).await;
+        let id = add_binary(&db, ws, "a.png", b"sealed bytes").await;
+        assert_eq!(db.load_blob(id).await.unwrap().as_deref(), Some(b"sealed bytes".as_ref()));
+
+        // Destroy the key the way a shred does, leaving the object where it is.
+        sqlx::query("DELETE FROM org_keys WHERE org_id = $1")
+            .bind(org)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // The read has to fail, and fail without "helping" by creating a key: a
+        // freshly minted one cannot open bytes sealed under the old, and the row
+        // would then look healthy while naming content nobody can ever read.
+        let err = db.load_blob(id).await.unwrap_err().to_string();
+        assert!(err.contains("data key is gone"), "unexpected error: {err}");
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM org_keys")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a read cannot mint a key");
+        // Writing new content is a different matter, and still works.
+        let other = add_binary(&db, ws, "b.png", b"fresh bytes").await;
+        assert_eq!(db.load_blob(other).await.unwrap().as_deref(), Some(b"fresh bytes".as_ref()));
+    }
+
+    #[tokio::test]
+    async fn shredding_an_organization_destroys_its_objects_and_not_a_neighbours() {
+        let (_tmp, db) = test_database().await;
+        let (org_a, ws_a, org_b, ws_b) = seed_two_orgs(&db).await;
+        let a = add_binary(&db, ws_a, "a.png", b"same bytes").await;
+        let b = add_binary(&db, ws_b, "b.png", b"same bytes").await;
+        assert_eq!(db.blobs.object_keys().len(), 2, "two organizations, two objects");
+
+        db.delete_org(org_a).await.unwrap();
+
+        let keys = db.blobs.object_keys();
+        assert_eq!(keys.len(), 1, "the shredded organization left no object behind");
+        // The surviving name is what proves the first organization ever held its own
+        // sealed object: unsealed content is named by its hash, and this assertion
+        // would pass on an install that cannot shred anything.
+        assert!(keys[0].starts_with(&format!("o{org_b}-")), "neighbour kept: {keys:?}");
+        assert_eq!(
+            db.load_blob(b).await.unwrap().as_deref(),
+            Some(b"same bytes".as_ref()),
+            "the other organization's identical content still reads"
+        );
+        assert!(db.load_blob(a).await.unwrap().is_none(), "its row is gone too");
+        let stored = db.blobs.get(&keys[0]).expect("object is on disk");
+        assert!(
+            !stored.windows(b"same bytes".len()).any(|w| w == b"same bytes"),
+            "what remains on disk is ciphertext"
+        );
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM org_keys WHERE org_id = $1")
+            .bind(org_a)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "the key went with the organization");
     }
 
     async fn assert_no_bad_foreign_keys(db: &Database) {

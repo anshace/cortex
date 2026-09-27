@@ -108,6 +108,76 @@ pub fn open(tag: &str, sealed: &str) -> Option<String> {
     String::from_utf8(plain).ok()
 }
 
+/// Tag organization data keys are wrapped under. One tag for all of them is
+/// deliberate: the per-organization secrecy comes from the random key inside
+/// each row, not from a different derivation per organization — a key derived
+/// from the master would survive every restore of the master and silently
+/// un-shred everything.
+const ORG_DEK_TAG: &str = "org.dek";
+
+/// Marker on stored bytes that are sealed under an organization key. An object
+/// without it predates sealing and is returned as written, so upgrading never
+/// turns an install's own history into unreadable data.
+pub const SEALED_MAGIC: &[u8] = b"CSX1";
+
+/// A fresh organization key, base64, ready to be wrapped for storage.
+pub fn new_dek() -> String {
+    B64.encode(random_key())
+}
+
+/// The stored form of an organization key. `None` when no master key is loaded,
+/// which a caller must treat as "this install cannot seal content, and cannot
+/// shred it" — never as permission to write it in the clear and hope.
+pub fn wrap_dek(dek_b64: &str) -> Option<String> {
+    seal(ORG_DEK_TAG, dek_b64)
+}
+
+/// The plaintext organization key. `None` covers a shredded row, a key wrapped
+/// by another install's master, and corrupt bytes alike.
+pub fn unwrap_dek(sealed: &str) -> Option<[u8; 32]> {
+    let raw = B64.decode(open(ORG_DEK_TAG, sealed)?.trim()).ok()?;
+    raw.try_into().ok()
+}
+
+/// Seal content bytes for one organization.
+///
+/// The nonce is random per call, so storing identical content twice produces two
+/// objects. That is the cost of shredding: one object shared by two organizations
+/// is content that survives the deletion of either one's key. Sharing still works
+/// *by reference* — a file copy reuses the stored name — which is why copying a
+/// file remains a metadata-only operation.
+pub fn seal_bytes(key: &[u8; 32], plain: &[u8]) -> Vec<u8> {
+    let cipher = Aes256Gcm::new_from_slice(key).expect("32 bytes is a valid AES-256 key");
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let body = cipher
+        .encrypt(Nonce::from_slice(&nonce), plain)
+        .expect("AES-GCM encryption does not fail on input this size");
+    let mut out = SEALED_MAGIC.to_vec();
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Reverse of [`seal_bytes`]. `None` when the marker is missing, the key is gone,
+/// or the tag does not check — all of which mean the same thing to a caller:
+/// these bytes cannot be read, and saying so is the whole point.
+pub fn open_bytes(key: &[u8; 32], stored: &[u8]) -> Option<Vec<u8>> {
+    let rest = stored.strip_prefix(SEALED_MAGIC)?;
+    if rest.len() <= NONCE_LEN {
+        return None;
+    }
+    let cipher = Aes256Gcm::new_from_slice(key).ok()?;
+    cipher
+        .decrypt(Nonce::from_slice(&rest[..NONCE_LEN]), &rest[NONCE_LEN..])
+        .ok()
+}
+
+/// True when stored bytes are sealed rather than plain.
+pub fn is_sealed(stored: &[u8]) -> bool {
+    stored.starts_with(SEALED_MAGIC)
+}
+
 /// Per-column subkey, so one column's plaintext recovery is not another's.
 fn subkey(tag: &str) -> Option<[u8; 32]> {
     let master = MASTER.get()?;

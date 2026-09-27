@@ -32,7 +32,15 @@ use tempfile::NamedTempFile;
 /// every row and every table matched, which is the signature of a canary
 /// measuring line endings rather than stored data. Both trees now agree on the
 /// value below, so it says what an install stores, not which checkout ran it.
-const BEFORE_ROUTING: &str = "56b80e452303b3313e3bbbd2f3131524770ec8b47c60929aeb9bde88a6470a2c";
+///
+/// Re-recorded again for organization data keys, and the reason is measured rather
+/// than assumed: with this one table removed from the hash the script reproduces
+/// the previous value exactly, so the whole difference is a `CREATE TABLE` that a
+/// default install leaves empty. That is true because `BLOB_BACKEND` is unset here
+/// — an inline install stores bytes in rows, has nothing to seal, and must not mint
+/// a key it would only misreport. Sealing therefore changes what a *filesystem
+/// object store* holds, which this test does not claim to cover.
+const BEFORE_ROUTING: &str = "eab70ba465436312c90fec8865db9e0b14916c70596fc424833fa13ef5b18f31";
 
 /// Tables that say nothing about the data an install holds: `PRAGMA optimize`
 /// fills the first from a random sample of rows, and sqlx writes how long each
