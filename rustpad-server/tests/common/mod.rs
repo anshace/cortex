@@ -1,7 +1,33 @@
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
+use std::time::Duration;
+use tokio::time;
 use warp::{filters::BoxedFilter, test::WsClient, Reply};
+
+/// How long a settled advance lets the server's background tasks run.
+const SETTLE: Duration = Duration::from_millis(400);
+
+/// Jump the clock forward `hours` hours, then let the server settle.
+///
+/// `time::advance` only works while the clock is paused, and a paused clock
+/// makes every deadline virtual — including the deadline the database pool puts
+/// on waiting for a connection, which then elapses the instant it is armed.
+///
+/// The jump also wakes the tasks the server started in the background when the
+/// routes were built: the persister, the cleaner, and the daily maintenance
+/// pass, which holds the only pooled connection for as long as it works. Asking
+/// the database for anything while that pass is still running is how these
+/// suites used to fail with `pool timed out` and a 500 from login. Resuming the
+/// clock and waiting real time lets whatever fired finish and go back to sleep,
+/// so the request that follows is never in contention with it. Leaves the clock
+/// resumed, so a second call pauses it again.
+pub async fn advance_hours(hours: u64) {
+    time::pause();
+    time::advance(Duration::from_secs(hours * 3600)).await;
+    time::resume();
+    time::sleep(SETTLE).await;
+}
 
 /// The client half of the app-layer protocol `src/crypto.rs` implements: an
 /// ephemeral P-256 key announced in the first frame, and an AES-256-GCM key

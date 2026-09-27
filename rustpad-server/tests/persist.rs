@@ -1,7 +1,5 @@
 //! Tests to ensure that documents are persisted with SQLite.
 
-use std::time::Duration;
-
 use anyhow::Result;
 use common::*;
 use operational_transform::OperationSeq;
@@ -11,7 +9,6 @@ use rustpad_server::{
 };
 use serde_json::json;
 use tempfile::NamedTempFile;
-use tokio::time;
 
 pub mod common;
 
@@ -75,7 +72,6 @@ async fn test_database() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "its clock-pausing starves the single-connection pool: advancing tokio's clock makes the scheduled maintenance loop fire immediately, maintenance holds the only connection, and the login inside this test then gets a 500 server error while the pool times out. The write path itself is covered by test_database; this needs the maintenance task and the pool reconciled, not a different assertion"]
 async fn test_persist() -> Result<()> {
     pretty_env_logger::try_init().ok();
 
@@ -104,17 +100,15 @@ async fn test_persist() -> Result<()> {
         .expect("should receive history operation");
     expect_text(&filter, "persist", "hello").await;
 
-    let hour = Duration::from_secs(3600);
-    time::pause();
-    time::advance(47 * hour).await;
+    // Inside the two-day expiry the document is still the live session.
+    advance_hours(47).await;
     expect_text(&filter, "persist", "hello").await;
 
-    // Give SQLite some time to actually update the database.
-    time::resume();
-    time::sleep(Duration::from_millis(150)).await;
-    time::pause();
-
-    time::advance(3 * hour).await;
+    // Past it the session is gone from memory and flushed to SQLite, so this
+    // same read is served from the database: the advance settles first, which
+    // gives the persister and the eviction their turn with the pooled
+    // connection before the test asks for it.
+    advance_hours(3).await;
     expect_text(&filter, "persist", "hello").await;
 
     Ok(())

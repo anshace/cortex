@@ -174,15 +174,32 @@ async fn test_multiple_operations() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "waits on a frame that never arrives: after its edit is broadcast, the test expects a cursor acknowledgment, and the strict frame ordering this suite now uses cannot be satisfied without deciding which frames the cursor path really owes. Investigate the frame sequence rather than converting it to the skipping reader, which would hide the cursor broadcast this test exists to assert"]
 async fn test_unicode_cursors() -> Result<()> {
     pretty_env_logger::try_init().ok();
     let config = sqlite_config(1).await;
     seed_doc(&config, "unicode").await;
     let filter = server(config);
 
+    // Every read here is the strict `recv_frame`: this test is about the
+    // `UserCursor` frames, and the skipping reader discards exactly those.
+    //
+    // Measured order for this document, per socket:
+    //   join          -> Identity, then the baseline `History`
+    //   own edit      -> `History` acknowledging it
+    //   own CursorData-> `UserCursor` broadcast back to everyone
+    //   someone else joining -> their Identity, the whole history so far, then
+    //                            a `UserCursor` replayed from server state
     let mut client = connect(&filter, "unicode").await?;
-    assert_eq!(client.recv().await?, json!({ "Identity": 0 }));
+    assert_eq!(client.recv_frame().await?, json!({ "Identity": 0 }));
+    assert_eq!(
+        client.recv_frame().await?,
+        json!({
+            "History": {
+                "start": 0,
+                "operations": [{ "id": u64::MAX as usize, "operation": [] }]
+            }
+        })
+    );
 
     let mut operation = OperationSeq::default();
     operation.insert("🎉🎉🎉");
@@ -194,10 +211,15 @@ async fn test_unicode_cursors() -> Result<()> {
     });
     info!("sending ClientMsg {}", msg);
     client.send(&msg).await;
-    // Two frames are owed here: the baseline history this client was replayed
-    // when it joined, then the history its own edit produced.
-    client.recv_frame().await?;
-    client.recv_frame().await?;
+    assert_eq!(
+        client.recv_frame().await?,
+        json!({
+            "History": {
+                "start": 1,
+                "operations": [{ "id": 0, "operation": ["🎉🎉🎉"] }]
+            }
+        })
+    );
 
     let cursors = json!({
         "cursors": [0, 1, 2, 3],
@@ -211,24 +233,63 @@ async fn test_unicode_cursors() -> Result<()> {
             "data": cursors
         }
     });
-    assert_eq!(client.recv().await?, cursors_resp);
+    assert_eq!(client.recv_frame().await?, cursors_resp);
 
+    // The joiner is replayed the state as it stands: the history, then the
+    // cursor the first client announced. Nothing about that replay is
+    // transformed yet — no edit has happened since.
     let mut client2 = connect(&filter, "unicode").await?;
-    assert_eq!(client2.recv().await?, json!({ "Identity": 1 }));
-    client2.recv_frame().await?;
-    assert_eq!(client2.recv().await?, cursors_resp);
+    assert_eq!(client2.recv_frame().await?, json!({ "Identity": 1 }));
+    assert_eq!(
+        client2.recv_frame().await?,
+        json!({
+            "History": {
+                "start": 0,
+                "operations": [
+                    { "id": u64::MAX as usize, "operation": [] },
+                    { "id": 0, "operation": ["🎉🎉🎉"] }
+                ]
+            }
+        })
+    );
+    assert_eq!(client2.recv_frame().await?, cursors_resp);
 
+    // Insert before the cursor positions: every stored index has to move.
     let msg = json!({
         "Edit": {
             "revision": 0,
             "operation": ["🎉"]
         }
     });
+    info!("sending ClientMsg {}", msg);
     client2.send(&msg).await;
 
+    let edit_resp = json!({
+        "History": {
+            "start": 2,
+            "operations": [{ "id": 1, "operation": ["🎉", 3] }]
+        }
+    });
+    assert_eq!(client2.recv_frame().await?, edit_resp);
+    assert_eq!(client.recv_frame().await?, edit_resp);
+
+    // Whoever joins after that edit is replayed the transformed cursor state,
+    // which is the only place the server's cursor bookkeeping is observable.
     let mut client3 = connect(&filter, "unicode").await?;
-    assert_eq!(client3.recv().await?, json!({ "Identity": 2 }));
-    client3.recv().await?;
+    assert_eq!(client3.recv_frame().await?, json!({ "Identity": 2 }));
+    assert_eq!(
+        client3.recv_frame().await?,
+        json!({
+            "History": {
+                "start": 0,
+                "operations": [
+                    { "id": u64::MAX as usize, "operation": [] },
+                    { "id": 0, "operation": ["🎉🎉🎉"] },
+                    { "id": 1, "operation": ["🎉", 3] }
+                ]
+            }
+        })
+    );
 
     let transformed_cursors_resp = json!({
         "UserCursor": {
@@ -239,7 +300,7 @@ async fn test_unicode_cursors() -> Result<()> {
             }
         }
     });
-    assert_eq!(client3.recv().await?, transformed_cursors_resp);
+    assert_eq!(client3.recv_frame().await?, transformed_cursors_resp);
 
     Ok(())
 }
