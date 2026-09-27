@@ -460,6 +460,35 @@ pub struct Database {
 /// Hands every opened database an identity no other database can share.
 static POOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// How long a request waits for the one pooled connection before the server
+/// says the database is busy.
+///
+/// This is the difference between a slow moment and a refused sign-in, so it is
+/// set against what actually holds the connection: housekeeping runs one short
+/// statement at a time and gives the connection back between them, which leaves
+/// `VACUUM` as the only thing a request can be queued behind for seconds. SQLx's
+/// 30-second default spends thirty seconds deciding a database is busy; four is
+/// long enough to ride out a compaction of a modest file and short enough that a
+/// genuinely stuck writer is reported while the user is still looking at it.
+const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Bytes of database file an unattended pass may rewrite with `VACUUM`, or zero
+/// for no bound.
+///
+/// `VACUUM`'s cost is a property of the install's size and of nothing else, and
+/// because it cannot be interrupted it is the one part of housekeeping a request
+/// can be made to wait for. `CORTEX_VACUUM_MAX_DB_MB` is the bound an operator
+/// sets when their database has grown past a second; unset or zero, which is how
+/// an install starts, bounds nothing and every pass compacts when the free pages
+/// justify it — exactly as it does today.
+fn vacuum_ceiling_bytes() -> i64 {
+    std::env::var("CORTEX_VACUUM_MAX_DB_MB")
+        .ok()
+        .and_then(|mb| mb.trim().parse::<i64>().ok())
+        .filter(|mb| *mb > 0)
+        .map_or(0, |mb| mb * 1024 * 1024)
+}
+
 // These helpers share the caller's transaction. File content, chats, reactions
 // and membership must disappear together or not at all (including on old DBs).
 async fn delete_workspace_tx(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<Vec<String>> {
@@ -646,8 +675,19 @@ impl Database {
         // immediately with SQLITE_BUSY_SNAPSHOT despite busy_timeout. One
         // writer/reader connection serializes in-process operations; WAL
         // still lets external backup readers coexist with the application.
+        // A measured corollary, in tests/maintenance_busy.rs: a second
+        // connection in *this* process can invalidate the snapshot a running
+        // transaction has already read — `VACUUM` there costs an application
+        // write indefinitely, not merely an error — so housekeeping stays on
+        // this connection too, and yields it between statements instead.
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            // What "the connection is held" costs a request. Housekeeping is
+            // now one statement at a time (see [`Database::sweep`]), so a wait
+            // this long means something genuinely uninterruptible is running —
+            // a compaction — and SQLx's 30-second default would spend it
+            // deciding that the database is busy.
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .connect_with(options)
             .await?;
         sqlx::migrate!().run(&pool).await?;
@@ -2676,59 +2716,100 @@ impl Database {
         Ok(pages * size)
     }
 
-    /// Daily in-app housekeeping. VACUUM is deliberately outside the tx: it
-    /// temporarily needs additional disk space and an exclusive write lock.
-    /// Avoid doing it for tiny files/short-lived free pages. Explicit owner
-    /// requests force compaction regardless of the free-page threshold.
+    /// One housekeeping sweep: a single DELETE, in a transaction of its own.
+    ///
+    /// The pool has exactly one connection, and a request that cannot get it is
+    /// refused as busy — so the grain at which housekeeping commits is the grain
+    /// at which it yields. Run as one seven-statement transaction, a pass holds
+    /// that connection for the sum of its statements and every request arriving
+    /// inside the window is told the database is busy; run one statement at a
+    /// time, a waiting request takes the connection in the gap between two
+    /// sweeps, and the worst queue a request can be given is a single DELETE.
+    ///
+    /// Nothing here needs the sweeps to land together: each is an idempotent
+    /// repair that re-runs on the next pass. The one pair that does need it —
+    /// orphan documents and their routing rows — commits together in
+    /// [`Self::sweep_pair`], because a routing row that outlives its document by
+    /// even one transaction is a tenant database the control plane still
+    /// believes it must keep.
+    async fn sweep(&self, statement: &str, bind: Option<i64>) -> Result<u64> {
+        let mut query = sqlx::query(statement);
+        if let Some(value) = bind {
+            query = query.bind(value);
+        }
+        let mut tx = self.pool.begin().await?;
+        let rows = query.execute(&mut *tx).await?.rows_affected();
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    /// Two statements that must disappear together, counted by the first.
+    async fn sweep_pair(&self, first: &str, second: &str) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(first).execute(&mut *tx).await?.rows_affected();
+        sqlx::query(second).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    /// Daily in-app housekeeping.
+    ///
+    /// Every step runs on the application's own connection, because a second
+    /// connection in this process can invalidate the snapshot a running
+    /// transaction has already read — see [`Self::open_pool`] and the measurement
+    /// in `tests/maintenance_busy.rs`. What keeps a request from being queued
+    /// behind the pass is therefore how the pass is cut up, not where it runs:
+    /// [`Self::sweep`] yields between statements, [`vacuum_ceiling_bytes`] bounds
+    /// the one statement that cannot be interrupted, and a step that cannot get
+    /// the write lock is reported as deferred rather than as a failed pass.
+    ///
+    /// VACUUM is outside the cleanup transactions because it temporarily needs
+    /// additional disk space and the write lock. Avoid doing it for tiny
+    /// files/short-lived free pages. Explicit owner requests force compaction
+    /// regardless of the free-page threshold or the size bound.
     pub async fn maintain(&self, now: i64, retention_days: i64, force: bool) -> Result<MaintenanceReport> {
         let _guard = self.maintenance_lock.lock().await;
         let db_bytes_before = self.db_size_bytes().await?;
-        let mut tx = self.pool.begin().await?;
-        let expired_sessions = sqlx::query("DELETE FROM session WHERE expires_at <= $1")
-            .bind(now)
-            .execute(&mut tx)
-            .await?
-            .rows_affected();
-        let orphan_documents = sqlx::query(
-            "DELETE FROM document WHERE NOT EXISTS (SELECT 1 FROM file WHERE file.doc_id = document.id AND file.kind = 'text')",
-        )
-        .execute(&mut tx)
-        .await?
-        .rows_affected();
-        // A routing row for a document no file names any more is a pointer to
-        // nothing. Every delete path drops its rows in-transaction; this sweep
-        // is the belt-and-braces repair, the same kind boot-time backfill is.
-        sqlx::query("DELETE FROM doc_org WHERE doc_id NOT IN (SELECT doc_id FROM file)")
-            .execute(&mut tx)
+        let expired_sessions = self
+            .sweep("DELETE FROM session WHERE expires_at <= $1", Some(now))
             .await?;
-        let orphan_blobs = sqlx::query(
-            "DELETE FROM file_blob WHERE NOT EXISTS (SELECT 1 FROM file WHERE file.id = file_blob.file_id)",
-        )
-        .execute(&mut tx)
-        .await?
-        .rows_affected();
-        let orphan_reactions = sqlx::query(
-            "DELETE FROM reaction WHERE (kind = 'ws' AND NOT EXISTS (SELECT 1 FROM message WHERE message.id = reaction.msg_id)) OR (kind = 'dm' AND NOT EXISTS (SELECT 1 FROM dm WHERE dm.id = reaction.msg_id)) OR kind NOT IN ('ws', 'dm') OR NOT EXISTS (SELECT 1 FROM users WHERE users.id = reaction.user_id)",
-        )
-        .execute(&mut tx)
-        .await?
-        .rows_affected();
+        // A routing row for a document no file names any more is a pointer to
+        // nothing, so the two sweeps share a transaction. Every delete path
+        // drops both in-transaction; this repair is the belt-and-braces sweep,
+        // the same kind boot-time backfill is.
+        let orphan_documents = self
+            .sweep_pair(
+                "DELETE FROM document WHERE NOT EXISTS (SELECT 1 FROM file WHERE file.doc_id = document.id AND file.kind = 'text')",
+                "DELETE FROM doc_org WHERE doc_id NOT IN (SELECT doc_id FROM file)",
+            )
+            .await?;
+        let orphan_blobs = self
+            .sweep(
+                "DELETE FROM file_blob WHERE NOT EXISTS (SELECT 1 FROM file WHERE file.id = file_blob.file_id)",
+                None,
+            )
+            .await?;
+        let orphan_reactions = self
+            .sweep(
+                "DELETE FROM reaction WHERE (kind = 'ws' AND NOT EXISTS (SELECT 1 FROM message WHERE message.id = reaction.msg_id)) OR (kind = 'dm' AND NOT EXISTS (SELECT 1 FROM dm WHERE dm.id = reaction.msg_id)) OR kind NOT IN ('ws', 'dm') OR NOT EXISTS (SELECT 1 FROM users WHERE users.id = reaction.user_id)",
+                None,
+            )
+            .await?;
         // Give in-flight pasted images a week to be referenced by a message.
         // `instr` may keep a false-positive numeric prefix, never delete a
         // referenced image. Images for a deleted org are already removed there.
-        let orphan_chat_images = sqlx::query(
-            "DELETE FROM chat_image WHERE created_at < $1 AND NOT EXISTS (SELECT 1 FROM message WHERE message.org_id = chat_image.org_id AND instr(message.body, '/api/chat-image/' || chat_image.id) > 0) AND NOT EXISTS (SELECT 1 FROM dm WHERE dm.org_id = chat_image.org_id AND instr(dm.body, '/api/chat-image/' || chat_image.id) > 0)",
-        )
-        .bind(now - 7 * 86400)
-        .execute(&mut tx)
-        .await?
-        .rows_affected();
-        let pruned_audit = sqlx::query("DELETE FROM audit WHERE created_at < $1")
-            .bind(now - retention_days.clamp(1, 36_500) * 86400)
-            .execute(&mut tx)
-            .await?
-            .rows_affected();
-        tx.commit().await?;
+        let orphan_chat_images = self
+            .sweep(
+                "DELETE FROM chat_image WHERE created_at < $1 AND NOT EXISTS (SELECT 1 FROM message WHERE message.org_id = chat_image.org_id AND instr(message.body, '/api/chat-image/' || chat_image.id) > 0) AND NOT EXISTS (SELECT 1 FROM dm WHERE dm.org_id = chat_image.org_id AND instr(dm.body, '/api/chat-image/' || chat_image.id) > 0)",
+                Some(now - 7 * 86400),
+            )
+            .await?;
+        let pruned_audit = self
+            .sweep(
+                "DELETE FROM audit WHERE created_at < $1",
+                Some(now - retention_days.clamp(1, 36_500) * 86400),
+            )
+            .await?;
 
         // Objects are reclaimed only after the deletes above are committed: until
         // this point a row may still name them, and a content-addressed object can
@@ -2741,24 +2822,54 @@ impl Database {
         }
 
         let free_bytes_before = self.free_bytes().await?;
-        let vacuum_needed = force
-            || free_bytes_before >= 16 * 1024 * 1024
-                && free_bytes_before * 5 >= db_bytes_before;
+        // `VACUUM` is the one statement here that cannot be made short by
+        // yielding: it rewrites the whole live database and cannot be
+        // interrupted, so a request that arrives during it waits for it whatever
+        // the shape of the pass. Its duration belongs to the size of the file,
+        // which is what an operator can be asked about.
+        let ceiling = vacuum_ceiling_bytes();
+        let capped = !force && ceiling > 0 && db_bytes_before > ceiling;
+        let vacuum_needed = !capped
+            && (force
+                || free_bytes_before >= 16 * 1024 * 1024
+                    && free_bytes_before * 5 >= db_bytes_before);
+        if capped {
+            log::info!(
+                "housekeeping: no compaction, {} bytes of database is past CORTEX_VACUUM_MAX_DB_MB",
+                db_bytes_before
+            );
+        }
         // PASSIVE checkpoint does not wait for readers; a full VACUUM only
         // starts if a TRUNCATE checkpoint obtains the lock. Neither can run in
-        // the cleanup transaction above.
+        // the cleanup transactions above.
         let mode = if vacuum_needed { "TRUNCATE" } else { "PASSIVE" };
         let (checkpoint_busy, _, _): (i64, i64, i64) =
-            sqlx::query_as(&format!("PRAGMA wal_checkpoint({mode})"))
+            match sqlx::query_as::<_, (i64, i64, i64)>(&format!("PRAGMA wal_checkpoint({mode})"))
                 .fetch_one(&self.pool)
-                .await?;
-        let vacuumed = vacuum_needed && checkpoint_busy == 0;
+                .await
+            {
+                Ok(row) => row,
+                // Somebody else holds the writer — a backup, an import — so the
+                // WAL cannot be handed over now. That is a deferral, not a failed
+                // pass: the sweeps above are already committed, and the next tick
+                // catches up. Reporting it as an error would bury the one log
+                // line that says housekeeping actually ran.
+                Err(err) => {
+                    log::info!("housekeeping: WAL checkpoint deferred: {err}");
+                    (1, 0, 0)
+                }
+            };
+        let mut vacuumed = vacuum_needed && checkpoint_busy == 0;
         if vacuumed {
-            sqlx::query("VACUUM").execute(&self.pool).await?;
-            // VACUUM itself writes WAL pages; truncate those too when possible.
-            let _: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
-                .fetch_one(&self.pool)
-                .await?;
+            if let Err(err) = sqlx::query("VACUUM").execute(&self.pool).await {
+                log::info!("housekeeping: compaction deferred: {err}");
+                vacuumed = false;
+            } else {
+                // VACUUM itself writes WAL pages; truncate those too when possible.
+                let _: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .fetch_one(&self.pool)
+                    .await?;
+            }
         }
         sqlx::query("PRAGMA optimize").execute(&self.pool).await?;
         Ok(MaintenanceReport {

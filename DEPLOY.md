@@ -97,6 +97,27 @@ when enough space is reusable. Set `CORTEX_AUDIT_RETENTION_DAYS` (default 180)
 to tune audit history. The owner can force a run from **Settings → Storage →
 Compact now**; no cron, sidecar, or Docker-specific script is required.
 
+Housekeeping runs on the same database connection the application answers
+requests from, and that is deliberate: moving the long statements to a second
+connection was tried and measured, and it is worse — a `VACUUM` started there
+succeeds while an application transaction that had already read is still open,
+and that transaction's next write is never answered at all. What changed instead
+is how much of a pass a request can be stuck behind: every statement is now
+separately short and separately interruptible, and one refusing to run is a
+**deferral that is logged**, retried on the next tick, not a failed pass. A
+request can therefore wait behind one statement, never behind the whole sweep.
+
+One residual is worth stating plainly, because it is the reason for the knob
+below: `VACUUM` rewrites the whole live database and cannot be interrupted, so on
+an install that has grown it remains the single thing a sign-in can queue behind
+for seconds. Two consequences to know before filing a bug: **`VACUUM` can be
+reported as not-compact** while the server is busy, which is the intended
+priority, and a grown install can be told to stop trying in place —
+`CORTEX_VACUUM_MAX_DB_MB` is the size above which an unattended pass leaves the
+file alone (audit history and WAL checkpointing are unaffected). Unset, which is
+the default, it bounds nothing and every pass compacts when the free pages
+justify it; a forced **Compact now** ignores it.
+
 ## Updating
 
 ```sh
