@@ -20,7 +20,7 @@
 
 use anyhow::{bail, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -100,6 +100,59 @@ pub struct Report {
     pub orgs: Vec<OrgDbStatus>,
 }
 
+/// The tenant database files in one directory: `org-<id>.db`, sorted. A `-wal`
+/// or `-shm` sibling is not listed, because those mean nothing without their
+/// database and a half-restored pair is a different problem than this one.
+pub fn orphaned_tenant_databases(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("org-") && name.ends_with(".db"))
+                .unwrap_or(false)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[cfg(test)]
+mod orphan_tests {
+    use super::orphaned_tenant_databases;
+    use std::fs;
+
+    #[test]
+    fn tenant_files_are_found_by_name_and_in_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for name in ["org-9.db", "org-2.db", "org-2.db-wal", "authpad.db"] {
+            fs::write(dir.path().join(name), b"x").expect("write");
+        }
+        let found = orphaned_tenant_databases(dir.path());
+        assert_eq!(
+            found.len(),
+            2,
+            "the two tenants, not the WAL sibling or the control file: {found:?}"
+        );
+        assert!(found[0].ends_with("org-2.db"), "sorted, not directory order: {found:?}");
+        assert!(found[1].ends_with("org-9.db"), "sorted, not directory order: {found:?}");
+    }
+
+    #[test]
+    fn an_absent_or_empty_directory_is_not_an_error() {
+        assert!(
+            orphaned_tenant_databases(std::path::Path::new("/no/such/cortex/dir")).is_empty(),
+            "no directory yet is the normal state of a fresh install"
+        );
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert!(orphaned_tenant_databases(dir.path()).is_empty(), "nothing to find");
+    }
+}
+
 impl Databases {
     /// A registry pinned to one directory, so a test can have file-backed
     /// tenants without editing the process environment to get them. Identical to
@@ -107,6 +160,22 @@ impl Databases {
     #[cfg(test)]
     pub(crate) fn files_in(control: Database, dir: PathBuf) -> Self {
         Self::with_mode(control, Mode::Files(dir))
+    }
+
+    /// Tenant databases sitting on a disk this instance has stopped reading.
+    ///
+    /// The content migration runs forward only, so an install turned back to a
+    /// single database keeps its documents in `org-<id>.db` while the control
+    /// file no longer holds them: every document opens blank and reads as data
+    /// loss. Boot asks this instead of serving that state quietly.
+    pub fn orphaned_tenants(&self) -> Vec<PathBuf> {
+        if self.is_split() {
+            return Vec::new();
+        }
+        let dir = std::env::var("CORTEX_ORG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/data/orgs"));
+        orphaned_tenant_databases(&dir)
     }
 
     fn with_mode(control: Database, mode: Mode) -> Self {

@@ -28,3 +28,7 @@ REASERCH/
 
 # Agent worktree checkouts and their build caches.
 .qoder/
+
+# The data-key sidecar next to a database (see DEPLOY.md). Losing it makes sealed
+# columns unreadable; committing it would publish the key.
+*.key

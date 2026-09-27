@@ -281,19 +281,34 @@ in, so an owner is never guessing why a seat or an upload was refused.
   memory database when the control database itself is `sqlite::memory:`. It also
   replicates each organization's member *display* rows into that database, with
   placeholder emails and a password hash that bcrypt can never verify: signing in
-  is always a control-plane operation. **Read the honest part:** today that flag
-  provisions, migrates and reports per-tenant databases; it does not yet move
-  document content into them, because requests are still served from the control
-  database. Turning it on does **not** give you tenant isolation, and the files
-  it creates are structure with no content — so do not delete them if you flip
-  the flag back off.
-- **`/data/orgs` belongs to the backup set whenever `CORTEX_ORG_DBS=1`.** The
-  control database's `.db` alone no longer describes everything on the volume.
-  Deleting an organization unlinks its `org-<id>.db` and the `-wal`/`-shm`
-  siblings, which is also why the two must be restored *together*: putting an
-  older control `.db` back while keeping a newer `/data/orgs` (or the reverse)
-  can leave a tenant database for an organization the control plane no longer
-  knows about. Restore both from the same moment, or restore neither.
+  is always a control-plane operation.
+  **This flag now moves content.** A document's text lives in its own
+  organization's file; the control database keeps the `file` rows and the
+  `doc_org` routing index, so `org-<id>.db` is no longer structure without
+  substance and **deleting it deletes those documents**. Turning it on at boot
+  runs a resumable migration that moves existing rows out of the control file,
+  and it only ever moves them forward: there is **no path back to a single
+  database**. If you set the flag back off, the server stops looking in
+  `/data/orgs` while the control file no longer holds the text, and every
+  document opens empty — nothing is destroyed, but nothing is reachable either.
+  Turn it back on to see your data again; treat removing the flag as a data
+  migration you have not been given a tool for.
+- **`/data/orgs` belongs to the backup set whenever `CORTEX_ORG_DBS=1`, and a
+  backup is then N+1 databases plus the objects.** The control database's `.db`
+  alone no longer describes everything on the volume: it holds identity, files,
+  routing and quotas, and the documents themselves sit one file per organization.
+  **Restoring only the control file resurrects identity with nothing behind it** —
+  the console will list every file and every workspace, and each text file will
+  open blank, which reads like data loss and is really a half restore. Deleting an
+  organization unlinks its `org-<id>.db` and the `-wal`/`-shm` siblings, which is
+  also why the two must be restored *together*: putting an older control `.db`
+  back while keeping a newer `/data/orgs` (or the reverse) can leave a tenant
+  database for an organization the control plane no longer knows about, or hide a
+  document the control plane still names. Restore both from the same moment, or
+  restore neither. The one artifact that still carries a whole instance in a
+  single file is the console's ZIP export: it folds every organization's content
+  inline, so it survives being restored onto an install with a different storage
+  layout, and an import provisions the tenant databases the archive names.
 - If you later buy a real domain, point an A record at the Elastic IP and just
   change `DOMAIN=`.
 

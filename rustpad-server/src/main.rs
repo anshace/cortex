@@ -38,6 +38,20 @@ async fn main() {
     // registry holds this handle — so the registry can only be attached after
     // both exist, which is what the line below is for.
     database.attach_registries(databases.clone());
+    // Content moves to a tenant database and does not move back. Starting in
+    // single mode beside those files would serve a control database that has no
+    // text in it, so every document would open blank and look destroyed.
+    let orphans = databases.orphaned_tenants();
+    if !orphans.is_empty() {
+        log::error!(
+            "refusing to start: per-organization storage is off, but {} tenant database(s) exist: {:?}. \
+             Their documents are readable only with CORTEX_ORG_DBS=1. Nothing has been deleted — set the \
+             flag back on, or move these files aside deliberately.",
+            orphans.len(),
+            orphans,
+        );
+        std::process::exit(2);
+    }
     match databases.migrate_all().await {
         Ok(moved) => {
             if moved > 0 {
