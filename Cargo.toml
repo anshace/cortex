@@ -2,6 +2,24 @@
 resolver = "2"
 members = ["rustpad-server", "rustpad-wasm"]
 
+# Keep `target/` to a few gigabytes instead of tens of them.
+#
+# Debug info is what made it grow: this workspace links nine separate test
+# binaries (eight files in `rustpad-server/tests/` plus the library's own unit
+# tests), each one pulling in the whole `rustpad-server` library and its
+# dependencies, and each carrying its own copy of that debug info. After a day
+# of edit-build-test cycles `target/` had reached 61 GiB and filled the disk,
+# which then failed a build and a commit for no reason to do with the code.
+#
+# Line tables keep the panic messages and backtraces this project's debugging
+# actually relies on — a failing test still says which file and line — without
+# the per-crate variable and type layout that costs the space. Step this down to
+# `debug = true` for the session you need to inspect variables in a test binary.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+codegen-units = 16
+
 # LTO off: on an I/O-bound web server it buys ~nothing at runtime but adds
 # minutes of slow single-threaded linking to every build. codegen-units high
 # keeps compilation parallel.
