@@ -4678,10 +4678,8 @@ impl Database {
                 "id IN (SELECT doc_id FROM file WHERE workspace_id IN ({workspace_ids}))"
             ),
             "file_blob" => format!("file_id IN ({file_ids})"),
-            "reaction" => format!(
-                "msg_id IN (SELECT id FROM message WHERE org_id = $1 \
-                 UNION SELECT id FROM dm WHERE org_id = $1)"
-            ),
+            "reaction" => "msg_id IN (SELECT id FROM message WHERE org_id = $1 \
+                 UNION SELECT id FROM dm WHERE org_id = $1)".to_string(),
             // Fail closed. A table added to `MIGRATE_TABLES` without a scope rule of
             // its own would otherwise be exported whole into a single-tenant
             // archive, which is the one mistake this function exists to prevent.
