@@ -762,7 +762,17 @@ impl Database {
         // database opened later agrees on where content lives.
         crate::blobstore::init(uri);
         let blobs = crate::blobstore::store().clone();
-        Self::open_with(uri, blobs).await
+        let db = Self::open_with(uri, blobs).await?;
+        // Stated once at boot, because it is the fact a shred is judged on: an
+        // install keeping content in rows seals nothing and mints no keys, and an
+        // install whose data key came from somewhere unexpected will read its own
+        // objects as garbage. Both are discoverable here or not at all.
+        log::info!(
+            "content in {}, data key from {}",
+            db.blobs.mode(),
+            keystore::source()
+        );
+        Ok(db)
     }
 
     /// Open an organization's database.
