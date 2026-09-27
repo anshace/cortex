@@ -270,6 +270,14 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
         .expect("AuthPad requires a database; set SQLITE_URI");
 
     let databases = config.databases.clone();
+    // Attach the registry to the database every handler is handed, so routing is
+    // on for anything that builds a server around one and not only for the
+    // process that ran `main`. Setting it twice is a no-op by construction, and
+    // a control database with no registry attached serves every document out of
+    // itself — which is what single mode means.
+    if let Some(registries) = &databases {
+        db.attach_registries(registries.clone());
+    }
     let state = ServerState {
         documents: Default::default(),
         boards: Default::default(),

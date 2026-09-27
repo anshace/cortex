@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -15,11 +15,12 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::RngCore;
 use serde::Serialize;
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-    Column, Sqlite, SqlitePool, Transaction,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
+    Column, Row, Sqlite, SqlitePool, Transaction,
 };
 
 use crate::blobstore::BlobStore;
+use crate::databases::Databases;
 use crate::keystore;
 
 /// Represents a document persisted in database storage.
@@ -311,6 +312,34 @@ fn random_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// One row of any table, as the JSON an archive is made of. Types come back as
+/// SQLite reports them, and bytes travel base64 because JSON has no other way to
+/// say "these exact octets".
+fn row_to_json(row: &SqliteRow) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let mut obj = serde_json::Map::new();
+    for (i, col) in row.columns().iter().enumerate() {
+        let name = col.name();
+        if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
+            obj.insert(name.into(), serde_json::to_value(v)?);
+        } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
+            obj.insert(name.into(), serde_json::to_value(v)?);
+        } else if let Ok(v) = row.try_get::<Option<String>, _>(i) {
+            obj.insert(name.into(), serde_json::to_value(v)?);
+        } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
+            obj.insert(name.into(), serde_json::to_value(v.map(|b| B64.encode(b)))?);
+        }
+    }
+    Ok(obj)
+}
+
+/// `$1, $2, …, $n` — the placeholder list for a set of values bound one by one.
+fn value_list(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn available_path(existing: &HashSet<String>, requested: &str) -> Result<String> {
     if existing.iter().any(|p| requested.starts_with(&format!("{p}/"))) {
         bail!("destination folder is a file");
@@ -455,6 +484,19 @@ pub struct Database {
     /// One lock per organization, held from the moment its stored bytes are
     /// counted until the write that count authorized has landed.
     quota_locks: Arc<dashmap::DashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    /// The per-organization database registry document content routes through.
+    ///
+    /// Shared by every handle over one pool — `Database` is a cheap clone, so a
+    /// plain cell here would belong to the single handle that happened to set it
+    /// and every other clone would keep resolving content to the control
+    /// database. It is filled *after* construction, at boot: the registry holds
+    /// this very handle, so neither can be built first.
+    ///
+    /// An organization's own handle leaves it empty on purpose. A tenant database
+    /// *is* the content database: asking it to route would resolve its routing
+    /// index — a control-plane table it does not maintain — and come back with
+    /// itself anyway.
+    registries: Arc<OnceLock<Databases>>,
 }
 
 /// Hands every opened database an identity no other database can share.
@@ -462,16 +504,23 @@ static POOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 
 // These helpers share the caller's transaction. File content, chats, reactions
 // and membership must disappear together or not at all (including on old DBs).
-async fn delete_workspace_tx(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<Vec<String>> {
-    let docs: Vec<(String,)> = sqlx::query_as("SELECT doc_id FROM file WHERE workspace_id = $1")
-        .bind(id)
-        .fetch_all(&mut *tx)
-        .await?;
+async fn delete_workspace_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: i64,
+) -> Result<Vec<(String, Option<i64>)>> {
+    // Each document, with the organization whose database holds its content —
+    // read here, because a delete that waits for the commit can no longer ask:
+    // by then the row that answered is gone. The content itself is dropped by
+    // the caller *after* this transaction commits, which leaves an orphan as the
+    // only failure mode and a missing document as none.
+    let docs: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT f.doc_id, (SELECT org_id FROM doc_org WHERE doc_id = f.doc_id) \
+         FROM file f WHERE f.workspace_id = $1",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM file_blob WHERE file_id IN (SELECT id FROM file WHERE workspace_id = $1)")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM document WHERE id IN (SELECT doc_id FROM file WHERE workspace_id = $1)")
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -491,10 +540,13 @@ async fn delete_workspace_tx(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Resul
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    Ok(docs.into_iter().map(|(id,)| id).collect())
+    Ok(docs)
 }
 
-async fn delete_group_tx(tx: &mut Transaction<'_, Sqlite>, id: i64) -> Result<Vec<String>> {
+async fn delete_group_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: i64,
+) -> Result<Vec<(String, Option<i64>)>> {
     let workspaces: Vec<(i64,)> =
         sqlx::query_as("SELECT id FROM workspace WHERE group_id = $1")
             .bind(id)
@@ -567,6 +619,95 @@ async fn route_workspace_tx(tx: &mut Transaction<'_, Sqlite>, workspace_id: i64)
     .await?;
     Ok(())
 }
+
+/// Which organization's database holds this document's content, answered through
+/// the caller's transaction.
+///
+/// Resolving a route needs the control database, and a transaction on its single
+/// pooled connection is the only thing that can read it without waiting for
+/// itself: every delete that has to empty a tenant database learns the answer
+/// here, while the row that gives it still exists.
+async fn route_of_doc_tx(tx: &mut Transaction<'_, Sqlite>, doc_id: &str) -> Result<Option<i64>> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT org_id FROM doc_org WHERE doc_id = $1")
+        .bind(doc_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    Ok(row.map(|(org_id,)| org_id))
+}
+
+// Content placement (issue #19).
+//
+// `document` is the only table in the schema with no inbound foreign key, which
+// is what makes it the only table that can leave the control database: nothing
+// else has to be told where it went. `file` and `doc_org` stay here and keep
+// sharing one transaction, so the routing index keeps meaning exactly what the
+// file list says — and the content row is written *before* that transaction
+// commits and removed *after* it. The one surviving mismatch is therefore an
+// unreachable content row in a tenant that names nothing, which the maintenance
+// sweep reclaims, rather than a file whose content has gone missing.
+
+/// Seed a document row. Fails loudly if the id is already taken: content ids
+/// are random and created with the file that owns them, so a collision is a bug.
+async fn insert_content(db: &Database, doc_id: &str, doc: &PersistedDocument) -> Result<()> {
+    sqlx::query("INSERT INTO document (id, text, language) VALUES ($1, $2, $3)")
+        .bind(doc_id)
+        .bind(&doc.text)
+        .bind(&doc.language)
+        .execute(db.write())
+        .await?;
+    Ok(())
+}
+
+/// Carry a document row to a new home, overwriting anything already there: a
+/// document that changed organizations moves with the content it has now.
+async fn replace_content(db: &Database, doc_id: &str, doc: &PersistedDocument) -> Result<()> {
+    sqlx::query("INSERT OR REPLACE INTO document (id, text, language) VALUES ($1, $2, $3)")
+        .bind(doc_id)
+        .bind(&doc.text)
+        .bind(&doc.language)
+        .execute(db.write())
+        .await?;
+    Ok(())
+}
+
+/// Drop a document row, reporting whether anything went. No row is not an error:
+/// every caller has already let the file go, and a content row can legitimately
+/// be missing when a delete is retried or the row was never written.
+async fn delete_content(db: &Database, doc_id: &str) -> Result<bool> {
+    Ok(sqlx::query("DELETE FROM document WHERE id = $1")
+        .bind(doc_id)
+        .execute(db.write())
+        .await?
+        .rows_affected()
+        > 0)
+}
+
+/// Drop a set of document rows, in lists small enough for one statement.
+async fn delete_content_ids(db: &Database, doc_ids: &[String]) -> Result<u64> {
+    let mut dropped = 0;
+    for chunk in doc_ids.chunks(Database::IDS_PER_QUERY) {
+        let sql = format!(
+            "DELETE FROM document WHERE id IN ({})",
+            value_list(chunk.len())
+        );
+        let mut query = sqlx::query(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        dropped += query.execute(db.write()).await?.rows_affected();
+    }
+    Ok(dropped)
+}
+
+/// A `file` row as the clients see it, in every query that lists them.
+///
+/// Binary content is measured here, in the database that keeps `file`. Text is
+/// left at zero and filled in afterwards by [`Database::fill_text_sizes`],
+/// because that row now lives in an organization's database and no subquery
+/// reaches across: a listing that could not ask would report every note in the
+/// product as an empty file, and the storage meter would agree with it.
+const FILE_COLUMNS: &str = "f.id, f.workspace_id, f.path, f.doc_id, f.kind, f.mime, \
+    COALESCE((SELECT COALESCE(fb.size, LENGTH(fb.data), 0) FROM file_blob fb WHERE fb.file_id = f.id), 0) AS size";
 
 /// The answer to "may this organization store `n` more bytes?".
 pub enum Quota {
@@ -664,6 +805,10 @@ impl Database {
             blobs,
             auth: Arc::default(),
             quota_locks: Arc::default(),
+            // Empty for every handle, including a control one: the registry is
+            // built from the control database, so it can only be attached after
+            // both exist. See [`Self::attach_registries`].
+            registries: Arc::new(OnceLock::new()),
         })
     }
 
@@ -684,6 +829,67 @@ impl Database {
     /// in-memory database does not have.
     pub fn shares_pool_with(&self, other: &Database) -> bool {
         Arc::ptr_eq(&self.pool_id, &other.pool_id)
+    }
+
+    /// Hand this (control) database the registry its documents route through.
+    ///
+    /// Only the control database is ever given one, and only once: the registry
+    /// holds a clone of this handle, so the dependency is circular and neither
+    /// side can be constructed first. Every clone of this pool sees it, because
+    /// the cell is shared — which is the whole reason it is an `Arc`.
+    pub fn attach_registries(&self, registries: Databases) -> bool {
+        self.registries.set(registries).is_ok()
+    }
+
+    /// Whether document content lives somewhere other than here.
+    ///
+    /// `false` covers both an instance that never turned the flag on and a
+    /// database that has no registry at all — an organization's own handle, and
+    /// every handle in a test that builds a bare control database. Both answer
+    /// "content is right here", which is what they mean.
+    fn content_is_split(&self) -> bool {
+        self.registries.get().is_some_and(Databases::is_split)
+    }
+
+    /// The database holding — or about to hold — this document's content.
+    ///
+    /// The routing index is the whole answer: it is control-plane data, it is
+    /// maintained in the same transaction as the `file` row it describes, and it
+    /// keeps resolving after the content row itself has left this database. An
+    /// unroutable document is one no tenant has ever been told about, so it
+    /// stays exactly where it is.
+    async fn content_db_for(&self, document_id: &str) -> Result<Database> {
+        if !self.content_is_split() {
+            return Ok(self.clone());
+        }
+        // A failure to *route* is an error, never a fallback: quietly writing
+        // content into the control database because its owning tenant's file
+        // would not open would strand it where no read will look.
+        let org = self.org_of_doc(document_id).await?;
+        self.content_db_for_org(org).await
+    }
+
+    /// The database holding the content of documents owned by `org_id`.
+    async fn content_db_for_org(&self, org_id: Option<i64>) -> Result<Database> {
+        match self.registries.get() {
+            Some(registries) if registries.is_split() => match org_id {
+                Some(org_id) => Ok(registries.org(org_id).await?),
+                // Content the index never attributed to a tenant belongs to the
+                // control database, which is where it already sits.
+                None => Ok(self.clone()),
+            },
+            _ => Ok(self.clone()),
+        }
+    }
+
+    /// The database that will hold content for documents created under
+    /// `workspace_id` right now.
+    async fn content_db_for_workspace(&self, workspace_id: i64) -> Result<Database> {
+        if !self.content_is_split() {
+            return Ok(self.clone());
+        }
+        let org = self.workspace_org(workspace_id).await?;
+        self.content_db_for_org(org).await
     }
 
     /// Bytes of the file backing this database.
@@ -886,13 +1092,157 @@ impl Database {
         Ok(added)
     }
 
+    /// Move every document row still held in this database into the database of
+    /// the organization the routing index credits it to.
+    ///
+    /// This is what makes an *existing* install routed rather than a new one:
+    /// content an upgrade leaves here is invisible to a read that now goes to a
+    /// tenant file, so an instance that turned the flag on without this would
+    /// show every one of its users an empty file.
+    ///
+    /// Idempotent, and restartable in the way that matters. A row already present
+    /// in its tenant database is never overwritten, because once a document is
+    /// routed every write to it lands there and the copy here is by definition
+    /// the older one. The row here goes only after its replacement is in place,
+    /// so an interruption leaves content duplicated and reachable — never lost,
+    /// never stranded — and the next pass finishes what it started.
+    ///
+    /// Returns the rows moved. Unrouted documents stay exactly where they are:
+    /// there is no tenant to hand them to, and a read resolves them here.
+    pub async fn migrate_content_to_orgs(&self) -> Result<u64> {
+        if !self.content_is_split() {
+            return Ok(0);
+        }
+        let mut moved = 0;
+        let mut after = String::new();
+        loop {
+            // Paged by id rather than drained: a hundred thousand documents must
+            // not be held in memory at once, and a page that cannot be moved —
+            // one tenant whose file will not open — must not be read again
+            // forever. `after` only ever advances.
+            let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+                r#"SELECT d.id, d.text, d.language, o.org_id
+                   FROM document d JOIN doc_org o ON o.doc_id = d.id
+                   WHERE d.id > $1 ORDER BY d.id LIMIT 200"#,
+            )
+            .bind(&after)
+            .fetch_all(&self.pool)
+            .await?;
+            let Some(last) = rows.last() else {
+                break;
+            };
+            after = last.0.clone();
+            for (doc_id, text, language, org_id) in rows {
+                let content = match self.content_db_for_org(Some(org_id)).await {
+                    Ok(content) => content,
+                    Err(e) => {
+                        log::warn!("cannot move document {doc_id} to org {org_id}: {e}");
+                        continue;
+                    }
+                };
+                let document = PersistedDocument { text, language };
+                let present = sqlx::query(
+                    "INSERT INTO document (id, text, language) \
+                     SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM document WHERE id = $1)",
+                )
+                .bind(&doc_id)
+                .bind(&document.text)
+                .bind(&document.language)
+                .execute(content.write())
+                .await?
+                .rows_affected();
+                if present == 0 {
+                    log::info!("document {doc_id} was already in org {org_id}'s database");
+                }
+                // Only now is the copy here let go — from this database, which is
+                // the one the row is being taken out of.
+                sqlx::query("DELETE FROM document WHERE id = $1")
+                    .bind(&doc_id)
+                    .execute(&self.pool)
+                    .await?;
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            log::info!("moved {moved} document(s) into their organization databases");
+        }
+        Ok(moved)
+    }
+
+    /// Reclaim content rows the routing index no longer claims for the
+    /// organization holding them, and report how many went.
+    ///
+    /// The collector that the ordering of a routed delete depends on: content is
+    /// dropped after the control transaction that makes it unreachable, so an
+    /// interrupted delete leaves a row no file names and no read will look for.
+    /// It is invisible rather than lost, and this removes it.
+    ///
+    /// One tenant database that will not open is logged and skipped — the other
+    /// organizations still get swept, and housekeeping must not be held hostage
+    /// by a single damaged file.
+    async fn sweep_tenant_content(&self) -> u64 {
+        let Some(registries) = self.registries.get().filter(|r| r.is_split()) else {
+            return 0;
+        };
+        let mut swept = 0;
+        let orgs = match registries.openable_org_ids().await {
+            Ok(orgs) => orgs,
+            Err(e) => {
+                log::warn!("could not list organizations to sweep: {e}");
+                return swept;
+            }
+        };
+        for org_id in orgs {
+            // The index is the authority on what a tenant owns, and it is read
+            // here rather than joined because it is a control-plane claim.
+            let owned: HashSet<String> = match self.docs_of_org(org_id).await {
+                Ok(docs) => docs.into_iter().collect(),
+                Err(e) => {
+                    log::warn!("could not read org {org_id}'s routing: {e}");
+                    continue;
+                }
+            };
+            let content = match registries.org(org_id).await {
+                Ok(content) => content,
+                Err(e) => {
+                    log::warn!("could not open org {org_id}'s database: {e}");
+                    continue;
+                }
+            };
+            let held: Vec<String> =
+                match sqlx::query_as::<_, (String,)>("SELECT id FROM document")
+                    .fetch_all(content.read_only())
+                    .await
+                {
+                    Ok(rows) => rows.into_iter().map(|(id,)| id).collect(),
+                    Err(e) => {
+                        log::warn!("could not read org {org_id}'s content: {e}");
+                        continue;
+                    }
+                };
+            let stale: Vec<String> = held
+                .into_iter()
+                .filter(|id| !owned.contains(id))
+                .collect();
+            if stale.is_empty() {
+                continue;
+            }
+            match delete_content_ids(&content, &stale).await {
+                Ok(n) => swept += n,
+                Err(e) => log::warn!("could not sweep org {org_id}'s content: {e}"),
+            }
+        }
+        swept
+    }
+
     // ----- Documents (OT content) -----
 
-    /// Load the text of a document from the database.
+    /// Load the text of a document from the database that holds it.
     pub async fn load(&self, document_id: &str) -> Result<PersistedDocument> {
+        let content = self.content_db_for(document_id).await?;
         sqlx::query_as(r#"SELECT text, language FROM document WHERE id = $1"#)
             .bind(document_id)
-            .fetch_one(&self.pool)
+            .fetch_one(content.read_only())
             .await
             .map_err(|e| e.into())
     }
@@ -907,18 +1257,56 @@ impl Database {
         )
     }
 
+    /// The guard [`Self::store`] and [`Self::store_document_text`] apply: a
+    /// snapshot may only be written over a document a text file still names.
+    ///
+    /// This is a control-plane question — `file` never leaves — so it is asked
+    /// here and answered before the write goes anywhere. Reading it from the
+    /// tenant database is not an option: a tenant database has the schema, and
+    /// an empty `file` table, because foreign keys cannot cross a database
+    /// boundary and its own rows need these tables to exist.
+    async fn file_names_text_doc(&self, document_id: &str) -> Result<bool> {
+        let (exists,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM file WHERE doc_id = $1 AND kind = 'text')",
+        )
+        .bind(document_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
     /// Write text directly, bypassing OT. Never recreate a deleted document:
     /// the file must still exist, and creation seeds the row in the same tx.
     pub async fn store_document_text(&self, document_id: &str, text: &str) -> Result<()> {
-        let result = sqlx::query(
-            r#"UPDATE document SET text = $2 WHERE id = $1
-               AND EXISTS (SELECT 1 FROM file WHERE doc_id = $1 AND kind = 'text')"#,
-        )
-        .bind(document_id)
-        .bind(text)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() != 1 {
+        let content = self.content_db_for(document_id).await?;
+        // With content in this database the guard is a subquery in the same
+        // statement, which is what it has always been. Once content is routed
+        // the two live in different databases and no statement can join them, so
+        // the check runs first — and the routed `UPDATE` still refuses a row
+        // that has gone away, which is the same refusal for the same reason: it
+        // is updating, never inserting, that makes resurrection impossible.
+        let written = if content.shares_pool_with(self) {
+            sqlx::query(
+                r#"UPDATE document SET text = $2 WHERE id = $1
+                   AND EXISTS (SELECT 1 FROM file WHERE doc_id = $1 AND kind = 'text')"#,
+            )
+            .bind(document_id)
+            .bind(text)
+            .execute(content.write())
+            .await?
+            .rows_affected()
+        } else {
+            if !self.file_names_text_doc(document_id).await? {
+                bail!("text document no longer exists");
+            }
+            sqlx::query("UPDATE document SET text = $2 WHERE id = $1")
+                .bind(document_id)
+                .bind(text)
+                .execute(content.write())
+                .await?
+                .rows_affected()
+        };
+        if written != 1 {
             bail!("text document no longer exists");
         }
         Ok(())
@@ -927,27 +1315,148 @@ impl Database {
     /// Persist a live OT snapshot. An UPDATE (not an upsert) prevents a stale
     /// persister from resurrecting a file after a concurrent hard delete.
     pub async fn store(&self, document_id: &str, document: &PersistedDocument) -> Result<()> {
-        let result = sqlx::query(
-            r#"UPDATE document SET text = $2, language = $3 WHERE id = $1
-               AND EXISTS (SELECT 1 FROM file WHERE doc_id = $1 AND kind = 'text')"#,
-        )
-        .bind(document_id)
-        .bind(&document.text)
-        .bind(&document.language)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() != 1 {
+        let content = self.content_db_for(document_id).await?;
+        let written = if content.shares_pool_with(self) {
+            sqlx::query(
+                r#"UPDATE document SET text = $2, language = $3 WHERE id = $1
+                   AND EXISTS (SELECT 1 FROM file WHERE doc_id = $1 AND kind = 'text')"#,
+            )
+            .bind(document_id)
+            .bind(&document.text)
+            .bind(&document.language)
+            .execute(content.write())
+            .await?
+            .rows_affected()
+        } else {
+            if !self.file_names_text_doc(document_id).await? {
+                bail!("text document no longer exists");
+            }
+            sqlx::query("UPDATE document SET text = $2, language = $3 WHERE id = $1")
+                .bind(document_id)
+                .bind(&document.text)
+                .bind(&document.language)
+                .execute(content.write())
+                .await?
+                .rows_affected()
+        };
+        if written != 1 {
             bail!("text document no longer exists");
         }
         Ok(())
     }
 
-    /// Count the number of documents in the database.
+    /// Whether this database can write a document inside its own transaction.
+    ///
+    /// True in single mode and for a document no tenant owns yet, and it is what
+    /// keeps those two paths exactly what they were: one statement, one commit,
+    /// nothing to repair if the transaction rolls back. False once the content
+    /// lives in another database, where the ordering below takes over.
+    fn holds(&self, content: &Database) -> bool {
+        content.shares_pool_with(self)
+    }
+
+    /// Carry the content of existing documents into the database of the
+    /// organization that is about to own them.
+    ///
+    /// Every path that moves a document between tenants — a transfer, a merge, a
+    /// workspace reparented into another organization's group — needs this:
+    /// re-pointing the index without carrying the row leaves the document named
+    /// by a database that has never heard of it, which a user reads as a file
+    /// that emptied itself. It runs before the control transaction commits, so
+    /// the moment a file is visible under its new owner its content is already
+    /// there.
+    ///
+    /// Returns the rows to drop from their old homes once the commit lands.
+    async fn carry_content_to(&self, org: Option<i64>, docs: &[String]) -> Result<Vec<(String, Option<i64>)>> {
+        // An unroutable destination keeps its documents wherever they already
+        // are, because the index cannot be pointed at "no one": `route_doc_tx`
+        // inserts nothing when the workspace chain does not resolve, so the old
+        // route — and the content it names — stays true.
+        let Some(org) = org else {
+            return Ok(Vec::new());
+        };
+        let mut stale = Vec::new();
+        if !self.content_is_split() {
+            return Ok(stale);
+        }
+        let dest = self.content_db_for_org(Some(org)).await?;
+        for id in docs {
+            let from = self.org_of_doc(id).await?;
+            if from == Some(org) {
+                continue; // already this organization's: the row is at home
+            }
+            match self.load(id).await {
+                Ok(document) => replace_content(&dest, id, &document).await?,
+                // An upload is routed like a text file but has no content row:
+                // its bytes are a `file_blob`, which is control-plane data.
+                Err(e) if Self::is_missing_document(&e) => continue,
+                Err(e) => return Err(e),
+            }
+            stale.push((id.clone(), from));
+        }
+        Ok(stale)
+    }
+
+    /// Drop content rows whose files a control transaction has just committed
+    /// away.
+    ///
+    /// Deliberately after the commit and deliberately tolerant: a row left
+    /// behind is an orphan no file names — unreachable, metered by nothing, and
+    /// reclaimed by the maintenance sweep — while failing the deletion the user
+    /// asked for because one tenant database would not open is a visible harm
+    /// with no corresponding benefit.
+    async fn drop_content_of(&self, stale: &[(String, Option<i64>)]) -> u64 {
+        let mut dropped = 0;
+        for (doc_id, org) in stale {
+            let content = match self.content_db_for_org(*org).await {
+                Ok(content) => content,
+                Err(e) => {
+                    log::warn!("cannot reach the database holding {doc_id}: {e}");
+                    continue;
+                }
+            };
+            // A tenant whose database is not there cannot be holding a row, and
+            // opening one to look would resurrect a file the delete above — or
+            // an organization's removal — has just unlinked.
+            if let (Some(org), Some(registries)) = (org, self.registries.get()) {
+                if !registries.is_provisioned(*org).await {
+                    continue;
+                }
+            }
+            match delete_content(&content, doc_id).await {
+                Ok(true) => dropped += 1,
+                Ok(false) => {}
+                Err(e) => log::warn!("could not drop the content of {doc_id}: {e}"),
+            }
+        }
+        dropped
+    }
+
+    /// Count the documents this instance stores.
+    ///
+    /// With content routed per organization, counting the rows in this database
+    /// would answer "how much has this instance got?" with the number of
+    /// documents no tenant has been given yet — and the endpoint that shows the
+    /// answer must not open a database for every organization to get it. The
+    /// routing index is that count, and it is local.
     pub async fn count(&self) -> Result<usize> {
-        let row: (i64,) = sqlx::query_as("SELECT count(*) FROM document")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.0 as usize)
+        if !self.content_is_split() {
+            let row: (i64,) = sqlx::query_as("SELECT count(*) FROM document")
+                .fetch_one(&self.pool)
+                .await?;
+            return Ok(row.0 as usize);
+        }
+        let (routed,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM file WHERE kind = 'text' AND doc_id IN (SELECT doc_id FROM doc_org)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let (here,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM document WHERE id NOT IN (SELECT doc_id FROM doc_org)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((routed + here) as usize)
     }
 
     // ----- Users / auth -----
@@ -1367,7 +1876,8 @@ impl Database {
             .execute(&mut tx)
             .await?;
         tx.commit().await?;
-        Ok(docs)
+        self.drop_content_of(&docs).await;
+        Ok(docs.into_iter().map(|(doc_id, _)| doc_id).collect())
     }
 
     // ----- Orgs -----
@@ -1471,7 +1981,12 @@ impl Database {
             bail!("org not found");
         }
         tx.commit().await?;
-        Ok(docs)
+        // Empty the tenant's database as well as unlinking it: whoever deletes
+        // the organization goes on to `discard` its file, and an install that
+        // reuses the id must not inherit the old rows through a file it is
+        // about to recreate.
+        self.drop_content_of(&docs).await;
+        Ok(docs.into_iter().map(|(doc_id, _)| doc_id).collect())
     }
 
     /// List the members (non-root users) of an org.
@@ -1658,7 +2173,8 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         let docs = delete_group_tx(&mut tx, id).await?;
         tx.commit().await?;
-        Ok(docs)
+        self.drop_content_of(&docs).await;
+        Ok(docs.into_iter().map(|(doc_id, _)| doc_id).collect())
     }
 
     /// The org that owns a group, if it exists.
@@ -1754,7 +2270,8 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         let docs = delete_workspace_tx(&mut tx, id).await?;
         tx.commit().await?;
-        Ok(docs)
+        self.drop_content_of(&docs).await;
+        Ok(docs.into_iter().map(|(doc_id, _)| doc_id).collect())
     }
 
     /// Move all source files into the target and remove the empty source
@@ -1764,6 +2281,20 @@ impl Database {
         if source == target {
             bail!("cannot merge a workspace with itself");
         }
+        // Merging into another organization's workspace moves every document
+        // with its files, so their content is carried first: the transaction
+        // below is what makes the new owner visible, and it must never be able
+        // to name a document its database has never heard of.
+        let text_docs: Vec<(String,)> = sqlx::query_as(
+            "SELECT doc_id FROM file WHERE workspace_id = $1 AND kind = 'text' ORDER BY doc_id",
+        )
+        .bind(source)
+        .fetch_all(&self.pool)
+        .await?;
+        let text_docs: Vec<String> = text_docs.into_iter().map(|(id,)| id).collect();
+        let stale = self
+            .carry_content_to(self.workspace_org(target).await?, &text_docs)
+            .await?;
         let mut tx = self.pool.begin().await?;
         let source_files: Vec<(i64, String, String)> =
             sqlx::query_as("SELECT id, path, doc_id FROM file WHERE workspace_id = $1 ORDER BY path")
@@ -1806,12 +2337,30 @@ impl Database {
             bail!("source workspace not found");
         }
         tx.commit().await?;
+        self.drop_content_of(&stale).await;
         Ok((source_files.len(), docs))
     }
 
     /// Reparent a workspace inside a different group without changing any
     /// file IDs. Ensure the slug stays unique within its new group.
     pub async fn move_workspace_to_group(&self, ws: &Workspace, group_id: i64) -> Result<Workspace> {
+        // Reparenting changes who owns every document in the subtree, so the
+        // content follows the route before the route moves — the same ordering
+        // every other path that changes an owner uses.
+        let text_docs: Vec<String> = sqlx::query_as(
+            "SELECT doc_id FROM file WHERE workspace_id = $1 AND kind = 'text' ORDER BY doc_id",
+        )
+        .bind(ws.id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(id,)| id)
+        .collect();
+        let new_org: Option<(i64,)> = sqlx::query_as("SELECT org_id FROM groups WHERE id = $1")
+            .bind(group_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let stale = self.carry_content_to(new_org.map(|(org_id,)| org_id), &text_docs).await?;
         let mut tx = self.pool.begin().await?;
         let existing: Vec<(String,)> =
             sqlx::query_as("SELECT slug FROM workspace WHERE group_id = $1 AND id != $2")
@@ -1836,6 +2385,7 @@ impl Database {
         // The whole subtree changes owner with its parent group.
         route_workspace_tx(&mut tx, ws.id).await?;
         tx.commit().await?;
+        self.drop_content_of(&stale).await;
         Ok(Workspace {
             id: ws.id,
             group_id,
@@ -1995,6 +2545,85 @@ impl Database {
 
     // ----- Files -----
 
+    /// How many ids go into one `WHERE id IN (…)` list. SQLite's variable limit
+    /// is what bounds it, and a folder listing can name thousands of documents.
+    const IDS_PER_QUERY: usize = 400;
+
+    /// Byte length of each of these documents' text, read from whichever
+    /// database holds the row.
+    ///
+    /// A text file's size is the length of a `document` row, and that row may
+    /// live in another database now: a file list, a download header and a copy
+    /// all ask the question, and an answer of `0` for every text file is how a
+    /// routed install silently loses its quota accounting. One query per
+    /// organization named in the page, not one per file. A document with no row
+    /// is absent from the result, which is the same zero the old single-database
+    /// `COALESCE` produced.
+    async fn text_sizes(&self, doc_ids: &[String]) -> Result<HashMap<String, i64>> {
+        let mut sizes = HashMap::new();
+        if doc_ids.is_empty() {
+            return Ok(sizes);
+        }
+        let mut routes: HashMap<String, i64> = HashMap::new();
+        if self.content_is_split() {
+            // The routing index answers for the whole page at once, and a
+            // document missing from it is one no tenant was ever told about.
+            for chunk in doc_ids.chunks(Self::IDS_PER_QUERY) {
+                let sql = format!(
+                    "SELECT doc_id, org_id FROM doc_org WHERE doc_id IN ({})",
+                    value_list(chunk.len())
+                );
+                let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+                for id in chunk {
+                    query = query.bind(id);
+                }
+                routes.extend(query.fetch_all(&self.pool).await?);
+            }
+        }
+        let mut by_org: HashMap<Option<i64>, Vec<&String>> = HashMap::new();
+        for id in doc_ids {
+            by_org
+                .entry(routes.get(id).copied())
+                .or_default()
+                .push(id);
+        }
+        for (org, ids) in by_org {
+            let content = self.content_db_for_org(org).await?;
+            for chunk in ids.chunks(Self::IDS_PER_QUERY) {
+                let sql = format!(
+                    "SELECT id, LENGTH(CAST(text AS BLOB)) FROM document WHERE id IN ({})",
+                    value_list(chunk.len())
+                );
+                let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+                for id in chunk {
+                    query = query.bind(id);
+                }
+                sizes.extend(query.fetch_all(content.read_only()).await?);
+            }
+        }
+        Ok(sizes)
+    }
+
+    /// Fill in the size of every text file in a list read from this database.
+    ///
+    /// The SQL that produced these rows measures binary content, which stays
+    /// here, and leaves text at zero, which is what this corrects.
+    async fn fill_text_sizes(&self, rows: &mut [FileRow]) -> Result<()> {
+        let ids: Vec<String> = rows
+            .iter()
+            .filter(|row| row.kind == "text")
+            .map(|row| row.doc_id.clone())
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let sizes = self.text_sizes(&ids).await?;
+        for row in rows.iter_mut().filter(|row| row.kind == "text") {
+            row.size = sizes.get(&row.doc_id).copied().unwrap_or(0);
+        }
+        Ok(())
+    }
+
     /// Create an empty collaborative text file. Document and file are inserted
     /// atomically so no editor can observe an unseeded document.
     pub async fn create_file(
@@ -2039,6 +2668,11 @@ impl Database {
         bytes: Option<&[u8]>,
         now: i64,
     ) -> Result<FileRow> {
+        // Resolved while the connection is still free: deciding where a
+        // document's content goes asks the control database a question, and a
+        // transaction on it cannot be answered by itself.
+        let content = self.content_db_for_workspace(workspace_id).await?;
+        let seed_here = self.holds(&content);
         let mut tx = self.pool.begin().await?;
         let existing: Vec<(String,)> =
             sqlx::query_as("SELECT path FROM file WHERE workspace_id = $1")
@@ -2061,11 +2695,23 @@ impl Database {
         .fetch_one(&mut tx)
         .await?;
         if kind == "text" {
-            sqlx::query("INSERT INTO document (id, text, language) VALUES ($1, $2, NULL)")
-                .bind(doc_id)
-                .bind(text.unwrap_or(""))
-                .execute(&mut tx)
-                .await?;
+            let document = PersistedDocument {
+                text: text.unwrap_or("").to_string(),
+                language: None,
+            };
+            if seed_here {
+                sqlx::query("INSERT INTO document (id, text, language) VALUES ($1, $2, NULL)")
+                    .bind(doc_id)
+                    .bind(text.unwrap_or(""))
+                    .execute(&mut tx)
+                    .await?;
+            } else {
+                // Written before the commit below, which is the moment a file
+                // becomes visible: an editor can never see a row it cannot
+                // load. If this transaction then fails, the row is a content
+                // nothing names — unreachable, and reclaimed by maintenance.
+                insert_content(&content, doc_id, &document).await?;
+            }
         } else if let Some(bytes) = bytes {
             sqlx::query("INSERT INTO file_blob (file_id, data) VALUES ($1, $2)")
                 .bind(id)
@@ -2094,6 +2740,8 @@ impl Database {
         files: &[ImportedFile],
         now: i64,
     ) -> Result<Vec<FileRow>> {
+        let content = self.content_db_for_workspace(workspace_id).await?;
+        let seed_here = self.holds(&content);
         let mut tx = self.pool.begin().await?;
         let paths: Vec<(String,)> =
             sqlx::query_as("SELECT path FROM file WHERE workspace_id = $1")
@@ -2128,11 +2776,21 @@ impl Database {
             .fetch_one(&mut tx)
             .await?;
             if entry.is_text {
-                sqlx::query("INSERT INTO document (id, text, language) VALUES ($1, $2, NULL)")
-                    .bind(&doc_id)
-                    .bind(std::str::from_utf8(&entry.bytes)?)
-                    .execute(&mut tx)
+                let text = std::str::from_utf8(&entry.bytes)?;
+                if seed_here {
+                    sqlx::query("INSERT INTO document (id, text, language) VALUES ($1, $2, NULL)")
+                        .bind(&doc_id)
+                        .bind(text)
+                        .execute(&mut tx)
+                        .await?;
+                } else {
+                    insert_content(
+                        &content,
+                        &doc_id,
+                        &PersistedDocument { text: text.to_string(), language: None },
+                    )
                     .await?;
+                }
             } else {
                 sqlx::query("INSERT INTO file_blob (file_id, data) VALUES ($1, $2)")
                     .bind(id)
@@ -2158,31 +2816,28 @@ impl Database {
 
     /// List files in a workspace, ordered by path.
     pub async fn list_files(&self, workspace_id: i64) -> Result<Vec<FileRow>> {
-        sqlx::query_as(
-            r#"SELECT f.id, f.workspace_id, f.path, f.doc_id, f.kind, f.mime,
-                      COALESCE((SELECT COALESCE(fb.size, LENGTH(fb.data), 0) FROM file_blob fb WHERE fb.file_id = f.id),
-                               (SELECT LENGTH(CAST(d.text AS BLOB)) FROM document d WHERE d.id = f.doc_id), 0) AS size
-               FROM file f
-               WHERE f.workspace_id = $1 ORDER BY f.path"#,
-        )
+        let mut rows: Vec<FileRow> = sqlx::query_as(&format!(
+            "SELECT {FILE_COLUMNS} FROM file f WHERE f.workspace_id = $1 ORDER BY f.path"
+        ))
         .bind(workspace_id)
         .fetch_all(&self.pool)
-        .await
-        .map_err(|e| e.into())
+        .await?;
+        self.fill_text_sizes(&mut rows).await?;
+        Ok(rows)
     }
 
     /// Fetch a file by id.
     pub async fn get_file(&self, id: i64) -> Result<Option<FileRow>> {
-        sqlx::query_as(
-            r#"SELECT f.id, f.workspace_id, f.path, f.doc_id, f.kind, f.mime,
-                      COALESCE((SELECT COALESCE(fb.size, LENGTH(fb.data), 0) FROM file_blob fb WHERE fb.file_id = f.id),
-                               (SELECT LENGTH(CAST(d.text AS BLOB)) FROM document d WHERE d.id = f.doc_id), 0) AS size
-               FROM file f WHERE f.id = $1"#,
-        )
+        let mut row: Option<FileRow> = sqlx::query_as(&format!(
+            "SELECT {FILE_COLUMNS} FROM file f WHERE f.id = $1"
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| e.into())
+        .await?;
+        if let Some(row) = row.as_mut() {
+            self.fill_text_sizes(std::slice::from_mut(row)).await?;
+        }
+        Ok(row)
     }
 
     /// Rename a file without silently creating a file/directory collision.
@@ -2228,23 +2883,72 @@ impl Database {
         if items.is_empty() || items.len() > 5000 {
             bail!("select 1–5000 files");
         }
-        let mut tx = self.pool.begin().await?;
-        let mut seen = HashSet::new();
+        // Read the sources while this database's connection is still free.
+        // Copying or moving a text file across an organization boundary has to
+        // ask where its content lives, and a transaction on the one pooled
+        // connection cannot answer that question for itself. The transaction
+        // below re-checks that every source is still there, so nothing can be
+        // transferred out from under a stale plan.
         let mut sources = Vec::with_capacity(items.len());
+        let mut seen = HashSet::new();
         for (id, path) in items {
             if !seen.insert(*id) || path.is_empty() || path.len() > 512 {
                 bail!("invalid transfer item");
             }
-            let file: Option<FileRow> = sqlx::query_as(
-                r#"SELECT f.id, f.workspace_id, f.path, f.doc_id, f.kind, f.mime,
-                         COALESCE((SELECT COALESCE(fb.size, LENGTH(fb.data), 0) FROM file_blob fb WHERE fb.file_id = f.id),
-                                  (SELECT LENGTH(CAST(d.text AS BLOB)) FROM document d WHERE d.id = f.doc_id), 0) AS size
-                   FROM file f WHERE f.id = $1"#,
-            )
+            let file: Option<FileRow> = sqlx::query_as(&format!(
+                "SELECT {FILE_COLUMNS} FROM file f WHERE f.id = $1"
+            ))
             .bind(id)
-            .fetch_optional(&mut tx)
+            .fetch_optional(&self.pool)
             .await?;
             sources.push(file.ok_or_else(|| anyhow::anyhow!("source file not found"))?);
+        }
+        self.fill_text_sizes(&mut sources).await?;
+        let dest_content = self.content_db_for_workspace(target_workspace).await?;
+        let seed_here = self.holds(&dest_content);
+        // A copy gets a document id of its own, decided now because a staged
+        // content row has to be named before the transaction that names the file.
+        let mut copies: HashMap<String, String> = HashMap::new();
+        let mut stale: Vec<(String, Option<i64>)> = Vec::new();
+        if !seed_here {
+            let dest_org = self.workspace_org(target_workspace).await?;
+            for src in &sources {
+                if src.kind != "text" {
+                    continue; // an upload's bytes are a `file_blob`, which stays here
+                }
+                let from = self.org_of_doc(&src.doc_id).await?;
+                let document = match snapshots.get(&src.doc_id) {
+                    Some(snapshot) => snapshot.clone(),
+                    None => match self.load(&src.doc_id).await {
+                        Ok(document) => document,
+                        Err(e) if Self::is_missing_document(&e) => {
+                            if copy {
+                                bail!("source text content missing");
+                            }
+                            continue; // a move of a document with nothing stored
+                        }
+                        Err(e) => return Err(e),
+                    },
+                };
+                if copy {
+                    let doc_id = random_id();
+                    insert_content(&dest_content, &doc_id, &document).await?;
+                    copies.insert(src.doc_id.clone(), doc_id);
+                } else if from != dest_org {
+                    replace_content(&dest_content, &src.doc_id, &document).await?;
+                    stale.push((src.doc_id.clone(), from));
+                }
+            }
+        }
+        let mut tx = self.pool.begin().await?;
+        for src in &sources {
+            let still_there: Option<(i64,)> = sqlx::query_as("SELECT id FROM file WHERE id = $1")
+                .bind(src.id)
+                .fetch_optional(&mut tx)
+                .await?;
+            if still_there.is_none() {
+                bail!("source file not found");
+            }
         }
         let dest_rows: Vec<(i64, String)> =
             sqlx::query_as("SELECT id, path FROM file WHERE workspace_id = $1")
@@ -2306,7 +3010,10 @@ impl Database {
         let mut result = Vec::with_capacity(items.len());
         for (mut src, path) in sources.into_iter().zip(destinations) {
             if copy {
-                let doc_id = random_id();
+                let doc_id = copies
+                    .get(&src.doc_id)
+                    .cloned()
+                    .unwrap_or_else(random_id);
                 let (id,): (i64,) = sqlx::query_as(
                     "INSERT INTO file (workspace_id, path, doc_id, kind, mime, created_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
                 )
@@ -2319,22 +3026,32 @@ impl Database {
                 .fetch_one(&mut tx)
                 .await?;
                 if src.kind == "text" {
-                    let rows = if let Some(snapshot) = snapshots.get(&src.doc_id) {
-                        src.size = snapshot.text.len() as i64;
-                        sqlx::query("INSERT INTO document (id, text, language) VALUES ($1, $2, $3)")
-                            .bind(&doc_id)
-                            .bind(&snapshot.text)
-                            .bind(&snapshot.language)
-                            .execute(&mut tx)
-                            .await?.rows_affected()
+                    if seed_here {
+                        let rows = if let Some(snapshot) = snapshots.get(&src.doc_id) {
+                            src.size = snapshot.text.len() as i64;
+                            sqlx::query("INSERT INTO document (id, text, language) VALUES ($1, $2, $3)")
+                                .bind(&doc_id)
+                                .bind(&snapshot.text)
+                                .bind(&snapshot.language)
+                                .execute(&mut tx)
+                                .await?.rows_affected()
+                        } else {
+                            sqlx::query("INSERT INTO document (id, text, language) SELECT $1, text, language FROM document WHERE id = $2")
+                                .bind(&doc_id)
+                                .bind(&src.doc_id)
+                                .execute(&mut tx)
+                                .await?.rows_affected()
+                        };
+                        if rows != 1 { bail!("source text content missing"); }
                     } else {
-                        sqlx::query("INSERT INTO document (id, text, language) SELECT $1, text, language FROM document WHERE id = $2")
-                            .bind(&doc_id)
-                            .bind(&src.doc_id)
-                            .execute(&mut tx)
-                            .await?.rows_affected()
-                    };
-                    if rows != 1 { bail!("source text content missing"); }
+                        // Already in the destination's database, staged above
+                        // this transaction: the copy is only claimable once the
+                        // content it names is reachable from it.
+                        src.size = snapshots
+                            .get(&src.doc_id)
+                            .map(|snapshot| snapshot.text.len() as i64)
+                            .unwrap_or(src.size);
+                    }
                 } else {
                     let rows = sqlx::query("INSERT INTO file_blob (file_id, data, storage_key, size) SELECT $1, data, storage_key, size FROM file_blob WHERE file_id = $2")
                         .bind(id)
@@ -2353,8 +3070,9 @@ impl Database {
                     .bind(src.id)
                     .execute(&mut tx)
                     .await?;
-                // A move across org boundaries re-routes; within one org it
-                // restates the answer. Either way the index cannot drift.
+                // A move across org boundaries re-routes the document and
+                // carries its content with the route; within one org it restates
+                // the answer. Either way the index cannot drift.
                 route_doc_tx(&mut tx, &src.doc_id, target_workspace).await?;
             }
             src.workspace_id = target_workspace;
@@ -2362,6 +3080,10 @@ impl Database {
             result.push(src);
         }
         tx.commit().await?;
+        // A moved document's old home is emptied only now that the route that
+        // no longer uses it is gone: the row left behind would be invisible
+        // either way, and dropping it here cannot fail the transfer.
+        self.drop_content_of(&stale).await;
         Ok(result)
     }
 
@@ -2456,9 +3178,16 @@ impl Database {
         }
     }
 
-    /// Hard-delete files and their content atomically. Returns their document
-    /// IDs so the caller can close any live collaborative sessions immediately.
-    /// Unknown IDs fail the entire batch instead of reporting false success.
+    /// Hard-delete files and their content. Returns their document IDs so the
+    /// caller can close any live collaborative sessions immediately. Unknown IDs
+    /// fail the entire batch instead of reporting false success.
+    ///
+    /// The rows this database owns — `file`, its blob, the routing index — go in
+    /// one transaction. Content in another organization's database cannot join
+    /// it and is dropped once that transaction has committed, which is the order
+    /// that can only ever leave an unreachable orphan behind: a file that outlives
+    /// its own content is the failure a user can see, and it is not available
+    /// here.
     pub async fn delete_files(&self, ids: &[i64]) -> Result<Vec<String>> {
         let mut tx = self.pool.begin().await?;
         let mut docs = Vec::with_capacity(ids.len());
@@ -2473,6 +3202,8 @@ impl Database {
                     .fetch_optional(&mut tx)
                     .await?;
             let (doc_id,) = row.ok_or_else(|| anyhow::anyhow!("file not found"))?;
+            // Asked before the index goes, because the index is the answer.
+            let org = route_of_doc_tx(&mut tx, &doc_id).await?;
             sqlx::query("DELETE FROM file_blob WHERE file_id = $1")
                 .bind(id)
                 .execute(&mut tx)
@@ -2481,18 +3212,15 @@ impl Database {
                 .bind(id)
                 .execute(&mut tx)
                 .await?;
-            sqlx::query("DELETE FROM document WHERE id = $1")
-                .bind(&doc_id)
-                .execute(&mut tx)
-                .await?;
             sqlx::query("DELETE FROM doc_org WHERE doc_id = $1")
                 .bind(&doc_id)
                 .execute(&mut tx)
                 .await?;
-            docs.push(doc_id);
+            docs.push((doc_id, org));
         }
         tx.commit().await?;
-        Ok(docs)
+        self.drop_content_of(&docs).await;
+        Ok(docs.into_iter().map(|(doc_id, _)| doc_id).collect())
     }
 
     /// Delete a single file, with the same all-or-nothing semantics as a batch.
@@ -2600,7 +3328,7 @@ impl Database {
         .bind(org_id)
         .fetch_one(&self.pool)
         .await?;
-        let (text,): (i64,) = sqlx::query_as(
+        let (mut text,): (i64,) = sqlx::query_as(
             r#"SELECT COALESCE(SUM(LENGTH(CAST(d.text AS BLOB))),0)
                FROM document d
                JOIN file f ON f.doc_id = d.id AND f.kind = 'text'
@@ -2611,7 +3339,38 @@ impl Database {
         .bind(org_id)
         .fetch_one(&self.pool)
         .await?;
+        // What this database can still see of an organization's text is only the
+        // part that has not moved. Reading it alone in a routed install would
+        // report a tenant typing nothing and hand it an unlimited ceiling, so
+        // the meter asks the organization's own database for the rest.
+        text += self.routed_text_bytes(org_id).await?;
         Ok(files + images + text)
+    }
+
+    /// Bytes of text stored in the database of the organization that owns it.
+    /// Zero in single mode, where the meter's own query already saw every row.
+    async fn routed_text_bytes(&self, org_id: i64) -> Result<i64> {
+        if !self.content_is_split() {
+            return Ok(0);
+        }
+        let docs = self.docs_of_org(org_id).await?;
+        if docs.is_empty() {
+            return Ok(0);
+        }
+        let content = self.content_db_for_org(Some(org_id)).await?;
+        let mut total = 0;
+        for chunk in docs.chunks(Self::IDS_PER_QUERY) {
+            let sql = format!(
+                "SELECT COALESCE(SUM(LENGTH(CAST(text AS BLOB))),0) FROM document WHERE id IN ({})",
+                value_list(chunk.len())
+            );
+            let mut query = sqlx::query_as::<_, (i64,)>(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            total += query.fetch_one(content.read_only()).await?.0;
+        }
+        Ok(total)
     }
 
     /// How many identity answers came from cache rather than the database. A
@@ -2689,7 +3448,7 @@ impl Database {
             .execute(&mut tx)
             .await?
             .rows_affected();
-        let orphan_documents = sqlx::query(
+        let mut orphan_documents = sqlx::query(
             "DELETE FROM document WHERE NOT EXISTS (SELECT 1 FROM file WHERE file.doc_id = document.id AND file.kind = 'text')",
         )
         .execute(&mut tx)
@@ -2729,6 +3488,13 @@ impl Database {
             .await?
             .rows_affected();
         tx.commit().await?;
+
+        // Content an organization's database is still holding after the control
+        // plane let it go. A routed delete drops rows *after* the commit, so the
+        // residue of an interruption is a row nothing names — and this is what
+        // collects it. Counted with the orphans found here, because the console
+        // reports one number and a tenant's leftovers are the same problem.
+        orphan_documents += self.sweep_tenant_content().await;
 
         // Objects are reclaimed only after the deletes above are committed: until
         // this point a row may still name them, and a content-addressed object can
@@ -3366,7 +4132,14 @@ impl Database {
     /// dangling file/blob/user references during concurrent edits and deletes.
     /// The session table is deliberately excluded (auth tokens never travel).
     pub async fn export_snapshot(&self) -> Result<serde_json::Map<String, serde_json::Value>> {
-        use sqlx::Row;
+        // The organizations' content is read *before* this database's transaction
+        // opens, for two reasons that are both load-bearing. Mechanically, the
+        // pool has one connection and a transaction on it would wait for itself
+        // forever. Correctly, because content is always written before the file
+        // row that names it: reading content first can only ever add a row the
+        // archive does not need, while reading it last could produce an archive
+        // naming a file whose content it does not carry.
+        let mut tenant_content = self.exported_tenant_content().await?;
         let mut tx = self.pool.begin().await?;
         let mut out = serde_json::Map::new();
         for table in Self::MIGRATE_TABLES {
@@ -3374,19 +4147,7 @@ impl Database {
                 .fetch_all(&mut tx).await?;
             let mut values = Vec::with_capacity(rows.len());
             for row in rows {
-                let mut obj = serde_json::Map::new();
-                for (i, col) in row.columns().iter().enumerate() {
-                    let name = col.name();
-                    if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
-                        obj.insert(name.into(), serde_json::to_value(v)?);
-                    } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
-                        obj.insert(name.into(), serde_json::to_value(v)?);
-                    } else if let Ok(v) = row.try_get::<Option<String>, _>(i) {
-                        obj.insert(name.into(), serde_json::to_value(v)?);
-                    } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
-                        obj.insert(name.into(), serde_json::to_value(v.map(|b| B64.encode(b)))?);
-                    }
-                }
+                let mut obj = row_to_json(&row)?;
                 // A whole-instance archive always carries its content inline, so
                 // it stays readable by an install on the inline backend and by a
                 // build that predates the object store entirely.
@@ -3399,10 +4160,38 @@ impl Database {
                         obj.insert("storage_key".into(), serde_json::Value::Null);
                     }
                 }
-                values.push(serde_json::Value::Object(obj));            }
+                values.push(serde_json::Value::Object(obj));
+            }
+            if *table == "document" {
+                values.append(&mut tenant_content);
+            }
             out.insert((*table).to_string(), serde_json::Value::Array(values));
         }
         tx.rollback().await?;
+        Ok(out)
+    }
+
+    /// Every document row stored outside the control database, in the same JSON
+    /// shape an archive uses.
+    ///
+    /// The ZIP export is the one backup that has to carry a whole instance in one
+    /// file, and a routed install keeps no content in this database at all: an
+    /// export that read only here would be a backup with every document removed
+    /// and nothing to say about it.
+    async fn exported_tenant_content(&self) -> Result<Vec<serde_json::Value>> {
+        let mut out = Vec::new();
+        let Some(registries) = self.registries.get().filter(|r| r.is_split()) else {
+            return Ok(out);
+        };
+        for org_id in registries.openable_org_ids().await? {
+            let content = registries.org(org_id).await?;
+            let rows = sqlx::query("SELECT * FROM document")
+                .fetch_all(content.read_only())
+                .await?;
+            for row in &rows {
+                out.push(serde_json::Value::Object(row_to_json(row)?));
+            }
+        }
         Ok(out)
     }
 
@@ -3415,7 +4204,6 @@ impl Database {
         &self,
         tables: &[(String, Vec<serde_json::Value>)],
     ) -> Result<()> {
-        use sqlx::Row;
         let supplied: HashSet<&str> = tables.iter().map(|(name, _)| name.as_str()).collect();
         if tables.len() != Self::MIGRATE_TABLES.len()
             || !Self::MIGRATE_TABLES.iter().all(|name| supplied.contains(name))
@@ -3535,13 +4323,39 @@ impl Database {
         // doc_org rows; repair the mapping from the freshly imported files so
         // the very first routed request after an import finds its tenant.
         self.backfill_doc_routing().await?;
+        // An archive also carries every document in this database, because that
+        // is the one place a whole-instance backup reads from. On a routed
+        // install the documents now have to move to the tenants that own them —
+        // and each tenant is still holding the *previous* dataset's rows, which
+        // a replace has to answer for before it lands the new ones.
+        if self.content_is_split() {
+            self.reset_org_content().await?;
+            self.migrate_content_to_orgs().await?;
+        }
+        Ok(())
+    }
+
+    /// Empty every organization's document table, for a restore that replaces the
+    /// whole instance: an archive naming no document for a tenant is a tenant
+    /// that must not keep the one it was holding.
+    async fn reset_org_content(&self) -> Result<()> {
+        let Some(registries) = self.registries.get().filter(|r| r.is_split()) else {
+            return Ok(());
+        };
+        for org_id in registries.openable_org_ids().await? {
+            let content = registries.org(org_id).await?;
+            sqlx::query("DELETE FROM document").execute(content.write()).await?;
+        }
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BlobStore, ChatImageScope, Database, Workspace, B64};
+    use super::{
+        insert_content, BlobStore, ChatImageScope, Database, Databases, PersistedDocument,
+        Workspace, B64,
+    };
     use base64::Engine;
 
     /// Every test runs against the object backend, so the storage path that
@@ -4557,4 +5371,594 @@ mod tests {
             "a byte ceiling measured in characters makes non-Latin content free"
         );
     }
+    // ----- Content in its own database (issue #19) -----
+
+    /// The layout `CORTEX_ORG_DBS=1` chooses, wired the way a boot wires it: a
+    /// file-backed control database, one tenant database per organization in a
+    /// directory of its own, and the registry attached to the handle every
+    /// handler is handed. The content migration is *not* run — the tests that
+    /// want it ask for it, because that is what makes them say something.
+    async fn split_databases(
+    ) -> (
+        tempfile::NamedTempFile,
+        tempfile::TempDir,
+        Database,
+        Databases,
+    ) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let uri = format!("sqlite://{}", file.path().to_str().unwrap());
+        let blobs = BlobStore::fs(format!("{}.blobs", file.path().display())).unwrap();
+        let db = Database::open_with(&uri, blobs).await.unwrap();
+        let orgs = tempfile::tempdir().unwrap();
+        let registries = Databases::files_in(db.clone(), orgs.path().to_path_buf());
+        assert!(
+            db.attach_registries(registries.clone()),
+            "a control database is given exactly one registry"
+        );
+        assert!(db.content_is_split(), "and the flag is what routes content");
+        (file, orgs, db, registries)
+    }
+
+    /// Two organizations, each with a group and a workspace: the smallest fixture
+    /// in which "did this tenant's bytes land in the wrong file?" can even be
+    /// answered wrongly.
+    async fn seed_two_orgs(db: &Database) -> (i64, i64, i64, i64) {
+        db.create_user_if_absent("owner", "Owner", "pw", "root", None)
+            .await
+            .unwrap();
+        let owner = db.get_user_by_email("owner").await.unwrap().unwrap();
+        let (org_a, _ga, ws_a) = seed_org(db, owner.id, "Alpha").await;
+        let (org_b, _gb, ws_b) = seed_org(db, owner.id, "Beta").await;
+        (org_a, ws_a.id, org_b, ws_b.id)
+    }
+
+    /// The text one *specific* database holds for a document id, bypassing the
+    /// routing entirely — which is the point: through the router both answers are
+    /// "here", and only the file says where the bytes actually are.
+    async fn stored_text(db: &Database, doc_id: &str) -> Option<String> {
+        sqlx::query_as::<_, (String,)>("SELECT text FROM document WHERE id = $1")
+            .bind(doc_id)
+            .fetch_optional(db.read_only())
+            .await
+            .unwrap()
+            .map(|(text,)| text)
+    }
+
+    #[tokio::test]
+    async fn an_organizations_content_lives_in_its_own_database() {
+        let (_file, orgs, db, registries) = split_databases().await;
+        let (org_a, ws_a, org_b, ws_b) = seed_two_orgs(&db).await;
+        db.create_file(ws_a, "a.md", "doc-a", "text", None, 1).await.unwrap();
+        db.create_file(ws_b, "b.md", "doc-b", "text", None, 1).await.unwrap();
+        db.store(
+            "doc-a",
+            &PersistedDocument { text: "alpha only".into(), language: Some("markdown".into()) },
+        )
+        .await
+        .unwrap();
+        db.store("doc-b", &PersistedDocument { text: "beta only".into(), language: None })
+            .await
+            .unwrap();
+
+        let tenant_a = registries.org(org_a).await.unwrap();
+        let tenant_b = registries.org(org_b).await.unwrap();
+        assert_eq!(stored_text(&tenant_a, "doc-a").await.as_deref(), Some("alpha only"));
+        assert_eq!(stored_text(&tenant_b, "doc-b").await.as_deref(), Some("beta only"));
+        assert_eq!(
+            stored_text(&tenant_a, "doc-b").await,
+            None,
+            "one tenant's file does not hold another organization's text"
+        );
+        assert_eq!(stored_text(&tenant_b, "doc-a").await, None, "nor the other way round");
+        assert_eq!(
+            stored_text(&db, "doc-a").await,
+            None,
+            "and the control database holds no content for a routed document"
+        );
+        assert_eq!(db.table_rows("document").await.unwrap(), 0, "not one row of content is left here");
+        assert_eq!(tenant_a.table_rows("document").await.unwrap(), 1, "nor is it stored twice");
+        assert!(orgs.path().join(format!("org-{org_a}.db")).exists());
+        assert!(orgs.path().join(format!("org-{org_b}.db")).exists());
+    }
+
+    #[tokio::test]
+    async fn reading_and_persisting_work_through_the_routed_handle() {
+        let (_file, _orgs, db, registries) = split_databases().await;
+        let (org_a, ws_a, ..) = seed_two_orgs(&db).await;
+        let file = db.create_file(ws_a, "note.md", "live", "text", None, 1).await.unwrap();
+        assert_eq!(db.load(&file.doc_id).await.unwrap().text, "", "a new file starts empty");
+
+        db.store(
+            &file.doc_id,
+            &PersistedDocument { text: "typed here".into(), language: Some("markdown".into()) },
+        )
+        .await
+        .unwrap();
+        let back = db.load(&file.doc_id).await.unwrap();
+        assert_eq!(back.text, "typed here", "an OT snapshot round-trips through the tenant");
+        assert_eq!(back.language.as_deref(), Some("markdown"), "including its language");
+        db.store_document_text(&file.doc_id, "written directly").await.unwrap();
+        assert_eq!(db.load(&file.doc_id).await.unwrap().text, "written directly");
+        assert_eq!(
+            stored_text(&registries.org(org_a).await.unwrap(), "live").await.as_deref(),
+            Some("written directly"),
+            "and it is the tenant's file that changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_instance_finds_content_in_the_tenant_that_holds_it() {
+        let (file, orgs, db, registries) = split_databases().await;
+        let (org_a, ws_a, ..) = seed_two_orgs(&db).await;
+        let created = db.create_file(ws_a, "note.md", "durable", "text", None, 1).await.unwrap();
+        db.store_document_text(&created.doc_id, "survives a restart").await.unwrap();
+        let uri = format!("sqlite://{}", file.path().to_str().unwrap());
+        drop(db);
+        drop(registries);
+
+        // A new process: the control database opens, the registry is built from
+        // it, and the migration finds nothing left to move.
+        let db = Database::open_with(&uri, BlobStore::inline()).await.unwrap();
+        let registries = Databases::files_in(db.clone(), orgs.path().to_path_buf());
+        db.attach_registries(registries.clone());
+        assert_eq!(db.migrate_content_to_orgs().await.unwrap(), 0, "it was never in the control file");
+        assert_eq!(db.load("durable").await.unwrap().text, "survives a restart");
+        assert_eq!(
+            stored_text(&registries.org(org_a).await.unwrap(), "durable").await.as_deref(),
+            Some("survives a restart"),
+            "read from the tenant's own file, on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_workspace_leaves_no_content_behind() {
+        let (_file, _orgs, db, registries) = split_databases().await;
+        let (org_a, ws_a, ..) = seed_two_orgs(&db).await;
+        let note = db.create_file(ws_a, "note.md", "ws-note", "text", None, 1).await.unwrap();
+        let also = db.create_file(ws_a, "also.md", "ws-also", "text", None, 1).await.unwrap();
+        let upload = db
+            .create_uploaded_file(ws_a, "deck.pdf", "ws-deck", Some("application/pdf"), None, &[1, 2], 1)
+            .await
+            .unwrap();
+        let tenant = registries.org(org_a).await.unwrap();
+        assert_eq!(tenant.table_rows("document").await.unwrap(), 2, "only text files have content rows");
+
+        let docs = db.delete_workspace(ws_a).await.unwrap();
+        assert_eq!(docs.len(), 3, "the eviction list still names all three");
+        assert_eq!(tenant.table_rows("document").await.unwrap(), 0, "a deleted workspace takes its content with it");
+        assert!(db.load(&note.doc_id).await.is_err());
+        assert!(db.load(&also.doc_id).await.is_err());
+        assert!(db.get_file(upload.id).await.unwrap().is_none());
+        assert!(db.docs_of_org(org_a).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_file_empties_only_the_tenant_that_held_it() {
+        let (_file, _orgs, db, registries) = split_databases().await;
+        let (org_a, ws_a, org_b, ws_b) = seed_two_orgs(&db).await;
+        let mine = db.create_file(ws_a, "mine.md", "mine", "text", None, 1).await.unwrap();
+        db.create_file(ws_b, "theirs.md", "theirs", "text", None, 1).await.unwrap();
+        db.store_document_text("theirs", "untouched").await.unwrap();
+
+        db.delete_file(mine.id).await.unwrap();
+        let tenant_a = registries.org(org_a).await.unwrap();
+        let tenant_b = registries.org(org_b).await.unwrap();
+        assert_eq!(tenant_a.table_rows("document").await.unwrap(), 0, "gone from its own tenant");
+        assert_eq!(stored_text(&tenant_b, "theirs").await.as_deref(), Some("untouched"), "and no other is touched");
+        assert_eq!(db.load("theirs").await.unwrap().text, "untouched");
+    }
+
+    #[tokio::test]
+    async fn a_persisted_snapshot_cannot_resurrect_content_in_a_tenant_file() {
+        let (_file, _orgs, db, registries) = split_databases().await;
+        let (org_a, ws_a, ..) = seed_two_orgs(&db).await;
+        let file = db.create_file(ws_a, "a.md", "ghost", "text", None, 1).await.unwrap();
+        db.store(&file.doc_id, &PersistedDocument { text: "while open".into(), language: None })
+            .await
+            .unwrap();
+        db.delete_file(file.id).await.unwrap();
+        let tenant = registries.org(org_a).await.unwrap();
+        assert_eq!(tenant.table_rows("document").await.unwrap(), 0);
+
+        // A persister still holding the snapshot from before the delete: across a
+        // database boundary the guard is a control-plane read and an `UPDATE`
+        // that matches nothing, so it refuses instead of writing the row back.
+        let stale = db.store(&file.doc_id, &PersistedDocument { text: "ghost".into(), language: None }).await;
+        assert!(stale.is_err(), "the persist path still refuses across the boundary");
+        assert!(db.store_document_text(&file.doc_id, "ghost").await.is_err());
+        assert_eq!(tenant.table_rows("document").await.unwrap(), 0, "and nothing came back");
+        assert!(db.load(&file.doc_id).await.is_err(), "the document stays gone");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_tenant_is_never_read_as_an_empty_document() {
+        let (_file, orgs, db, _registries) = split_databases().await;
+        let (_org_a, ws_a, org_b, ws_b) = seed_two_orgs(&db).await;
+        let kept = db.create_file(ws_a, "a.md", "kept", "text", None, 1).await.unwrap();
+        // Damage the second tenant's file before anything has opened it. The
+        // failure these paths must answer is a database that will not open, not a
+        // document that has no row.
+        std::fs::write(orgs.path().join(format!("org-{org_b}.db")), b"not a database at all").unwrap();
+
+        // Creating under it fails outright rather than quietly writing content
+        // somewhere no routed read will ever look.
+        assert!(db.create_file(ws_b, "b.md", "lost", "text", None, 1).await.is_err());
+        assert_eq!(db.table_rows("file").await.unwrap(), 1, "no file row claims a document nobody stores");
+        assert_eq!(db.table_rows("doc_org").await.unwrap(), 1);
+
+        // A document already routed there reads as an error, and the error is the
+        // one a caller must not mistake for "start with an empty document".
+        sqlx::query("INSERT INTO doc_org (doc_id, org_id, created_at) VALUES ($1, $2, 1)")
+            .bind("routed-away")
+            .bind(org_b)
+            .execute(db.write())
+            .await
+            .unwrap();
+        let err = db.load("routed-away").await.unwrap_err();
+        assert!(
+            !Database::is_missing_document(&err),
+            "an unreachable database is not an empty document"
+        );
+        assert_eq!(db.load(&kept.doc_id).await.unwrap().text, "", "the healthy tenant still works");
+    }
+
+    #[tokio::test]
+    async fn an_orphan_in_a_tenant_is_reclaimed_and_the_owned_row_is_not() {
+        let (_file, _orgs, db, registries) = split_databases().await;
+        let (org_a, ws_a, ..) = seed_two_orgs(&db).await;
+        let file = db.create_file(ws_a, "a.md", "owned", "text", None, 1).await.unwrap();
+        db.store_document_text(&file.doc_id, "keep me").await.unwrap();
+        let tenant = registries.org(org_a).await.unwrap();
+
+        // Exactly what an interrupted write leaves: a row in the tenant's
+        // database that no file and no route names.
+        insert_content(&tenant, "never-named", &PersistedDocument { text: "orphan".into(), language: None })
+            .await
+            .unwrap();
+        assert!(db.load("never-named").await.is_err(), "and it is unreachable, not readable");
+        let meter = db.org_content_bytes(org_a).await.unwrap();
+        assert_eq!(db.list_files(ws_a).await.unwrap().len(), 1);
+
+        let report = db.maintain(2_000_000_000, 180, false).await.unwrap();
+        assert_eq!(report.orphan_documents, 1, "the sweep finds it, and counts it");
+        assert_eq!(stored_text(&tenant, "never-named").await, None, "and removes it");
+        assert_eq!(
+            stored_text(&tenant, "owned").await.as_deref(),
+            Some("keep me"),
+            "the row the index does claim is untouched by the sweep"
+        );
+        assert_eq!(db.org_content_bytes(org_a).await.unwrap(), meter, "an orphan was never metered");
+    }
+
+    #[tokio::test]
+    async fn every_meter_reads_content_that_lives_in_a_tenant_file() {
+        use std::collections::HashMap;
+        let (_file, _orgs, db, registries) = split_databases().await;
+        let (org_a, ws_a, org_b, ws_b) = seed_two_orgs(&db).await;
+        let file = db.create_file(ws_a, "a.md", "metered", "text", None, 1).await.unwrap();
+        // 7 characters, 12 UTF-8 bytes: a size of 0 would mean the listing cannot
+        // see content that moved, and 7 would mean it counted characters again.
+        let text = "héllo—€".to_string();
+        db.store_document_text(&file.doc_id, &text).await.unwrap();
+        assert_eq!(stored_text(&registries.org(org_a).await.unwrap(), "metered").await, Some(text.clone()));
+        assert_eq!(stored_text(&db, "metered").await, None, "the old subquery could not have found it");
+
+        let listed = db.list_files(ws_a).await.unwrap();
+        assert_eq!(listed[0].size, 12, "the file listing measures a routed document");
+        assert_eq!(db.get_file(file.id).await.unwrap().unwrap().size, 12, "so does fetching one by id");
+        assert_eq!(
+            db.org_content_bytes(org_a).await.unwrap(),
+            12,
+            "and the storage meter, which is what a plan is enforced against"
+        );
+        assert_eq!(db.org_content_bytes(org_b).await.unwrap(), 0, "the other tenant holds nothing of this");
+        assert_eq!(db.count().await.unwrap(), 1, "and the instance still knows how many documents it has");
+        // The ceiling has to be enforced against bytes the meter can actually
+        // see: 12 stored here, so 12 more fits a 24-byte plan and not a 23.
+        assert!(
+            matches!(
+                db.reserve_content_bytes(org_a, 12, 24).await.unwrap(),
+                crate::database::Quota::Admitted(_)
+            ),
+            "content the meter can see is content the plan can admit"
+        );
+        assert!(
+            matches!(
+                db.reserve_content_bytes(org_a, 12, 23).await.unwrap(),
+                crate::database::Quota::Over
+            ),
+            "and a plan it does not fit still says so"
+        );
+
+        let copied = db
+            .transfer_files(ws_a, &[(file.id, "copy.md".into())], true, true, &HashMap::new(), 1)
+            .await
+            .unwrap();
+        assert_eq!(copied[0].size, 12, "a copy reports the size it copied");
+        assert_eq!(db.list_files(ws_a).await.unwrap().len(), 2, "in both rows and sizes");
+        assert_eq!(db.org_content_bytes(org_a).await.unwrap(), 24);
+        let _ = ws_b;
+    }
+
+    #[tokio::test]
+    async fn moving_a_document_between_organizations_carries_its_content() {
+        use std::collections::HashMap;
+        let (_file, _orgs, db, registries) = split_databases().await;
+        let (org_a, ws_a, org_b, ws_b) = seed_two_orgs(&db).await;
+        let file = db.create_file(ws_a, "a.md", "moves", "text", None, 1).await.unwrap();
+        db.store_document_text(&file.doc_id, "crossing the boundary").await.unwrap();
+        assert_eq!(db.org_content_bytes(org_a).await.unwrap(), 21);
+
+        db.transfer_files(ws_b, &[(file.id, "moved.md".into())], false, true, &HashMap::new(), 1)
+            .await
+            .unwrap();
+
+        let tenant_a = registries.org(org_a).await.unwrap();
+        let tenant_b = registries.org(org_b).await.unwrap();
+        assert_eq!(
+            stored_text(&tenant_b, "moves").await.as_deref(),
+            Some("crossing the boundary"),
+            "the content arrives with the route"
+        );
+        assert_eq!(stored_text(&tenant_a, "moves").await, None, "and does not stay behind");
+        assert_eq!(db.org_of_doc("moves").await.unwrap(), Some(org_b));
+        assert_eq!(db.load(&file.doc_id).await.unwrap().text, "crossing the boundary");
+        assert_eq!(db.get_file(file.id).await.unwrap().unwrap().size, 21, "the meter followed it");
+        assert_eq!(db.org_content_bytes(org_a).await.unwrap(), 0);
+        assert_eq!(db.org_content_bytes(org_b).await.unwrap(), 21);
+
+        // It can still be written, in its new home, and nothing reappeared in the
+        // old one.
+        db.store_document_text("moves", "edited after the move").await.unwrap();
+        assert_eq!(stored_text(&tenant_b, "moves").await.as_deref(), Some("edited after the move"));
+        assert_eq!(stored_text(&tenant_a, "moves").await, None);
+    }
+
+    #[tokio::test]
+    async fn copying_a_document_into_another_organization_writes_it_there() {
+        use std::collections::HashMap;
+        let (_file, _orgs, db, registries) = split_databases().await;
+        let (org_a, ws_a, org_b, ws_b) = seed_two_orgs(&db).await;
+        let file = db.create_file(ws_a, "a.md", "original", "text", None, 1).await.unwrap();
+        db.store_document_text("original", "the source text").await.unwrap();
+
+        let copied = db
+            .transfer_files(ws_b, &[(file.id, "copy.md".into())], true, true, &HashMap::new(), 1)
+            .await
+            .unwrap();
+        assert_ne!(copied[0].doc_id, "original", "a copy is a new document");
+        assert_eq!(db.org_of_doc(&copied[0].doc_id).await.unwrap(), Some(org_b));
+        assert_eq!(
+            stored_text(&registries.org(org_b).await.unwrap(), &copied[0].doc_id).await,
+            Some("the source text".to_string()),
+            "in the destination organization's database"
+        );
+        assert_eq!(
+            stored_text(&registries.org(org_a).await.unwrap(), "original").await,
+            Some("the source text".to_string()),
+            "and the source is untouched"
+        );
+        assert_eq!(db.load(&copied[0].doc_id).await.unwrap().text, "the source text");
+        assert_eq!(copied[0].size, 15);
+
+        // A live editor's unsaved text wins over what was flushed, as it did
+        // inside one database.
+        let mut snapshots = HashMap::new();
+        snapshots.insert(
+            copied[0].doc_id.clone(),
+            PersistedDocument { text: "typed but not flushed".into(), language: None },
+        );
+        let twice = db
+            .transfer_files(ws_b, &[(copied[0].id, "twice.md".into())], true, true, &snapshots, 1)
+            .await
+            .unwrap();
+        assert_eq!(twice[0].size, 21);
+        assert_eq!(db.load(&twice[0].doc_id).await.unwrap().text, "typed but not flushed");
+    }
+
+    #[tokio::test]
+    async fn a_merged_or_reparented_workspace_takes_its_content_across() {
+        let (_file, _orgs, db, registries) = split_databases().await;
+        let (org_a, ws_a, org_b, ws_b) = seed_two_orgs(&db).await;
+        let (group_a,): (i64,) = sqlx::query_as("SELECT group_id FROM workspace WHERE id = $1")
+            .bind(ws_a)
+            .fetch_one(db.write())
+            .await
+            .unwrap();
+        let merged = db.create_file(ws_a, "merge.md", "merged-doc", "text", None, 1).await.unwrap();
+        let moved = db.create_file(ws_a, "move.md", "moved-doc", "text", None, 1).await.unwrap();
+        db.store_document_text("merged-doc", "into the merge").await.unwrap();
+        db.store_document_text("moved-doc", "into the reparent").await.unwrap();
+        let tenant_a = registries.org(org_a).await.unwrap();
+        let tenant_b = registries.org(org_b).await.unwrap();
+
+        db.merge_workspaces(ws_a, ws_b).await.unwrap();
+        assert_eq!(stored_text(&tenant_b, "merged-doc").await.as_deref(), Some("into the merge"));
+        assert_eq!(stored_text(&tenant_a, "merged-doc").await, None, "and not left in the old tenant");
+        assert_eq!(db.org_of_doc("merged-doc").await.unwrap(), Some(org_b));
+        assert_eq!(db.load(&merged.doc_id).await.unwrap().text, "into the merge");
+
+        // The surviving workspace now belongs to org B; reparent it into org A's
+        // group and every document in it follows the route, ids unchanged.
+        let workspace = db.get_workspace(ws_b).await.unwrap().expect("the merged workspace");
+        db.move_workspace_to_group(&workspace, group_a).await.unwrap();
+        assert_eq!(db.org_of_doc("moved-doc").await.unwrap(), Some(org_a));
+        assert_eq!(stored_text(&tenant_a, "moved-doc").await.as_deref(), Some("into the reparent"));
+        assert_eq!(stored_text(&tenant_b, "moved-doc").await, None);
+        assert_eq!(db.load(&moved.doc_id).await.unwrap().text, "into the reparent");
+        assert_eq!(db.org_content_bytes(org_a).await.unwrap(), 31, "both documents, both sizes");
+        assert_eq!(db.org_content_bytes(org_b).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_boot_migration_moves_content_that_predates_the_split() {
+        let control = tempfile::NamedTempFile::new().unwrap();
+        let uri = format!("sqlite://{}", control.path().to_str().unwrap());
+        let db = Database::open_with(&uri, BlobStore::inline()).await.unwrap();
+        let (org_a, ws_a, org_b, ws_b) = seed_two_orgs(&db).await;
+        db.create_file(ws_a, "a.md", "old-a", "text", None, 1).await.unwrap();
+        db.create_file(ws_b, "b.md", "old-b", "text", None, 1).await.unwrap();
+        db.store_document_text("old-a", "written before the split").await.unwrap();
+        assert_eq!(db.table_rows("document").await.unwrap(), 2, "both rows are here today");
+        assert_eq!(db.migrate_content_to_orgs().await.unwrap(), 0, "with no registry, nothing moves");
+
+        let orgs = tempfile::tempdir().unwrap();
+        let registries = Databases::files_in(db.clone(), orgs.path().to_path_buf());
+        db.attach_registries(registries.clone());
+        assert_eq!(db.migrate_content_to_orgs().await.unwrap(), 2, "boot moves both");
+        assert_eq!(db.table_rows("document").await.unwrap(), 0, "and control ends up holding none");
+        assert_eq!(
+            stored_text(&registries.org(org_a).await.unwrap(), "old-a").await.as_deref(),
+            Some("written before the split")
+        );
+        assert_eq!(stored_text(&registries.org(org_b).await.unwrap(), "old-b").await.as_deref(), Some(""));
+        assert_eq!(db.load("old-a").await.unwrap().text, "written before the split");
+        assert_eq!(db.get_file(db.list_files(ws_a).await.unwrap()[0].id).await.unwrap().unwrap().size, 24);
+        assert!(orgs.path().join(format!("org-{org_a}.db")).exists());
+        assert_eq!(db.migrate_content_to_orgs().await.unwrap(), 0, "a second pass repairs nothing");
+
+        // A partially migrated database — the copy moved, the row here never
+        // deleted, and the tenant's copy written since. The newer one wins.
+        db.store_document_text("old-a", "typed after the move").await.unwrap();
+        insert_content(&db, "old-a", &PersistedDocument { text: "the stale copy".into(), language: None })
+            .await
+            .unwrap();
+        assert_eq!(db.migrate_content_to_orgs().await.unwrap(), 1);
+        assert_eq!(
+            stored_text(&registries.org(org_a).await.unwrap(), "old-a").await.as_deref(),
+            Some("typed after the move"),
+            "a migration never overwrites the copy a tenant is already using"
+        );
+        assert_eq!(stored_text(&db, "old-a").await, None, "and the duplicate here goes");
+    }
+
+    #[tokio::test]
+    async fn unrouted_content_stays_in_the_control_database_and_still_reads() {
+        let (_file, orgs, db, _registries) = split_databases().await;
+        // A workspace whose group chain resolves to no organization: there is no
+        // tenant to hand its documents to, so they stay exactly where they are.
+        let (lost,): (i64,) = sqlx::query_as(
+            "INSERT INTO workspace (group_id, name, slug, created_by, created_at) VALUES (NULL, 'Lost', 'lost', 1, 1) RETURNING id",
+        )
+        .fetch_one(db.write())
+        .await
+        .unwrap();
+        let file = db.create_file(lost, "x.md", "unrouted", "text", None, 1).await.unwrap();
+        db.store_document_text("unrouted", "still readable").await.unwrap();
+        assert_eq!(stored_text(&db, "unrouted").await.as_deref(), Some("still readable"));
+        assert_eq!(db.load(&file.doc_id).await.unwrap().text, "still readable");
+        assert_eq!(db.get_file(file.id).await.unwrap().unwrap().size, 14);
+        assert_eq!(db.migrate_content_to_orgs().await.unwrap(), 0, "and a boot does not invent an owner");
+        assert_eq!(
+            std::fs::read_dir(orgs.path()).unwrap().count(),
+            0,
+            "no tenant database is created for a document that belongs to none"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_archive_carries_content_stored_in_every_tenant() {
+        let (_file, _orgs, db, _registries) = split_databases().await;
+        let (org_a, ws_a, _org_b, ws_b) = seed_two_orgs(&db).await;
+        db.create_file(ws_a, "a.md", "archived-a", "text", None, 1).await.unwrap();
+        db.create_file(ws_b, "b.md", "archived-b", "text", None, 1).await.unwrap();
+        db.store_document_text("archived-a", "alpha bytes").await.unwrap();
+        db.store_document_text("archived-b", "beta bytes").await.unwrap();
+        assert_eq!(db.table_rows("document").await.unwrap(), 0, "the control database holds none of it");
+
+        let snapshot = db.export_snapshot().await.unwrap();
+        let rows = snapshot["document"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "and the backup still contains all of it");
+        assert!(rows
+            .iter()
+            .any(|row| row["id"] == serde_json::json!("archived-a") && row["text"] == serde_json::json!("alpha bytes")));
+
+        // Restore into a fresh instance of the same shape: the content has to end
+        // up in the tenant that owns it, not in the control file it arrived in.
+        let target_file = tempfile::NamedTempFile::new().unwrap();
+        let target_uri = format!("sqlite://{}", target_file.path().to_str().unwrap());
+        let target = Database::open_with(&target_uri, BlobStore::inline()).await.unwrap();
+        let target_orgs = tempfile::tempdir().unwrap();
+        let target_registries = Databases::files_in(target.clone(), target_orgs.path().to_path_buf());
+        target.attach_registries(target_registries.clone());
+        let tables: Vec<(String, Vec<serde_json::Value>)> = Database::MIGRATE_TABLES
+            .iter()
+            .map(|name| ((*name).to_string(), snapshot[*name].as_array().unwrap().clone()))
+            .collect();
+        target.import_replace_all(&tables).await.unwrap();
+        assert_eq!(target.load("archived-a").await.unwrap().text, "alpha bytes");
+        assert_eq!(target.load("archived-b").await.unwrap().text, "beta bytes");
+        assert_eq!(target.table_rows("document").await.unwrap(), 0, "and it did not stay in the control plane");
+        let owner = target.org_of_doc("archived-a").await.unwrap().expect("restored with its route");
+        assert_eq!(
+            stored_text(&target_registries.org(owner).await.unwrap(), "archived-a").await.as_deref(),
+            Some("alpha bytes"),
+            "it landed in the organization that owns it"
+        );
+        assert_eq!(owner, org_a, "and it is the organization the archive named");
+    }
+
+    /// A restore replaces the dataset, so a document the archive does not carry
+    /// must not survive in the tenant that was holding it.
+    #[tokio::test]
+    async fn restoring_an_archive_replaces_what_a_tenant_was_holding() {
+        let source_file = tempfile::NamedTempFile::new().unwrap();
+        let source_uri = format!("sqlite://{}", source_file.path().to_str().unwrap());
+        let source = Database::open_with(&source_uri, BlobStore::inline()).await.unwrap();
+        let (org_a, ws_a, _org_b, ws_b) = seed_two_orgs(&source).await;
+        source.create_file(ws_a, "keep.md", "keep", "text", None, 1).await.unwrap();
+        source.create_uploaded_file(ws_b, "x.bin", "upload", Some("image/png"), None, &[9], 1)
+            .await
+            .unwrap();
+        source.store_document_text("keep", "the archive's text").await.unwrap();
+        let snapshot = source.export_snapshot().await.unwrap();
+        let tables: Vec<(String, Vec<serde_json::Value>)> = Database::MIGRATE_TABLES
+            .iter()
+            .map(|name| ((*name).to_string(), snapshot[*name].as_array().unwrap().clone()))
+            .collect();
+
+        // The target is a routed instance with content of its own.
+        let (_file, _orgs, db, registries) = split_databases().await;
+        let (t_org, t_ws, ..) = seed_two_orgs(&db).await;
+        db.create_file(t_ws, "old.md", "stale-doc", "text", None, 1).await.unwrap();
+        db.store_document_text("stale-doc", "not in the archive").await.unwrap();
+        assert_eq!(
+            stored_text(&registries.org(t_org).await.unwrap(), "stale-doc").await.as_deref(),
+            Some("not in the archive")
+        );
+
+        db.import_replace_all(&tables).await.unwrap();
+        assert_eq!(
+            stored_text(&registries.org(org_a).await.unwrap(), "keep").await.as_deref(),
+            Some("the archive's text"),
+            "the restored document landed in the tenant that owns it"
+        );
+        assert_eq!(stored_text(&registries.org(t_org).await.unwrap(), "stale-doc").await, None);
+        assert_eq!(db.load("keep").await.unwrap().text, "the archive's text");
+        assert_eq!(db.count().await.unwrap(), 1, "one document, not two");
+    }
+
+    /// The zip-import path is the same code a restore runs, and the content it
+    /// writes has to end up where the route says.
+    #[tokio::test]
+    async fn a_zip_import_lands_its_content_in_the_organizations_file() {
+        use super::ImportedFile;
+        let (_file, orgs, db, registries) = split_databases().await;
+        let (org_a, ws_a, ..) = seed_two_orgs(&db).await;
+        let entries = [
+            ImportedFile { path: "hello.txt".into(), mime: None, bytes: b"imported text".to_vec(), is_text: true },
+            ImportedFile { path: "icon.png".into(), mime: Some("image/png".into()), bytes: vec![0, 1, 2], is_text: false },
+        ];
+        let imported = db.import_files(ws_a, &entries, 1).await.unwrap();
+        assert_eq!(imported.len(), 2);
+        let text = imported.iter().find(|f| f.kind == "text").expect("the note came back");
+        assert_eq!(text.size, 13, "an import reports the size it wrote");
+        let tenant = registries.org(org_a).await.unwrap();
+        assert_eq!(stored_text(&tenant, &text.doc_id).await.as_deref(), Some("imported text"));
+        assert_eq!(stored_text(&db, &text.doc_id).await, None, "and not in the control file");
+        assert_eq!(db.list_files(ws_a).await.unwrap()[0].size, 13);
+        assert_eq!(db.org_content_bytes(org_a).await.unwrap(), 16, "13 bytes of text and 3 of png");
+        assert!(orgs.path().join(format!("org-{org_a}.db")).exists());
+    }
+
 }

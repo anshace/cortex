@@ -101,6 +101,25 @@ pub struct Report {
 }
 
 impl Databases {
+    /// A registry pinned to one directory, so a test can have file-backed
+    /// tenants without editing the process environment to get them. Identical to
+    /// the layout `CORTEX_ORG_DBS=1` chooses on a file-backed control database.
+    #[cfg(test)]
+    pub(crate) fn files_in(control: Database, dir: PathBuf) -> Self {
+        Self::with_mode(control, Mode::Files(dir))
+    }
+
+    fn with_mode(control: Database, mode: Mode) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                control,
+                mode,
+                open: tokio::sync::Mutex::new(HashMap::new()),
+                nonce: rand::random(),
+            }),
+        }
+    }
+
     /// Choose the layout from the environment and keep the control database.
     ///
     /// `sqlite_uri` is the one the control plane opened, and only decides the
@@ -125,14 +144,7 @@ impl Databases {
         if !matches!(mode, Mode::Single) {
             log::info!("per-org databases enabled ({mode:?})");
         }
-        Self {
-            inner: Arc::new(Inner {
-                control,
-                mode,
-                open: tokio::sync::Mutex::new(HashMap::new()),
-                nonce: rand::random(),
-            }),
-        }
+        Self::with_mode(control, mode)
     }
 
     /// The layout name an operator reads in the console: "single", "files",
@@ -289,6 +301,22 @@ impl Databases {
             .fetch_all(self.inner.control.read_only())
             .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// The organizations that already have a content database, in a stable
+    /// order. Housekeeping over stored content asks this instead of
+    /// [`Self::org_ids`] because opening an organization that never had a
+    /// database would create one: a sweep has nothing to reclaim in a tenant
+    /// that holds no file, and boot must not provision the estate of an
+    /// organization that has never stored a byte.
+    pub async fn openable_org_ids(&self) -> Result<Vec<i64>> {
+        let mut out = Vec::new();
+        for org_id in self.org_ids().await? {
+            if self.is_provisioned(org_id).await {
+                out.push(org_id);
+            }
+        }
+        Ok(out)
     }
 
     /// Bring every organization's database to this binary's schema, and refresh
@@ -476,14 +504,7 @@ mod tests {
     }
 
     fn split(control: Database, mode: Mode) -> Databases {
-        Databases {
-            inner: Arc::new(Inner {
-                control,
-                mode,
-                open: tokio::sync::Mutex::new(HashMap::new()),
-                nonce: rand::random(),
-            }),
-        }
+        Databases::with_mode(control, mode)
     }
 
     #[tokio::test]
