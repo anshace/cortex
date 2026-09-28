@@ -3378,6 +3378,25 @@ impl Database {
         Ok(keystore::unwrap_dek(&stored))
     }
 
+    /// Whether this install seals organization content at all.
+    ///
+    /// Two things have to hold: content has to live in objects rather than in rows,
+    /// and a master key has to be loaded to wrap organization keys. An inline
+    /// install fails the first test and is honest about it — its content is gone
+    /// with the row that held it, and no key is involved either way.
+    pub fn content_sealed(&self) -> bool {
+        !self.blobs.is_inline() && keystore::source() != "unset"
+    }
+
+    /// How many organizations hold a data key. A caller that cannot read this says
+    /// "unknown", not zero: "no organization keys exist here" is a claim about
+    /// whether stored content can still be read.
+    pub async fn org_key_count(&self) -> Result<i64> {
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM org_keys").fetch_one(&self.pool).await?;
+        Ok(n)
+    }
+
     /// The stored (wrapped) key, without creating one. Reads must use this: a read
     /// that minted a fresh key would turn a shredded organization's objects into a
     /// mystery instead of the clear failure they are.
@@ -5360,6 +5379,22 @@ mod tests {
                 .await
                 .unwrap();
         assert!(inline_data.is_empty(), "the paste must not sit in the row as well");
+    }
+
+    #[tokio::test]
+    async fn the_storage_report_says_whether_content_is_sealed() {
+        let (_tmp, fs_db) = test_database().await;
+        assert!(fs_db.content_sealed(), "an object-store install seals what it writes");
+        assert_eq!(fs_db.org_key_count().await.unwrap(), 0, "no key before the first upload");
+        let (_, ws) = seed_workspace(&fs_db).await;
+        add_binary(&fs_db, ws, "a.png", b"sealed bytes").await;
+        assert_eq!(fs_db.org_key_count().await.unwrap(), 1, "one organization, one key");
+
+        let (_tmp2, inline) = test_database_inline().await;
+        assert!(!inline.content_sealed(), "a row-based install has nothing to seal");
+        let (_, ws) = seed_workspace(&inline).await;
+        add_binary(&inline, ws, "a.png", b"plain bytes").await;
+        assert_eq!(inline.org_key_count().await.unwrap(), 0, "and it mints no keys");
     }
 
     #[tokio::test]

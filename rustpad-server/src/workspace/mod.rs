@@ -2590,6 +2590,7 @@ async fn admin_storage(user: User, db: Database, databases: Option<Databases>) -
         "file_blob",
         "audit",
         "session",
+        "org_keys",
     ];
     let mut tables = Vec::new();
     for table in TABLES {
@@ -2605,12 +2606,22 @@ async fn admin_storage(user: User, db: Database, databases: Option<Databases>) -
         Some(registry) => registry.report().await.ok(),
         None => None,
     };
+    let keys = db.org_key_count().await.ok();
     let mut body = json!({
         "db_bytes": db.db_size_bytes().await.unwrap_or(0),
         "free_bytes": db.free_bytes().await.unwrap_or(0),
         "blob_bytes": db.blob_bytes().await.unwrap_or(0),
         "object_bytes": db.object_bytes().await.unwrap_or(0),
         "blob_backend": db.blob_backend(),
+        // Whether content is encrypted per organization is the fact a deletion's
+        // irreversibility rests on, so the console says it rather than leaving it
+        // in the server log. `null` keys means the count could not be read — which
+        // is not the same claim as "no keys exist".
+        "sealing": json!({
+            "active": db.content_sealed(),
+            "keys": keys,
+            "key_source": crate::keystore::source(),
+        }),
         // Plans are per org and verified offline; the console shows what this
         // deployment is enforcing so an owner is never guessing at a refusal.
         "licence": json!({

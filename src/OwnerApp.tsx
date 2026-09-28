@@ -574,7 +574,12 @@ function OwnerApp({
                       onDelete={() =>
                         setConfirm({
                           title: `Delete "${o.name}"?`,
-                          body: "All of its workspaces, files and chat go with it. Users are unassigned, not deleted.",
+                          body: storage?.sealing?.active
+                            ? "Its workspaces, files and chat go with it, and so does the key that encrypts its uploaded content — the bytes become unreadable for good. Backups taken before this still open, so a copy of the database and its data key from last week brings all of it back; destroying this organization for real means destroying those too. Users are unassigned, not deleted."
+                            : "All of its workspaces, files and chat go with it. Users are unassigned, not deleted.",
+                          cta: storage?.sealing?.active
+                            ? "Delete and destroy its key"
+                            : "Delete organization",
                           onConfirm: () =>
                             run(() => api.adminDeleteOrg(o.id), "Org deleted"),
                         })
@@ -1134,6 +1139,49 @@ function OwnerApp({
                       <Text as="span" fontFamily="mono">.db</Text> backup does not.
                     </Text>
                   )}
+                  {/* Whether content is encrypted per organization is what makes a
+                      deletion irreversible, and an owner cannot learn that from a
+                      file size. */}
+                  {storage?.sealing && (
+                    <Box mt={3} pt={3} borderTop="1px solid" borderColor="surface.border">
+                      <KV
+                        label="Per-org encryption"
+                        value={
+                          storage.sealing.active
+                            ? storage.sealing.keys === null
+                              ? "on · count unreadable"
+                              : `on · ${storage.sealing.keys} key${
+                                  storage.sealing.keys === 1 ? "" : "s"
+                                }`
+                            : "off"
+                        }
+                        hue={storage.sealing.active ? "state.ok" : "state.info"}
+                      />
+                      <Text fontSize="11px" color="ink.subtle" mt={2} lineHeight={1.55}>
+                        {storage.sealing.active ? (
+                          <>
+                            Each organization's uploads are sealed under a key of
+                            their own, so deleting an organization is what makes its
+                            content gone — and a backup taken beforehand still opens.
+                            Keys are wrapped by{" "}
+                            <Text as="span" fontFamily="mono">
+                              {storage.sealing.key_source}
+                            </Text>
+                            , which has to travel with every backup.
+                          </>
+                        ) : (
+                          <>
+                            Content lives in the database rows themselves, so deleting
+                            a file removes its bytes outright and no key is involved.
+                            Set{" "}
+                            <Text as="span" fontFamily="mono">BLOB_BACKEND=fs</Text> to
+                            move it into objects, where each organization's copy is
+                            sealed and shreddable.
+                          </>
+                        )}
+                      </Text>
+                    </Box>
+                  )}
                   {/* Plans are enforced offline from a signed licence, so the
                       console has to say which regime this instance is running in. */}
                   {storage?.licence && (
@@ -1148,12 +1196,27 @@ function OwnerApp({
                               (p.seats !== null && p.seats_used >= p.seats) ||
                               (p.storage_bytes !== null &&
                                 p.storage_used >= p.storage_bytes);
+                            // `exp` 0 means the licence never expires, so only a
+                            // positive one is a date worth showing — and a licence
+                            // about to lapse has to be visible before it silently
+                            // degrades the organization to the free tier.
+                            const expiry =
+                              p.licensed && p.exp > 0
+                                ? new Date(p.exp * 1000).toISOString().slice(0, 10)
+                                : null;
+                            const lapsing =
+                              expiry !== null &&
+                              p.exp * 1000 - Date.now() < 30 * 86_400_000;
                             return (
                               <KV
                                 key={p.org}
-                                label={`${p.org_name} · ${p.licensed ? p.plan : `${p.plan} (default)`}`}
+                                label={`${p.org_name} · ${
+                                  p.licensed
+                                    ? `${p.plan}${expiry ? ` until ${expiry}` : ""}`
+                                    : `${p.plan} (default)`
+                                }`}
                                 value={`${p.seats_used}/${p.seats ?? "∞"} seats · ${humanBytes(p.storage_used)}/${p.storage_bytes ? humanBytes(p.storage_bytes) : "∞"}`}
-                                hue={full ? "state.warn" : "brand.400"}
+                                hue={full || lapsing ? "state.warn" : "brand.400"}
                               />
                             );
                           })

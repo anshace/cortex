@@ -1516,6 +1516,17 @@ function StoragePanel() {
               </Text>
             </Card>
           </SimpleGrid>
+          {/* Two numbers side by side invite the reading that they add up to the
+              whole install. Where the content physically lives is the fact that
+              decides whether a copied `.db` is a backup at all. */}
+          <Text fontSize="xs" color="ink.muted" mb={4} lineHeight={1.6}>
+            {data.blob_backend === "fs"
+              ? "Uploaded content lives in files beside the database, not inside it, so a copied .db is not a backup — take the owner console's export."
+              : "Uploaded content is stored inside the database file, so this file is the whole install."}
+            {data.sealing?.active
+              ? " Each organization's content is encrypted under a key of its own, which deleting the organization destroys for good."
+              : ""}
+          </Text>
           <Card>
             <Flex justify="space-between" align="center" gap={4} flexWrap="wrap">
               <Box>

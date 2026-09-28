@@ -570,6 +570,11 @@ export type StorageStats = {
   object_bytes: number;
   /** `inline` while bytes live in the database file, `fs` once they do not. */
   blob_backend: string;
+  /** Whether uploaded content is encrypted under each organization's own key —
+   *  the fact that makes deleting an organization irreversible rather than merely
+   *  destructive. `keys` is null when the count could not be read, which is not
+   *  the same claim as zero. */
+  sealing?: { active: boolean; keys: number | null; key_source: string };
   /** Where each organization's content actually lives, and how current its
    *  schema is. Absent on an instance that predates per-org databases. */
   databases?: {
