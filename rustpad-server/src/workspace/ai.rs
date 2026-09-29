@@ -2104,6 +2104,19 @@ fn ai_jobs() -> &'static Mutex<HashMap<String, Arc<AiJob>>> {
 
 /// Register a new turn for `key` (`{workspace}:{conversation}`), replacing any
 /// previous one for the same conversation. Returns None for an empty key.
+/// The registry key for one in-flight turn.
+///
+/// The owner is part of it deliberately. Workspace membership is not enough here:
+/// attaching replays the exact message list the turn started with, every tool
+/// result, and file diffs up to 120 KB — and the conversation id is client-chosen
+/// and guessable (a timestamp plus four characters). Keyed on workspace and
+/// conversation alone, one member could watch another member's turn. Sharing a
+/// *finished* conversation is a separate, deliberate act (`set_ai_conv_shared`);
+/// this is not that, and one helper means the two call sites cannot drift.
+fn job_key(user_id: i64, workspace_id: i64, conv: &str) -> String {
+    format!("{user_id}:{workspace_id}:{}", conv.trim())
+}
+
 fn job_start(key: String, turn: Vec<serde_json::Value>) -> Option<Arc<AiJob>> {
     if key.is_empty() || turn.is_empty() {
         return None;
@@ -4803,8 +4816,9 @@ async fn ai_chat(user: User, db: Database, body: AiChatReq) -> Result<impl Reply
 
     // Register the turn in the in-memory job registry so a re-attached client
     // (after a tab close / refresh) can replay the log and keep watching it
-    // live. The key is `{workspace}:{conversation}`; without a conversation id
-    // the turn can't be recovered, so no job is registered.
+    // live. The key is `{owner}:{workspace}:{conversation}` — see [`job_key`];
+    // without a conversation id the turn can't be recovered, so no job is
+    // registered.
     let job = body
         .conv_id
         .as_deref()
@@ -4820,7 +4834,7 @@ async fn ai_chat(user: User, db: Database, body: AiChatReq) -> Result<impl Reply
                 .filter(|m| m.role == "user" || m.role == "assistant")
                 .filter_map(|m| serde_json::to_value(m).ok())
                 .collect();
-            job_start(format!("{}:{}", body.workspace_id, cid), turn)
+            job_start(job_key(user.id, body.workspace_id, cid), turn)
         });
 
     let turn_id = format!(
@@ -4867,7 +4881,7 @@ struct JobQuery {
 /// ran).
 async fn ai_job_stream(user: User, db: Database, q: JobQuery) -> Result<impl Reply, Rejection> {
     ensure_ws(&db, &user, q.workspace_id).await?;
-    let key = format!("{}:{}", q.workspace_id, q.conv_id.trim());
+    let key = job_key(user.id, q.workspace_id, &q.conv_id);
     let job = match job_get(&key) {
         Some(j) => j,
         None => return Ok(err(StatusCode::NOT_FOUND, "no active job for this conversation")),
@@ -6241,6 +6255,20 @@ pub(crate) fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error
 mod tests {
     use super::ai_clean_path;
     use super::{agent_short_name, ai_orchestrator_prompt, ai_tool_defs, anthropic_wire_content, apply_exact_patch, azure_chat_url, ctx_window, extra_ui_paths, fileish_paths, fmt_tok_i64, format_sibling_brief, full_replace_reject, looks_like_ui_work, mentioned_paths, oai_text_of, openai_usage_of, parse_frontmatter, parse_github_repo, tool_arg_preview, tool_round_key, tool_summary, usage_json, wire_args, wire_tool_result, write_ok, ToolFlags, UsageTotals};
+
+    #[test]
+    fn an_in_flight_turn_belongs_to_the_one_who_started_it() {
+        use super::job_key;
+        let mine = job_key(7, 3, "c-1");
+        // Two members of one workspace, same client-chosen conversation id: these
+        // must not meet, or attaching replays somebody else's turn.
+        assert_ne!(job_key(8, 3, "c-1"), mine, "one job key served two users");
+        // Same owner and conversation still match, trailing space included.
+        assert_eq!(job_key(7, 3, "  c-1  "), mine);
+        // And a workspace is not a conversation: nothing collides across either.
+        assert_ne!(job_key(7, 4, "c-1"), mine);
+        assert_ne!(job_key(7, 3, "c-2"), mine);
+    }
 
     #[test]
     fn a_provider_url_cannot_point_at_the_private_network() {
