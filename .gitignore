@@ -32,3 +32,10 @@ REASERCH/
 # The data-key sidecar next to a database (see DEPLOY.md). Losing it makes sealed
 # columns unreadable; committing it would publish the key.
 *.key
+
+# Personal agent overrides and agent scratch that can leak tokens
+# (project-context-system; see context/workflow-rules.md).
+CLAUDE.local.md
+context/current-issues.md
+.env.*
+!.env.example

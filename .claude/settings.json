@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(npm test)",
+      "Bash(npm run check)",
+      "Bash(npm run build)",
+      "Bash(npm run icons)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo build:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(git tag:*)",
+      "Bash(git checkout:*)",
+      "Bash(git reset:*)",
+      "Bash(git clean:*)",
+      "Bash(git branch -D:*)",
+      "Bash(npm install:*)",
+      "Bash(cargo add:*)",
+      "Bash(rm:*)",
+      "Bash(docker:*)",
+      "Bash(gh:*)",
+      "Read(**/*.db)",
+      "Read(**/*.key)"
+    ],
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(**/.env*)",
+      "Read(**/*.key)",
+      "Read(**/seed_users.json)",
+      "Bash(git config:*)",
+      "Bash(git push --force:*)",
+      "Bash(prettier --write:*)",
+      "Bash(cargo fmt:*)"
+    ]
+  }
+}
