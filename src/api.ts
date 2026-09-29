@@ -833,3 +833,586 @@ export async function adminExportOrg(id: number): Promise<void> {
   a.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
+
+// ----- AI assistant (ported from cortex-private; server holds the keys) -----
+
+// ----- AI assistant (works via file tools; server holds the key) -----
+// Token/cost accounting for one assistant reply. `input` is FRESH (non-cached)
+// input tokens; `cached` are cache-read tokens; `cacheCreation` are cache-write
+// tokens; `output` includes thinking; `reasoning` is the thinking part of output.
+// `cost` is the total (provider-reported, else estimated); the cost_* parts let
+// the UI show "input + cached + output = total".
+export type AiUsage = {
+  input: number;
+  output: number;
+  cached?: number;
+  cacheCreation?: number;
+  reasoning?: number;
+  ctx?: number; // last LLM round's prompt size (fresh+cached), for the ctx meter
+  ctxCached?: number;
+  cost?: number;
+  costInput?: number;
+  costCached?: number;
+  costOutput?: number;
+  model?: string; // set on live usage events so the header isn't "unknown" mid-turn
+};
+// A multiple-choice question the assistant asked (rendered from a fenced
+// ```question``` block at the end of its reply). `answer` is filled in when
+// the user picks an option or types their own.
+export type AiQuestion = {
+  q: string;
+  options: string[];
+  multi: boolean;
+  answer?: string;
+};
+// One tool invocation on an assistant message. `old`/`new` carry the
+// before/after file content for create/edit calls so the client can render diffs.
+export type ToolCallInfo = {
+  name: string;
+  arg: string;
+  result: string;
+  old?: string;
+  new?: string;
+  agent?: string;
+};
+export type AiMessage = {
+  role: "user" | "assistant";
+  content: string;
+  reasoning?: string;
+  steps?: string[]; // live activity log (status lines, retries, compaction)
+  agents?: AgentEvent[]; // structured orchestrator/subagent progress, grouped by id
+  toolCalls?: ToolCallInfo[]; // structured tool calls
+  question?: AiQuestion; // interactive Q&A card, set from a ```question``` block
+  usage?: AiUsage;
+  ms?: number; // wall-clock the response took
+  model?: string;
+  note?: boolean; // local slash-command note; never sent to the model
+  compacted?: boolean; // server compacted the conversation; content is a summary
+};
+export type AiDone = {
+  usage?: AiUsage;
+  source?: string;
+  model?: string;
+  ms?: number;
+  profile?: string;
+  // Present when the server compacted the conversation: the client must adopt
+  // this (visible) message list so the next turn reconciles with the wire state.
+  messages?: AiMessage[];
+};
+export type AiStreamEvent =
+  | { kind: "text"; text: string }
+  | { kind: "reasoning"; text: string }
+  | { kind: "status"; text: string }
+  | { kind: "tool"; name: string; arg: string; result: string; old?: string; new?: string; agent?: string };
+
+// A skill invoked this turn (via [skill:name] in the draft): its instructions
+// are injected server-side into the current message.
+export type SkillRef = { name: string; instructions: string };
+
+// A reusable skill definition. Stored server-side (per user) so skills follow
+// the user across machines; `alwaysOn` injects the skill into every prompt, and
+// `autoLoad` keywords activate it automatically when they appear in a message.
+export type SkillSource = "custom" | "github" | "bundled";
+export type Skill = {
+  id: number;
+  name: string;
+  description: string;
+  instructions: string;
+  source: SkillSource;
+  sourceUrl: string | null;
+  alwaysOn: boolean;
+  autoLoad: string[];
+};
+// Legacy localStorage key used before the registry moved to the server; the
+// client migrates any leftovers once, then clears it.
+export const SKILLS_STORAGE_KEY = "cortex-ai-skills";
+
+// ----- AI skills (server-backed registry + GitHub skill imports) -----
+export async function listSkills(): Promise<Skill[]> {
+  const data = await json<{ skills: Skill[] }>(await fetch("/api/ai/skills", { credentials: "include" }));
+  return data.skills;
+}
+
+export async function saveSkill(s: {
+  name: string;
+  description: string;
+  instructions: string;
+  source: SkillSource;
+  sourceUrl: string | null;
+  alwaysOn: boolean;
+  autoLoad: string[];
+}): Promise<Skill> {
+  const data = await json<{ skill: Skill }>(
+    await fetch(
+      "/api/ai/skills",
+      opts("POST", {
+        name: s.name,
+        description: s.description,
+        instructions: s.instructions,
+        source: s.source,
+        source_url: s.sourceUrl,
+        always_on: s.alwaysOn,
+        auto_load: s.autoLoad,
+      }),
+    ),
+  );
+  return data.skill;
+}
+
+export async function deleteSkill(name: string): Promise<void> {
+  await json(await fetch(`/api/ai/skills?name=${encodeURIComponent(name)}`, opts("DELETE")));
+}
+
+export async function catalogGithubSkills(repoUrl: string): Promise<{ name: string; description: string }[]> {
+  const data = await json<{ skills: { name: string; description: string }[] }>(
+    await fetch("/api/ai/skills/catalog", opts("POST", { repo_url: repoUrl })),
+  );
+  return data.skills;
+}
+
+export async function importGithubSkill(repoUrl: string, name: string): Promise<Skill> {
+  const data = await json<{ skill: Skill }>(
+    await fetch("/api/ai/skills/import", opts("POST", { repo_url: repoUrl, name })),
+  );
+  return data.skill;
+}
+
+// Structured agent progress: the orchestrator (id "main") and each subagent
+// (id "s1", "s2", …) report `start` / `round` / `end` so the UI can group
+// rounds per agent instead of showing one interleaved wall of "Round N".
+export type AgentEvent = {
+  id: string;
+  kind: "start" | "round" | "end";
+  model?: string;
+  profile?: string;
+  name?: string; // short label for the card (from the spawn task)
+  task?: string;
+  round?: number;
+  summary?: string;
+  calls?: number;
+  writes?: number;
+  ok?: boolean;
+  error?: string;
+};
+
+// Streams the assistant's reply as Server-Sent Events. `on` fires for each event:
+// "text" (answer), "reasoning" (extended thinking), "status" (model/retries), and
+// "tool" (each file tool call, live). `onUsage` streams the running cost/tokens
+// after every round so the header updates live; `onAgent` carries structured
+// orchestrator/subagent progress. Resolves with token usage, model, timing.
+// `convId` is the client conversation id — the server keeps the canonical wire
+// history under it so the exact cached prefix is resent on every turn.
+export async function aiChat(
+  workspaceId: number,
+  convId: string | null,
+  messages: AiMessage[],
+  on: (e: AiStreamEvent) => void,
+  attachments: string[] = [],
+  profile?: string,
+  plan = false,
+  onUsage?: (u: AiUsage) => void,
+  onAgent?: (a: AgentEvent) => void,
+  skills: SkillRef[] = [],
+  signal?: AbortSignal,
+  subagents = true,
+  research = true,
+): Promise<AiDone> {
+  const res = await fetch(
+    "/api/ai/chat",
+    { ...opts("POST", { workspace_id: workspaceId, conv_id: convId, messages, attachments, profile, plan, subagents, research, skills }), signal },
+  );
+  if (res.status === 503) throw new Error("AI isn't set up on this server yet.");
+  if (!res.ok) throw new Error("AI request failed");
+  return consumeAiSse(res, on, onUsage, onAgent, signal);
+}
+
+// Re-attach to an in-flight AI turn after the tab closed or refreshed. The
+// server kept the turn running (detached task) and buffered every event; this
+// replays the log — restoring the live activity view, the partial reply, and
+// the running usage — then streams new events until the turn ends. `onAttach`
+// fires first with the exact message list the turn started with (the client
+// rebuilds its base from it). Returns null when no job exists (404).
+export async function attachAiJob(
+  workspaceId: number,
+  convId: string,
+  on: (e: AiStreamEvent) => void,
+  onUsage?: (u: AiUsage) => void,
+  onAgent?: (a: AgentEvent) => void,
+  onAttach?: (messages: AiMessage[]) => void,
+  signal?: AbortSignal,
+): Promise<AiDone | null> {
+  const res = await fetch(
+    `/api/ai/jobs?workspace_id=${workspaceId}&conv_id=${encodeURIComponent(convId)}`,
+    { credentials: "include", signal },
+  );
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error("AI job unavailable");
+  return consumeAiSse(res, on, onUsage, onAgent, signal, onAttach);
+}
+
+// Shared SSE consumer for AI turns. Both the live POST /api/ai/chat and the
+// post-refresh re-attach GET /api/ai/jobs speak the same event protocol, so
+// one parser drives both paths. `onAttach` handles the special leading
+// "attach" event that carries the turn's starting message list.
+async function consumeAiSse(
+  res: Response,
+  on: (e: AiStreamEvent) => void,
+  onUsage?: (u: AiUsage) => void,
+  onAgent?: (a: AgentEvent) => void,
+  signal?: AbortSignal,
+  onAttach?: (messages: AiMessage[]) => void,
+): Promise<AiDone> {
+  if (!res.body) throw new Error("AI request failed");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let done: AiDone = {};
+  for (;;) {
+    // Aborted (Stop button / Esc): let the caller's AbortError propagate cleanly.
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const { done: fin, value } = await reader.read();
+    if (fin) break;
+    buf += decoder.decode(value, { stream: true });
+    let i: number;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const frame = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+      if (!dataLine) continue;
+      const payload = dataLine.slice(5).trim();
+      if (!payload) continue;
+      let ev: {
+        t?: string;
+        text?: string;
+        message?: string;
+        name?: string;
+        arg?: string;
+        result?: string;
+        old?: string;
+        new?: string;
+        input?: number;
+        output?: number;
+        cached?: number;
+        cache_creation?: number;
+        reasoning?: number;
+        ctx?: number;
+        ctx_cached?: number;
+        cost?: number;
+        cost_input?: number;
+        cost_cached?: number;
+        cost_output?: number;
+        source?: string;
+        model?: string;
+        profile?: string;
+        ms?: number;
+        messages?: AiMessage[];
+        id?: string;
+        kind?: string;
+        task?: string;
+        round?: number;
+        summary?: string;
+        calls?: number;
+        writes?: number;
+        ok?: boolean;
+        error?: string;
+        agent?: string;
+      };
+      try {
+        ev = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (ev.t === "attach" && onAttach) onAttach(ev.messages ?? []);
+      else if (ev.t === "delta") on({ kind: "text", text: ev.text ?? "" });
+      else if (ev.t === "reasoning") on({ kind: "reasoning", text: ev.text ?? "" });
+      else if (ev.t === "status") on({ kind: "status", text: ev.text ?? "" });
+      else if (ev.t === "tool")
+        on({
+          kind: "tool",
+          name: ev.name ?? "",
+          arg: ev.arg ?? "",
+          result: ev.result ?? "",
+          old: typeof ev.old === "string" ? ev.old : undefined,
+          new: typeof ev.new === "string" ? ev.new : undefined,
+          agent: typeof ev.agent === "string" && ev.agent ? ev.agent : undefined,
+        });
+      else if (ev.t === "usage" && onUsage)
+        onUsage({
+          input: ev.input ?? 0,
+          output: ev.output ?? 0,
+          cached: ev.cached ?? 0,
+          cacheCreation: ev.cache_creation ?? 0,
+          reasoning: ev.reasoning ?? 0,
+          ctx: ev.ctx ?? 0,
+          ctxCached: ev.ctx_cached ?? 0,
+          cost: ev.cost ?? 0,
+          costInput: ev.cost_input ?? 0,
+          costCached: ev.cost_cached ?? 0,
+          costOutput: ev.cost_output ?? 0,
+          model: ev.model,
+        });
+      else if (ev.t === "agent" && onAgent)
+        onAgent({
+          id: ev.id ?? "",
+          kind: (ev.kind as AgentEvent["kind"]) ?? "round",
+          model: ev.model,
+          profile: ev.profile,
+          name: ev.name,
+          task: ev.task,
+          round: ev.round,
+          summary: ev.summary,
+          calls: ev.calls,
+          writes: ev.writes,
+          ok: ev.ok,
+          error: ev.error,
+        });
+      else if (ev.t === "done")
+        done = {
+          usage: {
+            input: ev.input ?? 0,
+            output: ev.output ?? 0,
+            cached: ev.cached ?? 0,
+            cacheCreation: ev.cache_creation ?? 0,
+            reasoning: ev.reasoning ?? 0,
+            ctx: ev.ctx ?? 0,
+            ctxCached: ev.ctx_cached ?? 0,
+            cost: ev.cost ?? 0,
+            costInput: ev.cost_input ?? 0,
+            costCached: ev.cost_cached ?? 0,
+            costOutput: ev.cost_output ?? 0,
+          },
+          source: ev.source,
+          model: ev.model,
+          profile: ev.profile,
+          ms: ev.ms,
+          messages: ev.messages,
+        };
+      else if (ev.t === "error") throw new Error(ev.message || "AI error");
+    }
+  }
+  return done;
+}
+
+// ----- AI conversation sharing (team members) -----
+
+// A conversation in this workspace the user owns or has been shared with.
+export type SharedConv = {
+  id: string;
+  title: string;
+  owner: boolean; // true = owned by me, false = shared with me
+  owner_name: string;
+  updated_at: number;
+  preview?: string; // last message, one line, for the history sidebar
+  pinned?: boolean; // owner pinned it to the top of their history sidebar
+};
+
+export async function shareConversation(
+  workspaceId: number,
+  convId: string,
+  userIds: number[],
+): Promise<{ ok: true; shared_with: number[] }> {
+  return json(
+    await fetch(
+      "/api/ai/conv/share",
+      opts("POST", { workspace_id: workspaceId, conv_id: convId, user_ids: userIds }),
+    ),
+  );
+}
+
+export async function listSharedConversations(workspaceId: number): Promise<SharedConv[]> {
+  const res = await json<{ conversations: SharedConv[] }>(
+    await fetch(`/api/ai/conv/shared?workspace_id=${workspaceId}`, { credentials: "include" }),
+  );
+  return res.conversations;
+}
+
+// Fetches a conversation's messages (mine or shared-with-me) for opening on a
+// fresh machine. `wire` is the canonical history kept for cache reconciliation.
+export async function getSharedConversation(
+  workspaceId: number,
+  convId: string,
+): Promise<{ messages: AiMessage[]; wire: string }> {
+  return json<{ messages: AiMessage[]; wire: string }>(
+    await fetch(`/api/ai/conv/${encodeURIComponent(convId)}?workspace_id=${workspaceId}`, {
+      credentials: "include",
+    }),
+  );
+}
+
+// Permanently deletes a conversation for everyone it was shared with (owner
+// only). Shared members get a 404 — their local copy is removed client-side.
+// 404 is treated as "already gone": a conversation may exist only in the local
+// cache (never replied to this session), so there's no server row to remove.
+export async function deleteConversation(workspaceId: number, convId: string): Promise<{ ok: true }> {
+  const res = await fetch(`/api/ai/conv/${encodeURIComponent(convId)}?workspace_id=${workspaceId}`, opts("DELETE"));
+  if (res.status === 404) return { ok: true };
+  return json(res);
+}
+
+// Pin or unpin a conversation (owner only). Pins follow the owner across
+// machines and are visible to anyone the conversation is shared with.
+export async function setConversationPin(
+  workspaceId: number,
+  convId: string,
+  pinned: boolean,
+): Promise<{ ok: true; pinned: boolean }> {
+  return json(
+    await fetch("/api/ai/conv/pin", opts("POST", { workspace_id: workspaceId, conv_id: convId, pinned })),
+  );
+}
+
+// Sets a custom title for a conversation (owner only). The custom title
+// overrides the auto-derived first-message title on every device.
+export async function renameConversation(
+  workspaceId: number,
+  convId: string,
+  title: string,
+): Promise<{ ok: true; title: string }> {
+  return json(
+    await fetch("/api/ai/conv/rename", opts("POST", { workspace_id: workspaceId, conv_id: convId, title })),
+  );
+}
+
+// ----- AI provider settings (up to 3 named profiles; keys write-only) -----
+export type AiProviderKind = "anthropic" | "openai" | "azure";
+export type AiProviderView = {
+  name: string;
+  provider: AiProviderKind;
+  base_url: string | null;
+  model: string;
+  has_key: boolean;
+  is_current: boolean;
+};
+export type AiSettings = {
+  storage_ready: boolean; // AI_KEY_SECRET is set (keys can be stored)
+  is_admin: boolean;
+  max_profiles: number;
+  profiles: AiProviderView[];
+  current: string | null;
+  effective: { source: "user" | "org"; provider: string; model: string; name: string } | null;
+  org_profiles?: AiProviderView[];
+  org_users?: { user_id: number; provider: string; model: string }[];
+  subagent_profile?: string | null; // default spawn_agent profile ('' = main model)
+};
+export async function setSubagentProfile(profile: string): Promise<void> {
+  await json(await fetch("/api/ai/prefs", opts("POST", { subagent_profile: profile })));
+}
+export async function getAiSettings(): Promise<AiSettings> {
+  return json(await fetch("/api/ai/settings", { credentials: "include" }));
+}
+export async function saveAiProvider(body: {
+  scope: "user" | "org";
+  name: string;
+  provider: AiProviderKind;
+  base_url?: string;
+  model: string;
+  key?: string;
+}): Promise<void> {
+  await json(await fetch("/api/ai/providers", opts("POST", body)));
+}
+export async function deleteAiProvider(scope: "user" | "org", name: string): Promise<void> {
+  await json(await fetch(`/api/ai/providers?scope=${scope}&name=${encodeURIComponent(name)}`, opts("DELETE")));
+}
+export async function setCurrentProvider(scope: "user" | "org", name: string): Promise<void> {
+  await json(await fetch("/api/ai/providers/current", opts("POST", { scope, name })));
+}
+// Fire a real completion at this config from the backend to verify it works.
+// Throws with the provider's error message on failure. `key` may be omitted to
+// test the already-saved key. The browser never calls the AI provider directly.
+export async function testAiProvider(body: {
+  scope: "user" | "org";
+  name?: string;
+  provider: AiProviderKind;
+  base_url?: string;
+  model: string;
+  key?: string;
+}): Promise<{ ok: boolean; reply: string }> {
+  return json(await fetch("/api/ai/test", opts("POST", body)));
+}
+
+// ----- AI usage / cost dashboard (owner sees all; admin sees their org) -----
+export type UsageStat = {
+  label: string;
+  requests: number;
+  input_tokens: number;
+  cached_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  cost: number;
+};
+export type AiUsageReport = {
+  scope: "all" | "org";
+  totals: {
+    requests: number;
+    input_tokens: number;
+    cached_tokens: number;
+    output_tokens: number;
+    cost: number;
+  };
+  by_model: UsageStat[];
+  by_user: UsageStat[];
+};
+export async function getAiUsage(): Promise<AiUsageReport> {
+  return json(await fetch("/api/ai/usage", { credentials: "include" }));
+}
+
+
+export type McpServer = {
+  id: number;
+  name: string;
+  url: string;
+  hasToken: boolean;
+  enabled: boolean;
+  updatedAt: number;
+};
+
+export async function listMcp(): Promise<{ servers: McpServer[]; storage_ready: boolean }> {
+  return json(await fetch("/api/ai/mcp", { credentials: "include" }));
+}
+
+export async function saveMcp(s: {
+  name: string;
+  url: string;
+  token?: string | null;
+  enabled?: boolean;
+}): Promise<McpServer> {
+  const data = await json<{ server: McpServer }>(await fetch("/api/ai/mcp", opts("POST", s)));
+  return data.server;
+}
+
+export async function deleteMcp(name: string): Promise<void> {
+  await json(await fetch(`/api/ai/mcp?name=${encodeURIComponent(name)}`, opts("DELETE")));
+}
+
+export async function testMcp(body: {
+  name?: string;
+  url?: string;
+  token?: string;
+}): Promise<{ ok: true; tools: { name: string; description: string }[] }> {
+  return json(await fetch("/api/ai/mcp/test", opts("POST", body)));
+}
+
+export type ResearchProvider = "duckduckgo" | "exa" | "brave";
+export type ResearchSettings = {
+  provider: ResearchProvider;
+  has_key: boolean;
+  enabled: boolean;
+  updatedAt: number;
+};
+
+export async function getResearch(): Promise<{ research: ResearchSettings; storage_ready: boolean }> {
+  return json(await fetch("/api/ai/research", { credentials: "include" }));
+}
+
+export async function saveResearch(body: {
+  provider: ResearchProvider;
+  key?: string | null;
+  enabled?: boolean;
+}): Promise<ResearchSettings> {
+  const data = await json<{ research: ResearchSettings }>(await fetch("/api/ai/research", opts("POST", body)));
+  return data.research;
+}
+
+export async function testResearch(query?: string): Promise<{ ok: boolean; provider: string; result: string }> {
+  return json(await fetch("/api/ai/research/test", opts("POST", { query })));
+}

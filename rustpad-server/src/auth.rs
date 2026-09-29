@@ -312,6 +312,14 @@ async fn login_handler(
         }
     };
     let authed = match &user {
+        // An agent is an actor, not an account. Its credential column is `'!'`, so
+        // nothing could verify here anyway, but the intent is stated rather than
+        // implied: a bot may never reach the session path. Answered exactly like an
+        // unknown account, so neither the response nor the failure count differs.
+        Some(u) if u.kind != "human" => {
+            let _ = hash_password(&body.password);
+            false
+        }
         Some(u) => verify_password(&body.password, &u.password_hash),
         // Spend a real bcrypt on unknown emails so timing doesn't leak which
         // emails exist.

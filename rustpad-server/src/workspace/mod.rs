@@ -25,6 +25,8 @@ use crate::database::{ChatImageScope, ChatMessage, Database, FileRow, Group, Imp
 use crate::databases::Databases;
 use crate::{current_document, evict_all_boards, evict_boards, evict_documents, flush_and_evict, LiveBoards, LiveDocs};
 
+pub(crate) mod ai;
+
 /// Filter extracting the client's ECDH public key header (present when the
 /// client encrypts the payload).
 fn epk_header() -> impl Filter<Extract = (Option<String>,), Error = Rejection> + Clone {

@@ -51,7 +51,10 @@ import {
   VscDatabase,
   VscHistory,
   VscOrganization,
+  VscPlug,
   VscShield,
+  VscSparkle,
+  VscTools,
 } from "react-icons/vsc";
 import useLocalStorageState from "use-local-storage-state";
 
@@ -60,6 +63,16 @@ import * as api from "./api";
 import { Me } from "./api";
 import { EditorPrefs, useEditorPrefs } from "./editorPrefs";
 import { EDITOR_THEMES, SWATCHES, useEditorThemeId } from "./editorThemes";
+import {
+  AutoLoadTags,
+  draftFromSkill,
+  emptyDraft,
+  GitHubSkillImporter,
+  SkillDraft,
+  SkillFormFields,
+  SkillSourceBadge,
+  useServerSkills,
+} from "./SkillsManager";
 
 type Section =
   | "profile"
@@ -67,6 +80,9 @@ type Section =
   | "editor"
   | "keyboard"
   | "security"
+  | "ai"
+  | "skills"
+  | "mcp"
   | "notifications"
   | "activity"
   | "members"
@@ -123,6 +139,27 @@ const NAV: {
     icon: VscShield,
     hue: "state.ok",
     blurb: "Password, two-factor, and which sessions stay alive.",
+  },
+  {
+    id: "ai",
+    label: "AI",
+    icon: VscSparkle,
+    hue: "accent.base",
+    blurb: "Which model answers, what it may spend, and web research.",
+  },
+  {
+    id: "skills",
+    label: "Skills",
+    icon: VscTools,
+    hue: "accent.cyan",
+    blurb: "Reusable instructions the assistant injects when they match.",
+  },
+  {
+    id: "mcp",
+    label: "MCP",
+    icon: VscPlug,
+    hue: "state.info",
+    blurb: "Remote tool servers the assistant can call.",
   },
   {
     id: "notifications",
@@ -274,6 +311,9 @@ function Settings({ me, onClose, onUpdated }: Props) {
               {section === "security" && (
                 <SecurityPanel me={me} onUpdated={onUpdated} />
               )}
+              {section === "ai" && <AiPanel isAdmin={isAdmin} />}
+              {section === "skills" && <SkillsPanel />}
+              {section === "mcp" && <McpPanel />}
               {section === "notifications" && <NotificationsPanel />}
               {section === "activity" && isAdmin && <ActivityPanel />}
               {section === "members" &&
@@ -1431,6 +1471,861 @@ function OrgMembersPanel({ me }: { me: Me }) {
 }
 
 // ----- Storage (owner only) -----
+function ProviderForm({
+  scope,
+  initial,
+  isNew,
+  storageReady,
+  onChanged,
+}: {
+  scope: "user" | "org";
+  initial: api.AiProviderView | null | undefined;
+  isNew: boolean;
+  storageReady: boolean;
+  onChanged: () => void;
+}) {
+  const toast = useToast();
+  const [name, setName] = useState(initial?.name ?? "");
+  const [provider, setProvider] = useState<api.AiProviderKind>(initial?.provider ?? "anthropic");
+  const [baseUrl, setBaseUrl] = useState(initial?.base_url ?? "");
+  const [model, setModel] = useState(initial?.model ?? "");
+  const [key, setKey] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const hasKey = !!initial?.has_key;
+  const isCurrent = !!initial?.is_current;
+  const profileName = () => (isNew ? name.trim() : initial?.name ?? name.trim());
+
+  async function test() {
+    if (!model.trim()) return;
+    setTesting(true);
+    try {
+      const r = await api.testAiProvider({
+        scope,
+        name: profileName() || undefined,
+        provider,
+        base_url: baseUrl.trim() || undefined,
+        model: model.trim(),
+        key: key.trim() || undefined,
+      });
+      toast({
+        title: "Connection OK",
+        description: r.reply ? `Model replied: ${r.reply}` : "The provider accepted the request.",
+        status: "success",
+        duration: 4000,
+      });
+    } catch (err) {
+      fail(toast, err);
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  async function save(e: FormEvent) {
+    e.preventDefault();
+    const nm = profileName();
+    if (!model.trim() || !nm) return;
+    setSaving(true);
+    try {
+      await api.saveAiProvider({
+        scope,
+        name: nm,
+        provider,
+        base_url: baseUrl.trim() || undefined,
+        model: model.trim(),
+        key: key.trim() || undefined,
+      });
+      setKey("");
+      if (isNew) {
+        setName("");
+        setModel("");
+        setBaseUrl("");
+      }
+      onChanged();
+      toast({ title: "Model profile saved", status: "success", duration: 2000 });
+    } catch (err) {
+      fail(toast, err);
+    } finally {
+      setSaving(false);
+    }
+  }
+  async function clear() {
+    try {
+      await api.deleteAiProvider(scope, profileName());
+      onChanged();
+      toast({ title: "Removed", status: "success", duration: 1800 });
+    } catch (err) {
+      fail(toast, err);
+    }
+  }
+  async function makeCurrent() {
+    try {
+      await api.setCurrentProvider(scope, profileName());
+      onChanged();
+      toast({ title: `Now using "${profileName()}"`, status: "success", duration: 1800 });
+    } catch (err) {
+      fail(toast, err);
+    }
+  }
+
+  return (
+    <Box as="form" onSubmit={save}>
+      <VStack align="stretch" spacing={3} maxW="440px">
+        <FormControl>
+          <FormLabel fontSize="xs" color="ink.muted">
+            Profile name{" "}
+            {isCurrent && (
+              <Text as="span" color="brand.400">
+                · current
+              </Text>
+            )}
+          </FormLabel>
+          <Input
+            size="sm"
+            value={isNew ? name : initial?.name ?? ""}
+            isDisabled={!isNew}
+            placeholder="e.g. Claude, Fast, GPT-4o"
+            onChange={(e) => setName(e.target.value)}
+          />
+        </FormControl>
+        <FormControl>
+          <FormLabel fontSize="xs" color="ink.muted">
+            Provider
+          </FormLabel>
+          <Select size="sm" value={provider} onChange={(e) => setProvider(e.target.value as api.AiProviderKind)}>
+            <option value="anthropic">Anthropic (Claude)</option>
+            <option value="openai">OpenAI-compatible (OpenAI, OpenRouter, Ollama, Groq…)</option>
+            <option value="azure">Azure OpenAI</option>
+          </Select>
+        </FormControl>
+        <FormControl>
+          <FormLabel fontSize="xs" color="ink.muted">
+            Model
+          </FormLabel>
+          <Input size="sm" value={model} placeholder={MODEL_HINTS[provider]} onChange={(e) => setModel(e.target.value)} />
+        </FormControl>
+        <FormControl>
+          <FormLabel fontSize="xs" color="ink.muted">
+            API base URL <Text as="span" color="ink.subtle">(optional — defaults to the provider's)</Text>
+          </FormLabel>
+          <Input
+            size="sm"
+            value={baseUrl}
+            placeholder={(provider === "azure" ? "required · " : "") + BASEURL_HINTS[provider]}
+            onChange={(e) => setBaseUrl(e.target.value)}
+          />
+        </FormControl>
+        <FormControl>
+          <FormLabel fontSize="xs" color="ink.muted">
+            API key {hasKey && <Text as="span" color="green.400">· saved</Text>}
+          </FormLabel>
+          <Input
+            size="sm"
+            type="password"
+            autoComplete="off"
+            value={key}
+            placeholder={hasKey ? "•••••••• (leave blank to keep)" : "Paste your API key"}
+            onChange={(e) => setKey(e.target.value)}
+          />
+        </FormControl>
+        <HStack flexWrap="wrap">
+          <Tooltip label={storageReady ? undefined : "Key storage isn't configured on the server (set AI_KEY_SECRET) — Save is off until it is."} hasArrow>
+            <Box>
+              <Button
+                size="sm"
+                type="submit"
+                isLoading={saving}
+                isDisabled={!storageReady || !model.trim() || !profileName() || (!hasKey && !key.trim())}
+              >
+                Save
+              </Button>
+            </Box>
+          </Tooltip>
+          <Button
+            size="sm"
+            type="button"
+            variant="outline"
+            onClick={test}
+            isLoading={testing}
+            isDisabled={!model.trim() || (!hasKey && !key.trim())}
+          >
+            Test connection
+          </Button>
+          {!isNew && !isCurrent && hasKey && (
+            <Button size="sm" type="button" variant="outline" colorScheme="brand" onClick={makeCurrent}>
+              Make current
+            </Button>
+          )}
+          {!isNew && (
+            <Button size="sm" variant="ghost" color="red.400" onClick={clear}>
+              Remove
+            </Button>
+          )}
+        </HStack>
+      </VStack>
+    </Box>
+  );
+}
+
+function ProfilesSection({
+  scope,
+  profiles,
+  max,
+  storageReady,
+  onChanged,
+  title,
+  sub,
+}: {
+  scope: "user" | "org";
+  profiles: api.AiProviderView[];
+  max: number;
+  storageReady: boolean;
+  onChanged: () => void;
+  title: string;
+  sub: string;
+}) {
+  const [adding, setAdding] = useState(false);
+  return (
+    <Card>
+      <Text fontSize="sm" fontWeight={600} mb={1}>
+        {title}
+      </Text>
+      <Text fontSize="xs" color="ink.subtle" mb={4}>
+        {sub}
+      </Text>
+      <VStack align="stretch" spacing={5}>
+        {profiles.map((p) => (
+          <Box key={p.name} borderLeft="2px solid" borderColor={p.is_current ? "brand.400" : "surface.border"} pl={4}>
+            <ProviderForm scope={scope} initial={p} isNew={false} storageReady={storageReady} onChanged={onChanged} />
+          </Box>
+        ))}
+        {profiles.length === 0 && !adding && (
+          <Text fontSize="xs" color="ink.subtle">
+            No model profiles yet.
+          </Text>
+        )}
+        {adding ? (
+          <Box borderLeft="2px solid" borderColor="brand.400" pl={4}>
+            <ProviderForm
+              scope={scope}
+              initial={null}
+              isNew
+              storageReady={storageReady}
+              onChanged={() => {
+                setAdding(false);
+                onChanged();
+              }}
+            />
+            <Button size="xs" variant="ghost" mt={2} onClick={() => setAdding(false)}>
+              Cancel
+            </Button>
+          </Box>
+        ) : profiles.length < max ? (
+          <Button size="sm" variant="outline" alignSelf="flex-start" onClick={() => setAdding(true)}>
+            ＋ Add model profile
+          </Button>
+        ) : (
+          <Text fontSize="xs" color="ink.subtle">
+            Maximum of {max} profiles reached. Remove one to add another.
+          </Text>
+        )}
+      </VStack>
+    </Card>
+  );
+}
+
+function SubagentDefaultCard({
+  profiles,
+  value,
+  onChanged,
+}: {
+  profiles: api.AiProviderView[];
+  value: string | null;
+  onChanged: () => void;
+}) {
+  const toast = useToast();
+  const [saving, setSaving] = useState(false);
+  async function save(profile: string) {
+    setSaving(true);
+    try {
+      await api.setSubagentProfile(profile);
+      onChanged();
+      toast({
+        title: profile ? `Subagents will default to "${profile}"` : "Subagents will use the main model",
+        status: "success",
+        duration: 2000,
+      });
+    } catch (err) {
+      fail(toast, err);
+    } finally {
+      setSaving(false);
+    }
+  }
+  return (
+    <Card>
+      <Text fontSize="sm" fontWeight={600} mb={1}>
+        Subagent default model
+      </Text>
+      <Text fontSize="xs" color="ink.muted" mb={3}>
+        When the Assistant delegates work with <Code fontSize="xs">spawn_agent</Code> and the prompt doesn't name a
+        model, subagents use this profile. Name a model in the prompt (or the <Code fontSize="xs">profile</Code> argument)
+        and it overrides this setting — your prompt always wins.
+      </Text>
+      <Select
+        size="sm"
+        maxW="300px"
+        value={value ?? ""}
+        isDisabled={saving}
+        onChange={(e) => save(e.target.value)}
+      >
+        <option value="">Use the main model</option>
+        {profiles.map((p) => (
+          <option key={p.name} value={p.name}>
+            {p.name} · {p.model}
+          </option>
+        ))}
+      </Select>
+    </Card>
+  );
+}
+
+function ResearchCard() {
+  const toast = useToast();
+  const [data, setData] = useState<api.ResearchSettings | null>(null);
+  const [storageReady, setStorageReady] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [provider, setProvider] = useState<api.ResearchProvider>("duckduckgo");
+  const [key, setKey] = useState("");
+  const [enabled, setEnabled] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testOut, setTestOut] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    api
+      .getResearch()
+      .then((d) => {
+        setData(d.research);
+        setStorageReady(d.storage_ready);
+        setProvider(d.research.provider);
+        setEnabled(d.research.enabled);
+      })
+      .catch((e) => fail(toast, e))
+      .finally(() => setLoading(false));
+  }, [toast]);
+  useEffect(load, [load]);
+
+  const needsKey = provider === "exa" || provider === "brave";
+
+  async function save() {
+    setSaving(true);
+    try {
+      const saved = await api.saveResearch({
+        provider,
+        key: key.trim() ? key.trim() : undefined,
+        enabled,
+      });
+      setData(saved);
+      setKey("");
+      toast({ title: "Research settings saved", status: "success", duration: 2000 });
+    } catch (err) {
+      fail(toast, err);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function test() {
+    setTesting(true);
+    setTestOut(null);
+    try {
+      const r = await api.testResearch("rust async tokio");
+      setTestOut(r.result);
+      toast({
+        title: r.ok ? `Search ok via ${r.provider}` : "Search returned an error",
+        status: r.ok ? "success" : "error",
+        duration: 2500,
+      });
+    } catch (err) {
+      fail(toast, err);
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  return (
+    <Card>
+      <Text fontSize="sm" fontWeight={600} mb={1}>
+        Research
+      </Text>
+      <Text fontSize="xs" color="ink.muted" mb={3}>
+        Lets the assistant search the web (toggle Research in the chat header). DuckDuckGo is free and needs no key.
+        Exa and Brave return fuller results — paste an API key from{" "}
+        <Code fontSize="xs">exa.ai</Code> or <Code fontSize="xs">brave.com/search/api</Code>.
+      </Text>
+      {loading ? (
+        <Text fontSize="xs" color="ink.subtle">
+          Loading…
+        </Text>
+      ) : (
+        <VStack align="stretch" spacing={3}>
+          <FormControl>
+            <FormLabel fontSize="xs" color="ink.muted" mb={1}>
+              Provider
+            </FormLabel>
+            <Select
+              size="sm"
+              maxW="300px"
+              value={provider}
+              onChange={(e) => setProvider(e.target.value as api.ResearchProvider)}
+            >
+              <option value="duckduckgo">DuckDuckGo — free, no key</option>
+              <option value="exa">Exa — AI search (API key)</option>
+              <option value="brave">Brave Search (API key)</option>
+            </Select>
+          </FormControl>
+          {needsKey && (
+            <FormControl>
+              <FormLabel fontSize="xs" color="ink.muted" mb={1}>
+                API key {data?.has_key ? "(saved — leave blank to keep)" : ""}
+              </FormLabel>
+              <Input
+                size="sm"
+                maxW="300px"
+                type="password"
+                autoComplete="off"
+                placeholder={data?.has_key ? "••••••••" : "Paste key"}
+                value={key}
+                onChange={(e) => setKey(e.target.value)}
+                isDisabled={!storageReady}
+              />
+              {!storageReady && (
+                <Text fontSize="xs" color="orange.400" mt={1}>
+                  Set <Code fontSize="xs">AI_KEY_SECRET</Code> on the server to store keys.
+                </Text>
+              )}
+            </FormControl>
+          )}
+          <HStack spacing={3}>
+            <HStack spacing={2}>
+              <Switch size="sm" isChecked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+              <Text fontSize="xs" color="ink.muted">
+                Enabled
+              </Text>
+            </HStack>
+            <Button size="xs" colorScheme="brand" onClick={save} isLoading={saving}>
+              Save
+            </Button>
+            <Button size="xs" variant="outline" onClick={test} isLoading={testing}>
+              Test search
+            </Button>
+          </HStack>
+          {testOut && (
+            <Box
+              as="pre"
+              fontSize="11px"
+              color="ink.muted"
+              bg="surface.hover"
+              borderRadius="md"
+              p={3}
+              maxH="180px"
+              overflow="auto"
+              whiteSpace="pre-wrap"
+            >
+              {testOut}
+            </Box>
+          )}
+        </VStack>
+      )}
+    </Card>
+  );
+}
+
+function AiPanel({ isAdmin }: { isAdmin: boolean }) {
+  const toast = useToast();
+  const [data, setData] = useState<api.AiSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    api
+      .getAiSettings()
+      .then(setData)
+      .catch((e) => fail(toast, e))
+      .finally(() => setLoading(false));
+  }, [toast]);
+  useEffect(load, [load]);
+
+  return (
+    <>
+      <PanelHead title="AI" sub="Bring your own model. Keys are encrypted at rest and never shown again." />
+
+      {loading ? (
+        <Text fontSize="sm" color="ink.muted">
+          Loading…
+        </Text>
+      ) : !data ? null : (
+        <>
+          <Card>
+            <Text fontSize="sm" fontWeight={600} mb={1}>
+              Status
+            </Text>
+            {data.effective ? (
+              <Text fontSize="sm" color="ink.muted">
+                Active — <Code fontSize="xs">{data.effective.name}</Code>: <Code fontSize="xs">{data.effective.model}</Code>{" "}
+                via {data.effective.provider} (
+                {data.effective.source === "user" ? "your key" : data.effective.source === "org" ? "org default" : "server key"}).
+              </Text>
+            ) : (
+              <Text fontSize="sm" color="ink.muted">
+                Not configured yet. Add a key below to enable the Assistant.
+              </Text>
+            )}
+            {!data.storage_ready && (
+              <Text fontSize="xs" color="orange.400" mt={2}>
+                Key storage is off: set <Code fontSize="xs">AI_KEY_SECRET</Code> on the server to save keys here.
+              </Text>
+            )}
+          </Card>
+
+          <SubagentDefaultCard
+            profiles={data.profiles}
+            value={data.subagent_profile ?? null}
+            onChanged={load}
+          />
+
+          <ResearchCard />
+
+          <ProfilesSection
+            scope="user"
+            profiles={data.profiles}
+            max={data.max_profiles}
+            storageReady={data.storage_ready}
+            onChanged={load}
+            title="Your models"
+            sub="Up to 3 named profiles, each with its own provider, URL, model and key. The 'current' one is used by default; switch anytime here or in the Assistant."
+          />
+
+          {isAdmin && (
+            <>
+              <ProfilesSection
+                scope="org"
+                profiles={data.org_profiles ?? []}
+                max={data.max_profiles}
+                storageReady={data.storage_ready}
+                onChanged={load}
+                title="Organization models"
+                sub="Shared profiles for everyone in the org who hasn't set their own."
+              />
+              {data.org_users && data.org_users.length > 0 && (
+                <Card>
+                  <Text fontSize="xs" color="ink.subtle" mb={2}>
+                    {data.org_users.length} member{data.org_users.length === 1 ? "" : "s"} using a personal key (keys hidden):
+                  </Text>
+                  <VStack align="stretch" spacing={1}>
+                    {data.org_users.map((u) => (
+                      <Text key={u.user_id} fontSize="xs" color="ink.muted">
+                        User #{u.user_id} · {u.provider} · <Code fontSize="xs">{u.model}</Code>
+                      </Text>
+                    ))}
+                  </VStack>
+                </Card>
+              )}
+            </>
+          )}
+        </>
+      )}
+    </>
+  );
+}
+
+// ----- Storage (owner / admin) -----
+
+function McpPanel() {
+  const toast = useToast();
+  const [servers, setServers] = useState<api.McpServer[]>([]);
+  const [storageReady, setStorageReady] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [name, setName] = useState("");
+  const [url, setUrl] = useState("");
+  const [token, setToken] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState<string | null>(null);
+  const [testOut, setTestOut] = useState<{ name: string; tools: { name: string; description: string }[] } | null>(null);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    api
+      .listMcp()
+      .then((d) => {
+        setServers(d.servers);
+        setStorageReady(d.storage_ready);
+      })
+      .catch((e) => fail(toast, e))
+      .finally(() => setLoading(false));
+  }, [toast]);
+  useEffect(load, [load]);
+
+  async function save(e: FormEvent) {
+    e.preventDefault();
+    const n = name.trim();
+    const u = url.trim();
+    if (!n || !u) return;
+    setSaving(true);
+    try {
+      await api.saveMcp({ name: n, url: u, token: token.trim() ? token.trim() : undefined, enabled: true });
+      setName("");
+      setUrl("");
+      setToken("");
+      toast({ title: "MCP server saved", status: "success", duration: 2000 });
+      load();
+    } catch (err) {
+      fail(toast, err);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function test(target: { name?: string; url?: string; token?: string }) {
+    const key = target.name || target.url || "new";
+    setTesting(key);
+    try {
+      const r = await api.testMcp(target);
+      setTestOut({ name: key, tools: r.tools });
+      toast({ title: `Connected — ${r.tools.length} tool${r.tools.length === 1 ? "" : "s"}`, status: "success", duration: 2500 });
+    } catch (err) {
+      fail(toast, err);
+    } finally {
+      setTesting(null);
+    }
+  }
+
+  async function toggle(s: api.McpServer) {
+    try {
+      await api.saveMcp({ name: s.name, url: s.url, enabled: !s.enabled });
+      load();
+    } catch (err) {
+      fail(toast, err);
+    }
+  }
+
+  async function remove(n: string) {
+    try {
+      await api.deleteMcp(n);
+      if (testOut?.name === n) setTestOut(null);
+      load();
+    } catch (err) {
+      fail(toast, err);
+    }
+  }
+
+  return (
+    <>
+      <PanelHead
+        title="MCP"
+        sub="Connect remote Model Context Protocol servers over HTTPS. Their tools are added to the assistant each turn as mcp_name_tool. Tokens are encrypted at rest and never shown again."
+      />
+      {!storageReady && (
+        <Text fontSize="xs" color="orange.400" mb={4}>
+          Token storage is off: set <Code fontSize="xs">AI_KEY_SECRET</Code> on the server to save bearer tokens. Unauthenticated servers still work.
+        </Text>
+      )}
+      {loading ? (
+        <Text fontSize="sm" color="ink.muted">
+          Loading…
+        </Text>
+      ) : (
+        servers.map((s) => (
+          <Card key={s.id}>
+            <HStack justify="space-between" align="flex-start" mb={2}>
+              <Box minW={0}>
+                <Text fontSize="sm" fontWeight={600}>
+                  {s.name}
+                </Text>
+                <Text fontSize="xs" color="ink.muted" fontFamily="mono" isTruncated title={s.url}>
+                  {s.url}
+                </Text>
+                <Text fontSize="xs" color="ink.subtle" mt={0.5}>
+                  {s.hasToken ? "Bearer token saved" : "No token"} · tools appear as <Code fontSize="10px">mcp_{s.name}_…</Code>
+                </Text>
+              </Box>
+              <Switch isChecked={s.enabled} onChange={() => void toggle(s)} size="sm" />
+            </HStack>
+            <HStack spacing={2}>
+              <Button size="xs" variant="ghost" isLoading={testing === s.name} onClick={() => void test({ name: s.name })}>
+                Test
+              </Button>
+              <Button size="xs" variant="ghost" colorScheme="red" onClick={() => void remove(s.name)}>
+                Remove
+              </Button>
+            </HStack>
+            {testOut?.name === s.name && (
+              <Text fontSize="xs" color="ink.muted" mt={2}>
+                {testOut.tools.length === 0
+                  ? "Connected, but the server advertised no tools."
+                  : testOut.tools.map((t) => t.name).join(", ")}
+              </Text>
+            )}
+          </Card>
+        ))
+      )}
+      <Card>
+        <Text fontSize="sm" fontWeight={600} mb={3}>
+          Add a remote server
+        </Text>
+        <form onSubmit={save}>
+          <FormControl mb={3}>
+            <FormLabel fontSize="xs">Name</FormLabel>
+            <Input size="sm" value={name} onChange={(e) => setName(e.target.value)} placeholder="github" autoComplete="off" />
+          </FormControl>
+          <FormControl mb={3}>
+            <FormLabel fontSize="xs">HTTPS URL</FormLabel>
+            <Input size="sm" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://mcp.example.com/mcp" autoComplete="off" />
+          </FormControl>
+          <FormControl mb={3}>
+            <FormLabel fontSize="xs">Bearer token (optional)</FormLabel>
+            <Input size="sm" type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder="leave blank if none" autoComplete="off" />
+          </FormControl>
+          <HStack>
+            <Button type="submit" size="sm" colorScheme="brand" isLoading={saving} isDisabled={!name.trim() || !url.trim()}>
+              Save
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              isLoading={testing === (url.trim() || "new")}
+              isDisabled={!url.trim()}
+              onClick={() => void test({ url: url.trim(), token: token.trim() || undefined })}
+            >
+              Test without saving
+            </Button>
+          </HStack>
+        </form>
+      </Card>
+    </>
+  );
+}
+
+function SkillsPanel() {
+  const toast = useToast();
+  const { skills, loading, save, remove, catalog, importSkill, refresh } = useServerSkills();
+  const [draft, setDraft] = useState<SkillDraft>(emptyDraft());
+
+  async function saveNow() {
+    const name = draft.name.trim();
+    if (!name || !draft.instructions.trim()) return;
+    try {
+      await save(draft);
+      toast({ title: draft.id ? "Skill updated" : "Skill added", status: "success", duration: 2000 });
+      setDraft(emptyDraft());
+    } catch (e) {
+      toast({ title: e instanceof Error ? e.message : "Couldn't save skill", status: "error", duration: 3500 });
+    }
+  }
+
+  async function removeNow(name: string) {
+    try {
+      await remove(name);
+      setDraft((d) => (d.name === name ? emptyDraft() : d));
+    } catch (e) {
+      toast({ title: e instanceof Error ? e.message : "Couldn't delete skill", status: "error", duration: 3500 });
+    }
+  }
+
+  return (
+    <>
+      <PanelHead
+        title="Skills"
+        sub="Reusable instructions for the assistant, stored on the server so they follow you across machines. Invoke one with /name or [skill:name], set auto-load keywords to activate it automatically, or import Claude-style skills from GitHub repos (like ponytail)."
+      />
+
+      {loading && (
+        <Text fontSize="sm" color="ink.muted" mb={3}>
+          Loading skills…
+        </Text>
+      )}
+
+      {skills.length > 0 && (
+        <Card>
+          <VStack spacing={3} align="stretch">
+            {skills.map((k) => (
+              <Flex key={k.id} align="center" gap={3}>
+                <Box flex={1} minW={0}>
+                  <Flex align="center" gap={2} flexWrap="wrap">
+                    <Text fontSize="sm" fontWeight={600} color="purple.300" fontFamily="mono">
+                      [skill:{k.name}]
+                    </Text>
+                    <SkillSourceBadge source={k.source} />
+                    {k.alwaysOn && (
+                      <Badge variant="subtle" colorScheme="green" fontSize="9px" letterSpacing="0.08em" textTransform="uppercase">
+                        Always
+                      </Badge>
+                    )}
+                  </Flex>
+                  <Text fontSize="xs" color="ink.subtle" noOfLines={2}>
+                    {k.description || "Custom skill"}
+                  </Text>
+                  <AutoLoadTags keywords={k.autoLoad} />
+                </Box>
+                <Button size="xs" variant="ghost" onClick={() => setDraft(draftFromSkill(k))}>
+                  Edit
+                </Button>
+                <Button size="xs" variant="ghost" color="red.400" onClick={() => removeNow(k.name)}>
+                  Delete
+                </Button>
+              </Flex>
+            ))}
+          </VStack>
+        </Card>
+      )}
+
+      <Card>
+        <Text fontSize="sm" fontWeight={600} mb={3}>
+          Import from a Claude-skills repo
+        </Text>
+        <GitHubSkillImporter catalog={catalog} importSkill={importSkill} onImported={refresh} />
+      </Card>
+
+      <Card>
+        <Text fontSize="sm" fontWeight={600} mb={3}>
+          {draft.id != null ? "Edit skill" : "New skill"}
+        </Text>
+        <VStack spacing={3} align="stretch">
+          <SkillFormFields draft={draft} setDraft={setDraft} textareaMinH="110px" />
+          <Flex justify="flex-end" gap={2}>
+            {draft.id != null && (
+              <Button size="sm" variant="ghost" onClick={() => setDraft(emptyDraft())}>
+                Cancel
+              </Button>
+            )}
+            <Button
+              size="sm"
+              colorScheme="brand"
+              isDisabled={!draft.name.trim() || !draft.instructions.trim()}
+              onClick={saveNow}
+            >
+              {draft.id != null ? "Save changes" : "Add skill"}
+            </Button>
+          </Flex>
+        </VStack>
+      </Card>
+    </>
+  );
+}
+
+const MODEL_HINTS: Record<string, string> = {
+  anthropic: "e.g. claude-opus-5, claude-sonnet-5, claude-haiku-4-5",
+  openai: "e.g. gpt-4o, gpt-4o-mini, o3-mini, or your model name",
+  azure: "your deployment name",
+};
+const BASEURL_HINTS: Record<string, string> = {
+  anthropic: "https://api.anthropic.com",
+  openai: "https://api.openai.com/v1",
+  azure:
+    "https://<resource>.openai.azure.com/openai/deployments/<deployment>  —  or https://<resource>.services.ai.azure.com for Foundry v1",
+};
 export function humanBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   const units = ["KB", "MB", "GB", "TB"];

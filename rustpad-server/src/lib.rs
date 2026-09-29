@@ -30,6 +30,8 @@ pub mod database;
 pub mod databases;
 pub mod keystore;
 pub mod licence;
+mod mcp;
+mod search;
 mod ot;
 mod rustpad;
 pub mod workspace;
@@ -303,6 +305,7 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
     // organization's content actually lives.
     let workspace_routes =
         workspace::routes(db.clone(), live.clone(), boards.clone(), databases.clone());
+    let ai_routes = workspace::ai::routes(db.clone());
     let account_routes = account::routes(db.clone(), live, boards, databases);
 
     // A plain db filter used by the document access checks below.
@@ -389,6 +392,7 @@ fn backend(config: ServerConfig) -> BoxedFilter<(impl Reply,)> {
     auth_routes
         .or(account_routes)
         .or(workspace_routes)
+        .or(ai_routes)
         .or(socket)
         .or(board_socket)
         .or(text)

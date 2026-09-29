@@ -125,6 +125,46 @@ pub fn seal_reply(epk: &Option<String>, value: &serde_json::Value) -> Response {
     }
 }
 
+// ----- At-rest secrets (AI provider keys) -----
+
+fn at_rest_key() -> Option<[u8; 32]> {
+    let secret = std::env::var("AI_KEY_SECRET").ok().filter(|s| !s.trim().is_empty())?;
+    let hk = Hkdf::<Sha256>::new(Some(b"cortex-atrest-v1"), secret.as_bytes());
+    let mut okm = [0u8; 32];
+    hk.expand(b"cortex-provider-key-v1", &mut okm).ok()?;
+    Some(okm)
+}
+
+/// Whether at-rest key storage is available (AI_KEY_SECRET is set).
+pub fn secret_storage_ready() -> bool {
+    at_rest_key().is_some()
+}
+
+/// Encrypt a secret string for storage. None if AI_KEY_SECRET is unset.
+pub fn secret_encrypt(plaintext: &str) -> Option<String> {
+    let key = at_rest_key()?;
+    let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let ct = cipher.encrypt(Nonce::from_slice(&nonce), plaintext.as_bytes()).ok()?;
+    let mut out = nonce.to_vec();
+    out.extend_from_slice(&ct);
+    Some(B64.encode(out))
+}
+
+/// Decrypt a stored secret. None on any failure (missing key, tamper, bad data).
+pub fn secret_decrypt(b64: &str) -> Option<String> {
+    let key = at_rest_key()?;
+    let raw = B64.decode(b64.trim()).ok()?;
+    if raw.len() < 13 {
+        return None;
+    }
+    let (nonce, ct) = raw.split_at(12);
+    let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
+    let pt = cipher.decrypt(Nonce::from_slice(nonce), ct).ok()?;
+    String::from_utf8(pt).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

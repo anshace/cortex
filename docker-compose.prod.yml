@@ -12,6 +12,8 @@ services:
     restart: unless-stopped
     environment:
       - SQLITE_URI=sqlite:///data/authpad.db
+      # AI assistant: encrypts saved provider keys at rest (optional; see README).
+      - AI_KEY_SECRET=${AI_KEY_SECRET:-}
       - COOKIE_SECURE=1
       - RUST_LOG=info
       - CORTEX_AUDIT_RETENTION_DAYS=${CORTEX_AUDIT_RETENTION_DAYS:-180}

@@ -23,6 +23,112 @@ use crate::blobstore::BlobStore;
 use crate::databases::Databases;
 use crate::keystore;
 
+/// A stored AI provider profile. `key_cipher` is the encrypted API key.
+#[derive(sqlx::FromRow, Clone, Debug)]
+pub struct ProviderRow {
+    /// 'org' | 'user'.
+    pub scope: String,
+    /// Org id or user id, depending on `scope`.
+    pub scope_id: i64,
+    /// Profile name (unique within the scope).
+    pub name: String,
+    /// 'anthropic' | 'openai' | 'azure'.
+    pub provider: String,
+    /// Custom endpoint override; None = the provider's default.
+    pub base_url: Option<String>,
+    /// Model or deployment name sent with each request.
+    pub model: String,
+    /// base64(nonce || AES-GCM ciphertext) of the API key.
+    pub key_cipher: String,
+    /// 1 for the profile this scope uses by default.
+    pub is_current: i64,
+    /// Unix seconds of the last write.
+    pub updated_at: i64,
+}
+
+/// Per-user research/search provider (Exa, Brave, or free DuckDuckGo).
+#[derive(sqlx::FromRow, Clone, Debug)]
+pub struct AiResearchRow {
+    /// Owning user id.
+    pub user_id: i64,
+    /// 'duckduckgo' | 'exa' | 'brave'.
+    pub provider: String,
+    /// Encrypted API key; None for the key-free DuckDuckGo provider.
+    pub key_cipher: Option<String>,
+    /// 1 when research tools may use this provider.
+    pub enabled: i64,
+    /// Unix seconds of the last write.
+    pub updated_at: i64,
+}
+
+/// A user's remote MCP server. `token_cipher` is encrypted at rest (nullable).
+#[derive(sqlx::FromRow, Clone, Debug)]
+pub struct AiMcpRow {
+    /// Primary key.
+    pub id: i64,
+    /// Owning user id.
+    pub user_id: i64,
+    /// Server name as shown in the tool list.
+    pub name: String,
+    /// Streamable-HTTP endpoint (public https only).
+    pub url: String,
+    /// Encrypted bearer token; None for unauthenticated servers.
+    pub token_cipher: Option<String>,
+    /// 1 when the server's tools are exposed to the assistant.
+    pub enabled: i64,
+    /// Unix seconds of the last write.
+    pub updated_at: i64,
+}
+
+/// A user's reusable AI skill. `auto_load` holds comma-separated trigger
+/// keywords: when the current message mentions one, the skill is injected into
+/// the model's system prompt. `always_on` injects it into every prompt.
+#[derive(sqlx::FromRow, Clone, Debug)]
+pub struct AiSkillRow {
+    /// Primary key.
+    pub id: i64,
+    /// Owning user id.
+    pub user_id: i64,
+    /// Unique name per user; `[skill:name]` tokens refer to it.
+    pub name: String,
+    /// One-line description shown in skill pickers.
+    pub description: String,
+    /// The instructions injected into the model's prompt.
+    pub instructions: String,
+    /// 'custom' | 'github' | 'bundled'.
+    pub source: String,
+    /// Repo/raw URL for GitHub imports.
+    pub source_url: Option<String>,
+    /// 1 to inject into EVERY system prompt.
+    pub always_on: i64,
+    /// Comma-separated trigger keywords for auto-loading.
+    pub auto_load: String,
+}
+
+/// One row of aggregated AI token usage (grouped by model or by user).
+#[derive(sqlx::FromRow, serde::Serialize, Clone, Debug)]
+pub struct UsageStat {
+    /// Model name or user email, depending on the grouping.
+    pub label: String,
+    /// Number of requests in the group.
+    pub requests: i64,
+    /// Sum of input tokens.
+    pub input_tokens: i64,
+    /// Sum of cache-read tokens.
+    pub cached_tokens: i64,
+    /// Sum of output tokens.
+    pub output_tokens: i64,
+    /// Sum of reasoning tokens (where the provider reports them).
+    pub reasoning_tokens: i64,
+    /// Sum of provider-reported or estimated cost, in dollars.
+    pub cost: f64,
+}
+
+/// One row of the shared-conversation listing: conversation id, owner user id,
+/// raw `shared_with` JSON, last-updated unix time, visible-messages JSON,
+/// optional custom title, pinned flag.
+pub type AiConvShareRow = (String, i64, String, i64, String, Option<String>, bool);
+
 /// Represents a document persisted in database storage.
 #[derive(sqlx::FromRow, PartialEq, Eq, Clone, Debug)]
 pub struct PersistedDocument {
@@ -47,6 +153,10 @@ pub struct User {
     pub role: String,
     /// Org the user is assigned to (None for root / unassigned).
     pub org_id: Option<i64>,
+    /// `'human'` or `'bot'`. Every row written before agents existed says
+    /// `'human'`, and anything that counts people or offers a login must ask,
+    /// because an agent is an actor with no credential to verify.
+    pub kind: String,
     /// HKDF-sealed [`Self::totp_secret`] — never the seed itself. None means 2FA
     /// was never started.
     pub totp_secret_cipher: Option<String>,
@@ -78,6 +188,34 @@ pub struct AdminUser {
     pub org_id: Option<i64>,
     /// Assigned org name (nullable).
     pub org_name: Option<String>,
+}
+
+/// A chat agent: an actor with a persona, owned by exactly one organization.
+///
+/// The identity half lives in `users` (`kind = 'bot'`, `password_hash = '!'`) so
+/// every existing authorization, membership and audit path resolves it unchanged;
+/// everything that makes it an agent rather than a person lives here.
+#[derive(sqlx::FromRow, Serialize, PartialEq, Eq, Clone, Debug)]
+pub struct Bot {
+    /// Primary key of the profile row.
+    pub id: i64,
+    /// The `users` row this agent speaks as.
+    pub user_id: i64,
+    /// Owning organization. Never shared, never global.
+    pub org_id: i64,
+    /// The mention token: lowercase, no spaces, unique within the org.
+    pub slug: String,
+    /// What members see next to the agent's messages.
+    pub display_name: String,
+    /// The persona handed to the provider as the system turn.
+    pub system_prompt: String,
+    /// Named provider profile to answer with, resolved per org. `None` means "use
+    /// the org's current one", and if that does not exist the agent is unusable.
+    pub provider_profile: Option<String>,
+    /// A disabled agent is not mentionable and does not appear in autocomplete.
+    pub enabled: bool,
+    /// Unix seconds the owner created it.
+    pub created_at: i64,
 }
 
 /// An org.
@@ -466,6 +604,12 @@ fn wall_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Does a `shared_with` JSON array (e.g. "[1,42,7]") contain the user id?
+/// Used to check access to shared AI conversations. Not a SQL JSON function —
+/// plain string search is enough for our controlled array format.
+fn shared_contains(shared_with: &str, user_id: i64) -> bool {
+    shared_with.contains(&format!("\"{}\"", user_id))
+}
 /// A driver for database operations wrapping a pool connection.
 #[derive(Clone, Debug)]
 pub struct Database {
@@ -1644,7 +1788,7 @@ impl Database {
     /// Look up a user by email for login.
     pub async fn get_user_by_email(&self, email: &str) -> Result<Option<User>> {
         sqlx::query_as(
-            r#"SELECT id, email, name, password_hash, role, org_id, totp_secret_cipher, totp_enabled FROM users WHERE email = $1"#,
+            r#"SELECT id, email, name, password_hash, role, org_id, kind, totp_secret_cipher, totp_enabled FROM users WHERE email = $1"#,
         )
         .bind(email)
         .fetch_optional(&self.pool)
@@ -1786,7 +1930,7 @@ impl Database {
             }
         }
         let row = sqlx::query(
-            r#"SELECT u.id, u.email, u.name, u.password_hash, u.role, u.org_id,
+            r#"SELECT u.id, u.email, u.name, u.password_hash, u.role, u.org_id, u.kind,
                       u.totp_secret_cipher, u.totp_enabled, s.expires_at AS session_expires_at
                FROM session s JOIN users u ON u.id = s.user_id
                WHERE s.token = $1 AND s.expires_at > $2"#,
@@ -1807,6 +1951,7 @@ impl Database {
             password_hash: row.try_get("password_hash")?,
             role: row.try_get("role")?,
             org_id: row.try_get("org_id")?,
+            kind: row.try_get("kind")?,
             totp_secret_cipher: row.try_get("totp_secret_cipher")?,
             totp_enabled: row.try_get("totp_enabled")?,
         };
@@ -1839,24 +1984,208 @@ impl Database {
 
     // ----- Root admin: users -----
 
-    /// List all non-root users, with their org name.
+    // ----- Chat agents (Feature 01: context/feature-specs/01-chat-agents.md) -----
+
+    /// Create an agent: its identity row and its profile, in one transaction.
+    ///
+    /// Both rows or neither. An identity with no profile would be mentionable but
+    /// mute, and a profile with no identity could be listed but never speak — and a
+    /// later reader cannot tell either half-state from a bug in the mention path.
+    pub async fn create_bot(
+        &self,
+        org_id: i64,
+        slug: &str,
+        display_name: &str,
+        system_prompt: &str,
+        provider_profile: Option<&str>,
+        now: i64,
+    ) -> Result<Bot> {
+        let slug = slug.trim().to_lowercase();
+        if slug.is_empty()
+            || !slug
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            // The slug is the mention token, so a space would make `@first last`
+            // ambiguous and a punctuation character would collide with message
+            // punctuation. This is the rule the matcher is written against.
+            bail!("an agent's name must be one word of letters, digits, '-' or '_'");
+        }
+        let display_name = display_name.trim();
+        if display_name.is_empty() {
+            bail!("an agent needs a display name");
+        }
+        if self.list_bots(org_id).await?.iter().any(|b| b.slug == slug) {
+            bail!("an agent named '{slug}' already exists in this organization");
+        }
+        // Derived from the org and the slug, so it cannot collide with a person's
+        // email and no real domain is ever stored for an account nobody signs in
+        // as — matching the `@org.local` convention replicated members already use.
+        let email = format!("agent-{org_id}-{slug}@cortex.local");
+        let mut tx = self.pool.begin().await?;
+        let (user_id,): (i64,) = sqlx::query_as(
+            r#"INSERT INTO users (email, name, password_hash, role, org_id, kind)
+               VALUES ($1, $2, '!', 'user', $3, 'bot') RETURNING id"#,
+        )
+        .bind(&email)
+        .bind(display_name)
+        .bind(org_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let bot = sqlx::query_as::<_, Bot>(
+            r#"INSERT INTO bots
+                 (user_id, org_id, slug, display_name, system_prompt, provider_profile, enabled, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, 1, $7)
+               RETURNING id, user_id, org_id, slug, display_name, system_prompt,
+                         provider_profile, enabled, created_at"#,
+        )
+        .bind(user_id)
+        .bind(org_id)
+        .bind(&slug)
+        .bind(display_name)
+        .bind(system_prompt)
+        .bind(provider_profile)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        // A new actor can now appear in membership answers, so the identity cache
+        // cannot be allowed to serve the world from before it existed.
+        self.auth.wipe();
+        Ok(bot)
+    }
+
+    /// Every agent of an organization, enabled or not — the console's view.
+    pub async fn list_bots(&self, org_id: i64) -> Result<Vec<Bot>> {
+        Ok(sqlx::query_as::<_, Bot>(
+            "SELECT * FROM bots WHERE org_id = $1 ORDER BY display_name",
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The agents that may be mentioned right now. A disabled agent is absent
+    /// here, so it cannot answer even to a mention typed from memory.
+    pub async fn agents_of_org(&self, org_id: i64) -> Result<Vec<Bot>> {
+        Ok(sqlx::query_as::<_, Bot>(
+            "SELECT * FROM bots WHERE org_id = $1 AND enabled = 1 ORDER BY slug",
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The agent behind a message author, if that author is one. This is how the
+    /// loop guard knows it is looking at an agent's own words.
+    pub async fn bot_for_user(&self, user_id: i64) -> Result<Option<Bot>> {
+        Ok(sqlx::query_as::<_, Bot>("SELECT * FROM bots WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    /// Enable or disable an agent. Returns false when no row matched, which
+    /// includes an agent of a different organization — the org id is part of the
+    /// write, not a check the caller is trusted to remember.
+    pub async fn set_bot_enabled(&self, org_id: i64, bot_id: i64, enabled: bool) -> Result<bool> {
+        let changed = sqlx::query("UPDATE bots SET enabled = $1 WHERE id = $2 AND org_id = $3")
+            .bind(enabled)
+            .bind(bot_id)
+            .bind(org_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if changed == 1 {
+            self.auth.wipe();
+        }
+        Ok(changed == 1)
+    }
+
+    /// Remove an agent. The `users` row goes with it by cascade, so no orphan
+    /// actor is left that no console row can turn off.
+    pub async fn delete_bot(&self, org_id: i64, bot_id: i64) -> Result<bool> {
+        let removed = sqlx::query("DELETE FROM bots WHERE id = $1 AND org_id = $2")
+            .bind(bot_id)
+            .bind(org_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if removed == 1 {
+            self.auth.wipe();
+        }
+        Ok(removed == 1)
+    }
+
+    /// True when `body` mentions `slug` as its own token.
+    ///
+    /// Punctuation ends a mention, because "@scribe?" and "@scribe, help" are both
+    /// real ways to address an agent, and a matcher that required whitespace would
+    /// silently never fire on them.
+    fn mentions(body: &str, slug: &str) -> bool {
+        let chars: Vec<char> = body.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '@' {
+                // An `@` glued to a word before it is an email address or an
+                // inline handle, not somebody addressing an agent. Without this
+                // rule `mail@corp.local` mentions an agent named "corp".
+                let glued = i > 0
+                    && (chars[i - 1].is_alphanumeric()
+                        || chars[i - 1] == '.'
+                        || chars[i - 1] == '_'
+                        || chars[i - 1] == '-'
+                        || chars[i - 1] == '+'
+                        || chars[i - 1] == '@');
+                if !glued {
+                    let mut j = i + 1;
+                    while j < chars.len()
+                        && (chars[j].is_ascii_alphanumeric() || chars[j] == '-' || chars[j] == '_')
+                    {
+                        j += 1;
+                    }
+                    let token: String = chars[i + 1..j].iter().collect();
+                    if token.eq_ignore_ascii_case(slug) {
+                        return true;
+                    }
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// The enabled agents a posted message mentions, in slug order.
+    pub async fn mentioned_agents(&self, org_id: i64, body: &str) -> Result<Vec<Bot>> {
+        Ok(self
+            .agents_of_org(org_id)
+            .await?
+            .into_iter()
+            .filter(|bot| Self::mentions(body, &bot.slug))
+            .collect())
+    }
+
+    /// List all non-root users, with their org name. Agents are listed by
+    /// `list_bots`, not here: this list is people, and it feeds the People
+    /// surface and the assignee pickers.
     pub async fn admin_list_users(&self) -> Result<Vec<AdminUser>> {
         sqlx::query_as(
             r#"SELECT u.id, u.email, u.name, u.role, u.org_id, o.name AS org_name
                FROM users u LEFT JOIN org o ON o.id = u.org_id
-               WHERE u.role != 'root' ORDER BY u.email"#,
+               WHERE u.role != 'root' AND u.kind = 'human' ORDER BY u.email"#,
         )
         .fetch_all(&self.pool)
         .await
         .map_err(|e| e.into())
     }
 
-    /// List only the members of the admin's own org; never include root.
+    /// List only the members of the admin's own org; never include root or agents.
     pub async fn admin_list_users_in_org(&self, org_id: i64) -> Result<Vec<AdminUser>> {
         Ok(sqlx::query_as(
             r#"SELECT u.id, u.email, u.name, u.role, u.org_id, o.name AS org_name
                FROM users u JOIN org o ON o.id = u.org_id
-               WHERE u.org_id = $1 AND u.role != 'root' ORDER BY u.email"#,
+               WHERE u.org_id = $1 AND u.role != 'root' AND u.kind = 'human'
+               ORDER BY u.email"#,
         )
         .bind(org_id)
         .fetch_all(&self.pool)
@@ -1866,7 +2195,7 @@ impl Database {
     /// Fetch a target for an authorization decision (never expose its hash).
     pub async fn admin_target(&self, id: i64) -> Result<Option<User>> {
         Ok(sqlx::query_as(
-            "SELECT id, email, name, password_hash, role, org_id, totp_secret_cipher, totp_enabled FROM users WHERE id = $1",
+            "SELECT id, email, name, password_hash, role, org_id, kind, totp_secret_cipher, totp_enabled FROM users WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -2114,6 +2443,14 @@ impl Database {
             .execute(&mut tx)
             .await?;
         sqlx::query("DELETE FROM audit WHERE org_id = $1")
+            .bind(id)
+            .execute(&mut tx)
+            .await?;
+        // An agent is an actor, not a membership. Its `bots` profile would cascade
+        // with the org and leave the `users` row standing — an identity with no
+        // profile that is still a valid message author. Delete the identity, and
+        // the profile goes by cascade.
+        sqlx::query("DELETE FROM users WHERE kind = 'bot' AND org_id = $1")
             .bind(id)
             .execute(&mut tx)
             .await?;
@@ -2811,6 +3148,7 @@ impl Database {
 
     /// Create an upload in one transaction. A failed blob/document write must
     /// not leave a file row blocking the next upload of the same name.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_uploaded_file(
         &self,
         workspace_id: i64,
@@ -3619,8 +3957,10 @@ impl Database {
     /// Accounts in one org, which is what a plan's seat count is compared
     /// against. Root accounts are excluded: they are the operator, not a tenant.
     pub async fn org_user_count(&self, org_id: i64) -> Result<i64> {
+        // Seats are people. An agent is an actor with no credential, and charging
+        // a licence for one would make enabling agents cost licences (D-12).
         let (n,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM users WHERE org_id = $1 AND role != 'root'",
+            "SELECT COUNT(*) FROM users WHERE org_id = $1 AND role != 'root' AND kind = 'human'",
         )
         .bind(org_id)
         .fetch_one(&self.pool)
@@ -4982,6 +5322,754 @@ impl Database {
         Ok(())
     }
 
+    // ----- AI provider profiles (up to 3 named per scope; keys encrypted) -----
+
+    const PROVIDER_COLS: &'static str =
+        "scope, scope_id, name, provider, base_url, model, key_cipher, is_current, updated_at";
+
+    /// All provider profiles for a scope, current first.
+    pub async fn list_providers(&self, scope: &str, scope_id: i64) -> Result<Vec<ProviderRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {} FROM ai_provider WHERE scope = $1 AND scope_id = $2 ORDER BY is_current DESC, name",
+            Self::PROVIDER_COLS
+        ))
+        .bind(scope)
+        .bind(scope_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The current profile for a scope (falls back to the newest if none flagged).
+    pub async fn get_current_provider(&self, scope: &str, scope_id: i64) -> Result<Option<ProviderRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {} FROM ai_provider WHERE scope = $1 AND scope_id = $2 \
+             ORDER BY is_current DESC, updated_at DESC LIMIT 1",
+            Self::PROVIDER_COLS
+        ))
+        .bind(scope)
+        .bind(scope_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// A specific named profile.
+    pub async fn get_named_provider(&self, scope: &str, scope_id: i64, name: &str) -> Result<Option<ProviderRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {} FROM ai_provider WHERE scope = $1 AND scope_id = $2 AND name = $3",
+            Self::PROVIDER_COLS
+        ))
+        .bind(scope)
+        .bind(scope_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// How many profiles this scope has (the cap is three per scope).
+    pub async fn count_providers(&self, scope: &str, scope_id: i64) -> Result<i64> {
+        let (n,): (i64,) =
+            sqlx::query_as(r#"SELECT count(*) FROM ai_provider WHERE scope = $1 AND scope_id = $2"#)
+                .bind(scope)
+                .bind(scope_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(n)
+    }
+
+    // ----- AI skills (per-user reusable instructions; server-backed) -----
+
+    const AI_SKILL_COLS: &'static str =
+        "id, user_id, name, description, instructions, source, source_url, always_on, auto_load";
+
+    /// All skills for a user, alphabetized by name.
+    pub async fn list_skills(&self, user_id: i64) -> Result<Vec<AiSkillRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {} FROM ai_skills WHERE user_id = $1 ORDER BY name",
+            Self::AI_SKILL_COLS
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// A single skill by name.
+    pub async fn get_skill(&self, user_id: i64, name: &str) -> Result<Option<AiSkillRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {} FROM ai_skills WHERE user_id = $1 AND name = $2",
+            Self::AI_SKILL_COLS
+        ))
+        .bind(user_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Insert or replace a skill (name is unique per user). Returns the saved row.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_skill(
+        &self,
+        user_id: i64,
+        name: &str,
+        description: &str,
+        instructions: &str,
+        source: &str,
+        source_url: Option<&str>,
+        always_on: bool,
+        auto_load: &str,
+    ) -> Result<AiSkillRow> {
+        sqlx::query(
+            r#"INSERT INTO ai_skills (user_id, name, description, instructions, source, source_url, always_on, auto_load, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, strftime('%s','now'))
+               ON CONFLICT(user_id, name) DO UPDATE SET
+                 description = excluded.description,
+                 instructions = excluded.instructions,
+                 source = excluded.source,
+                 source_url = excluded.source_url,
+                 always_on = excluded.always_on,
+                 auto_load = excluded.auto_load,
+                 updated_at = strftime('%s','now')"#,
+        )
+        .bind(user_id)
+        .bind(name)
+        .bind(description)
+        .bind(instructions)
+        .bind(source)
+        .bind(source_url)
+        .bind(always_on as i64)
+        .bind(auto_load)
+        .execute(&self.pool)
+        .await?;
+        self.get_skill(user_id, name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("skill upsert did not persist"))
+    }
+
+    /// Delete a skill; returns whether a row was removed.
+    pub async fn delete_skill(&self, user_id: i64, name: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM ai_skills WHERE user_id = $1 AND name = $2")
+            .bind(user_id)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Create or replace a named profile. The scope's first profile becomes current.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_provider(
+        &self,
+        scope: &str,
+        scope_id: i64,
+        name: &str,
+        provider: &str,
+        base_url: Option<&str>,
+        model: &str,
+        key_cipher: &str,
+        now: i64,
+    ) -> Result<()> {
+        let first = self.count_providers(scope, scope_id).await.unwrap_or(0) == 0;
+        sqlx::query(
+            r#"INSERT INTO ai_provider (scope, scope_id, name, provider, base_url, model, key_cipher, is_current, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               ON CONFLICT(scope, scope_id, name) DO UPDATE SET
+                 provider = excluded.provider, base_url = excluded.base_url,
+                 model = excluded.model, key_cipher = excluded.key_cipher,
+                 updated_at = excluded.updated_at"#,
+        )
+        .bind(scope)
+        .bind(scope_id)
+        .bind(name)
+        .bind(provider)
+        .bind(base_url)
+        .bind(model)
+        .bind(key_cipher)
+        .bind(if first { 1 } else { 0 })
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark one profile current for its scope (clears the others).
+    pub async fn set_current_provider(&self, scope: &str, scope_id: i64, name: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(r#"UPDATE ai_provider SET is_current = 0 WHERE scope = $1 AND scope_id = $2"#)
+            .bind(scope)
+            .bind(scope_id)
+            .execute(&mut tx)
+            .await?;
+        sqlx::query(r#"UPDATE ai_provider SET is_current = 1 WHERE scope = $1 AND scope_id = $2 AND name = $3"#)
+            .bind(scope)
+            .bind(scope_id)
+            .bind(name)
+            .execute(&mut tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Remove a named profile. If it was the current one, the newest survivor
+    /// is promoted so the scope keeps a usable default.
+    pub async fn delete_provider(&self, scope: &str, scope_id: i64, name: &str) -> Result<()> {
+        sqlx::query(r#"DELETE FROM ai_provider WHERE scope = $1 AND scope_id = $2 AND name = $3"#)
+            .bind(scope)
+            .bind(scope_id)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        // If the deleted profile was current, promote the newest survivor.
+        sqlx::query(
+            r#"UPDATE ai_provider SET is_current = 1
+               WHERE scope = $1 AND scope_id = $2 AND updated_at = (
+                   SELECT max(updated_at) FROM ai_provider WHERE scope = $1 AND scope_id = $2)
+               AND NOT EXISTS (
+                   SELECT 1 FROM ai_provider WHERE scope = $1 AND scope_id = $2 AND is_current = 1)"#,
+        )
+        .bind(scope)
+        .bind(scope_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ----- AI usage accounting (for the owner/admin cost dashboard) -----
+
+    /// Insert a usage row (one-shot). Prefer `upsert_usage` for in-flight turns.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_usage(
+        &self,
+        org_id: Option<i64>,
+        user_id: i64,
+        provider: &str,
+        model: &str,
+        input: i64,
+        output: i64,
+        cached: i64,
+        cache_creation: i64,
+        reasoning: i64,
+        cost: f64,
+        now: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO ai_usage
+               (org_id, user_id, provider, model, input_tokens, output_tokens,
+                cached_tokens, cache_creation_tokens, reasoning_tokens, cost, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .bind(provider)
+        .bind(model)
+        .bind(input)
+        .bind(output)
+        .bind(cached)
+        .bind(cache_creation)
+        .bind(reasoning)
+        .bind(cost)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Insert or update the usage row for one in-flight turn so cost accrues
+    /// after every round — including when the turn later errors or is truncated.
+    /// `turn_id` is `{workspace}:{conv}:{started}` (unique while the turn lives).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_usage(
+        &self,
+        org_id: Option<i64>,
+        user_id: i64,
+        provider: &str,
+        model: &str,
+        input: i64,
+        output: i64,
+        cached: i64,
+        cache_creation: i64,
+        reasoning: i64,
+        cost: f64,
+        turn_id: &str,
+        now: i64,
+    ) -> Result<()> {
+        let res = sqlx::query(
+            r#"UPDATE ai_usage SET
+                 input_tokens = $1, output_tokens = $2, cached_tokens = $3,
+                 cache_creation_tokens = $4, reasoning_tokens = $5, cost = $6,
+                 provider = $7, model = $8
+               WHERE turn_id = $9"#,
+        )
+        .bind(input)
+        .bind(output)
+        .bind(cached)
+        .bind(cache_creation)
+        .bind(reasoning)
+        .bind(cost)
+        .bind(provider)
+        .bind(model)
+        .bind(turn_id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            let insert = sqlx::query(
+                r#"INSERT INTO ai_usage
+                   (org_id, user_id, provider, model, input_tokens, output_tokens,
+                    cached_tokens, cache_creation_tokens, reasoning_tokens, cost, created_at, turn_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#,
+            )
+            .bind(org_id)
+            .bind(user_id)
+            .bind(provider)
+            .bind(model)
+            .bind(input)
+            .bind(output)
+            .bind(cached)
+            .bind(cache_creation)
+            .bind(reasoning)
+            .bind(cost)
+            .bind(now)
+            .bind(turn_id)
+            .execute(&self.pool)
+            .await;
+            if insert.is_err() {
+                // Concurrent first round — the other task inserted. Update.
+                sqlx::query(
+                    r#"UPDATE ai_usage SET
+                         input_tokens = $1, output_tokens = $2, cached_tokens = $3,
+                         cache_creation_tokens = $4, reasoning_tokens = $5, cost = $6,
+                         provider = $7, model = $8
+                       WHERE turn_id = $9"#,
+                )
+                .bind(input)
+                .bind(output)
+                .bind(cached)
+                .bind(cache_creation)
+                .bind(reasoning)
+                .bind(cost)
+                .bind(provider)
+                .bind(model)
+                .bind(turn_id)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Usage grouped by model. `all` = every org (root); else just `org_id` (admin).
+    pub async fn usage_by_model(&self, org_id: Option<i64>, all: bool) -> Result<Vec<UsageStat>> {
+        let cols = "model AS label, count(*) AS requests, \
+                    COALESCE(sum(input_tokens),0) AS input_tokens, \
+                    COALESCE(sum(cached_tokens),0) AS cached_tokens, \
+                    COALESCE(sum(output_tokens),0) AS output_tokens, \
+                    COALESCE(sum(reasoning_tokens),0) AS reasoning_tokens, \
+                    COALESCE(sum(cost),0) AS cost";
+        let order = "ORDER BY sum(input_tokens) + sum(cached_tokens) + sum(output_tokens) DESC";
+        if all {
+            Ok(sqlx::query_as(&format!("SELECT {cols} FROM ai_usage GROUP BY model {order}"))
+                .fetch_all(&self.pool)
+                .await?)
+        } else {
+            Ok(sqlx::query_as(&format!("SELECT {cols} FROM ai_usage WHERE org_id = $1 GROUP BY model {order}"))
+                .bind(org_id)
+                .fetch_all(&self.pool)
+                .await?)
+        }
+    }
+
+    /// Usage grouped by user (label = email).
+    pub async fn usage_by_user(&self, org_id: Option<i64>, all: bool) -> Result<Vec<UsageStat>> {
+        let cols = "COALESCE(u.email, 'unknown') AS label, count(*) AS requests, \
+                    COALESCE(sum(a.input_tokens),0) AS input_tokens, \
+                    COALESCE(sum(a.cached_tokens),0) AS cached_tokens, \
+                    COALESCE(sum(a.output_tokens),0) AS output_tokens, \
+                    COALESCE(sum(a.reasoning_tokens),0) AS reasoning_tokens, \
+                    COALESCE(sum(a.cost),0) AS cost";
+        let order = "ORDER BY sum(a.input_tokens) + sum(a.cached_tokens) + sum(a.output_tokens) DESC";
+        if all {
+            Ok(sqlx::query_as(&format!(
+                "SELECT {cols} FROM ai_usage a LEFT JOIN users u ON u.id = a.user_id GROUP BY a.user_id {order}"
+            ))
+            .fetch_all(&self.pool)
+            .await?)
+        } else {
+            Ok(sqlx::query_as(&format!(
+                "SELECT {cols} FROM ai_usage a LEFT JOIN users u ON u.id = a.user_id \
+                 WHERE a.org_id = $1 GROUP BY a.user_id {order}"
+            ))
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await?)
+        }
+    }
+
+    // ----- AI conversation wire state (prompt-cache prefix) -----
+
+    /// The stored wire-format history for a conversation, if any: (wire, visible).
+    /// Access is relaxed for sharing: the owner can always load it, and so can
+    /// any user listed in `shared_with` (co-members of the same workspace).
+    pub async fn load_ai_conv(
+        &self,
+        id: &str,
+        user_id: i64,
+        workspace_id: i64,
+    ) -> Result<Option<(String, String)>> {
+        let row: Option<(i64, String, String, String)> = sqlx::query_as(
+            r#"SELECT user_id, wire, visible, shared_with FROM ai_conv WHERE id = $1 AND workspace_id = $3"#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(workspace_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some((owner, wire, visible, shared)) if owner == user_id || shared_contains(&shared, user_id) => {
+                Ok(Some((wire, visible)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Persist the wire-format history for a conversation. The owner always
+    /// writes; a shared member may also update the owner's row (so a shared
+    /// conversation keeps ONE canonical wire history — the cache prefix stays
+    /// identical for every participant). A brand-new conversation inserts.
+    pub async fn save_ai_conv(
+        &self,
+        id: &str,
+        user_id: i64,
+        workspace_id: i64,
+        wire: &str,
+        visible: &str,
+        now: i64,
+    ) -> Result<()> {
+        let row: Option<(i64, String)> = sqlx::query_as(
+            r#"SELECT user_id, shared_with FROM ai_conv WHERE id = $1 AND workspace_id = $3"#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(workspace_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some((owner, shared)) if owner == user_id || shared_contains(&shared, user_id) => {
+                sqlx::query(
+                    r#"UPDATE ai_conv SET wire = $4, visible = $5, updated_at = $6 WHERE id = $1 AND workspace_id = $3"#,
+                )
+                .bind(id)
+                .bind(user_id)
+                .bind(workspace_id)
+                .bind(wire)
+                .bind(visible)
+                .bind(now)
+                .execute(&self.pool)
+                .await?;
+                Ok(())
+            }
+            // Row exists but this user has no access — leave it untouched.
+            Some(_) => Ok(()),
+            // New conversation: this user becomes the owner.
+            None => {
+                sqlx::query(
+                    r#"INSERT INTO ai_conv (id, user_id, workspace_id, wire, visible, updated_at)
+                       VALUES ($1, $2, $3, $4, $5, $6)"#,
+                )
+                .bind(id)
+                .bind(user_id)
+                .bind(workspace_id)
+                .bind(wire)
+                .bind(visible)
+                .bind(now)
+                .execute(&self.pool)
+                .await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Set who a conversation is shared with (JSON array of user ids).
+    /// Owner-only. Returns false if the caller doesn't own the conversation.
+    pub async fn set_ai_conv_shared(
+        &self,
+        id: &str,
+        user_id: i64,
+        workspace_id: i64,
+        shared_with: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            r#"UPDATE ai_conv SET shared_with = $4 WHERE id = $1 AND user_id = $2 AND workspace_id = $3"#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(workspace_id)
+        .bind(shared_with)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Delete a conversation (owner only — the canonical row is the
+    /// owner's; shared members read and update it but can't remove it).
+    /// Returns true when a row was deleted.
+    pub async fn delete_ai_conv(&self, id: &str, user_id: i64, workspace_id: i64) -> Result<bool> {
+        let res = sqlx::query(
+            r#"DELETE FROM ai_conv WHERE id = $1 AND user_id = $2 AND workspace_id = $3"#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(workspace_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Conversations in a workspace the user owns or has been shared with:
+    /// (id, owner_user_id, shared_with, updated_at, visible).
+    pub async fn list_ai_conv_shares(
+        &self,
+        user_id: i64,
+        workspace_id: i64,
+    ) -> Result<Vec<AiConvShareRow>> {
+        let rows: Vec<AiConvShareRow> = sqlx::query_as(
+            r#"SELECT id, user_id, shared_with, updated_at, visible, title, pinned FROM ai_conv WHERE workspace_id = $2"#,
+        )
+        .bind(user_id)
+        .bind(workspace_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, owner, shared, _, _, _, _)| *owner == user_id || shared_contains(shared, user_id))
+            .collect())
+    }
+
+    /// Pin or unpin a conversation (owner only). Returns false if the caller
+    /// doesn't own the conversation.
+    pub async fn set_ai_conv_pin(
+        &self,
+        id: &str,
+        user_id: i64,
+        workspace_id: i64,
+        pinned: bool,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            r#"UPDATE ai_conv SET pinned = $4 WHERE id = $1 AND user_id = $2 AND workspace_id = $3"#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(workspace_id)
+        .bind(pinned)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Set a conversation's custom title (owner only). Returns false if the
+    /// caller doesn't own the conversation.
+    pub async fn set_ai_conv_title(
+        &self,
+        id: &str,
+        user_id: i64,
+        workspace_id: i64,
+        title: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            r#"UPDATE ai_conv SET title = $4 WHERE id = $1 AND user_id = $2 AND workspace_id = $3"#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(workspace_id)
+        .bind(title)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// The stored subagent-profile preference for a scope, if any ('' = unset).
+    pub async fn get_ai_pref(&self, scope: &str, scope_id: i64) -> Result<Option<String>> {
+        Ok(sqlx::query_as::<_, (String,)>(r#"SELECT subagent_profile FROM ai_prefs WHERE scope = $1 AND scope_id = $2"#)
+            .bind(scope)
+            .bind(scope_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|(p,)| p))
+    }
+
+    /// Set the subagent-profile preference for a scope (upsert).
+    pub async fn set_ai_pref(&self, scope: &str, scope_id: i64, profile: &str, now: i64) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO ai_prefs (scope, scope_id, subagent_profile, updated_at)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT(scope, scope_id) DO UPDATE SET
+                 subagent_profile = excluded.subagent_profile, updated_at = excluded.updated_at"#,
+        )
+        .bind(scope)
+        .bind(scope_id)
+        .bind(profile)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// (user_id, provider, model) for every user in an org who set a personal
+    /// config — for the owner/admin overview (no keys).
+    pub async fn org_user_providers(&self, org_id: i64) -> Result<Vec<(i64, String, String)>> {
+        Ok(sqlx::query_as(
+            r#"SELECT p.scope_id, p.provider, p.model
+               FROM ai_provider p JOIN users u ON u.id = p.scope_id
+               WHERE p.scope = 'user' AND u.org_id = $1"#,
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    // ----- Remote MCP connections (per user) -----
+
+    const AI_MCP_COLS: &'static str = "id, user_id, name, url, token_cipher, enabled, updated_at";
+
+    /// List this user's remote MCP servers.
+    pub async fn list_mcp(&self, user_id: i64) -> Result<Vec<AiMcpRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {} FROM ai_mcp WHERE user_id = $1 ORDER BY name COLLATE NOCASE",
+            Self::AI_MCP_COLS
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// One MCP server by name.
+    pub async fn get_mcp(&self, user_id: i64, name: &str) -> Result<Option<AiMcpRow>> {
+        Ok(sqlx::query_as(&format!(
+            "SELECT {} FROM ai_mcp WHERE user_id = $1 AND name = $2",
+            Self::AI_MCP_COLS
+        ))
+        .bind(user_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Insert or update a remote MCP server. `keep_token` leaves the stored
+    /// cipher alone (the client omitted the token field).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_mcp(
+        &self,
+        user_id: i64,
+        name: &str,
+        url: &str,
+        token_cipher: Option<&str>,
+        enabled: bool,
+        keep_token: bool,
+    ) -> Result<AiMcpRow> {
+        if keep_token {
+            sqlx::query(
+                r#"INSERT INTO ai_mcp (user_id, name, url, enabled, updated_at)
+                   VALUES ($1, $2, $3, $4, strftime('%s','now'))
+                   ON CONFLICT(user_id, name) DO UPDATE SET
+                     url = excluded.url,
+                     enabled = excluded.enabled,
+                     updated_at = strftime('%s','now')"#,
+            )
+            .bind(user_id)
+            .bind(name)
+            .bind(url)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"INSERT INTO ai_mcp (user_id, name, url, token_cipher, enabled, updated_at)
+                   VALUES ($1, $2, $3, $4, $5, strftime('%s','now'))
+                   ON CONFLICT(user_id, name) DO UPDATE SET
+                     url = excluded.url,
+                     token_cipher = excluded.token_cipher,
+                     enabled = excluded.enabled,
+                     updated_at = strftime('%s','now')"#,
+            )
+            .bind(user_id)
+            .bind(name)
+            .bind(url)
+            .bind(token_cipher)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        }
+        self.get_mcp(user_id, name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("mcp upsert did not persist"))
+    }
+
+    /// Delete a remote MCP server; returns whether a row was removed.
+    pub async fn delete_mcp(&self, user_id: i64, name: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM ai_mcp WHERE user_id = $1 AND name = $2")
+            .bind(user_id)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    // ----- Research / web search (per user) -----
+
+    /// This user's research provider row, if any.
+    pub async fn get_ai_research(&self, user_id: i64) -> Result<Option<AiResearchRow>> {
+        Ok(sqlx::query_as(
+            r#"SELECT user_id, provider, key_cipher, enabled, updated_at
+               FROM ai_research WHERE user_id = $1"#,
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Upsert research settings. `keep_key` leaves the stored cipher alone.
+    pub async fn upsert_ai_research(
+        &self,
+        user_id: i64,
+        provider: &str,
+        key_cipher: Option<&str>,
+        enabled: bool,
+        keep_key: bool,
+    ) -> Result<AiResearchRow> {
+        if keep_key {
+            sqlx::query(
+                r#"INSERT INTO ai_research (user_id, provider, enabled, updated_at)
+                   VALUES ($1, $2, $3, strftime('%s','now'))
+                   ON CONFLICT(user_id) DO UPDATE SET
+                     provider = excluded.provider,
+                     enabled = excluded.enabled,
+                     updated_at = strftime('%s','now')"#,
+            )
+            .bind(user_id)
+            .bind(provider)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"INSERT INTO ai_research (user_id, provider, key_cipher, enabled, updated_at)
+                   VALUES ($1, $2, $3, $4, strftime('%s','now'))
+                   ON CONFLICT(user_id) DO UPDATE SET
+                     provider = excluded.provider,
+                     key_cipher = excluded.key_cipher,
+                     enabled = excluded.enabled,
+                     updated_at = strftime('%s','now')"#,
+            )
+            .bind(user_id)
+            .bind(provider)
+            .bind(key_cipher)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(self
+            .get_ai_research(user_id)
+            .await?
+            .expect("research row just upserted"))
+    }
     /// Empty every organization's document table, for a restore that replaces the
     /// whole instance: an archive naming no document for a tenant is a tenant
     /// that must not keep the one it was holding.
@@ -4989,6 +6077,7 @@ impl Database {
         let Some(registries) = self.registries.get().filter(|r| r.is_split()) else {
             return Ok(());
         };
+
         for org_id in registries.openable_org_ids().await? {
             let content = registries.org(org_id).await?;
             sqlx::query("DELETE FROM document").execute(content.write()).await?;
@@ -5395,6 +6484,141 @@ mod tests {
         let (_, ws) = seed_workspace(&inline).await;
         add_binary(&inline, ws, "a.png", b"plain bytes").await;
         assert_eq!(inline.org_key_count().await.unwrap(), 0, "and it mints no keys");
+    }
+
+    #[tokio::test]
+    async fn an_agent_is_an_actor_with_no_credential() {
+        let (_tmp, db) = test_database().await;
+        let (owner, _ws) = seed_workspace(&db).await;
+        let (org, _, ws) = {
+            let org = db.create_org("Agents R Us", "agentsrus", 1).await.unwrap();
+            let group = db.create_group(org.id, "Team", owner, 1, "group").await.unwrap();
+            let ws = db.create_workspace(group.id, "Project", owner, 1).await.unwrap();
+            (org.id, group.id, ws.id)
+        };
+        let _ = ws;
+        let before = db.org_user_count(org).await.unwrap();
+
+        let bot = db.create_bot(org, "scribe", "Scribe", "You summarise.", None, 1).await.unwrap();
+
+        // It speaks as a user row, so every existing authorization path can
+        // resolve it — and that row carries nothing a login could verify.
+        let row: (String, String, Option<i64>) =
+            sqlx::query_as("SELECT kind, password_hash, org_id FROM users WHERE id = $1")
+                .bind(bot.user_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "bot");
+        assert_eq!(row.1, "!", "an agent must hold no credential");
+        assert_eq!(row.2, Some(org));
+
+        // Seats are people (D-12): adding an agent must not move the number a
+        // plan is checked against.
+        assert_eq!(db.org_user_count(org).await.unwrap(), before, "an agent costs no seat");
+        // Neither does it appear among people.
+        let emails: Vec<String> = db
+            .admin_list_users_in_org(org)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|u| u.email)
+            .collect();
+        assert!(
+            !emails.iter().any(|e| e.contains("scribe")),
+            "an agent showed up in the people list: {emails:?}"
+        );
+        assert_eq!(db.agents_of_org(org).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_agent_is_not_mentionable_and_agents_are_org_scoped() {
+        let (_tmp, db) = test_database().await;
+        let owner = db.create_user_if_absent("owner", "Owner", "pw", "root", None).await.unwrap();
+        let owner_id = db.get_user_by_email("owner").await.unwrap().unwrap().id;
+        let _ = owner;
+        let (org_a, _, _) = seed_org(&db, owner_id, "Alpha").await;
+        let (org_b, _, _) = seed_org(&db, owner_id, "Beta").await;
+        db.create_bot(org_a, "scribe", "Scribe", "a", None, 1).await.unwrap();
+
+        // An agent of one org is invisible to another — not merely refused at the
+        // handler, which is the difference between a policy and an invariant.
+        assert_eq!(db.agents_of_org(org_a).await.unwrap().len(), 1);
+        assert!(db.agents_of_org(org_b).await.unwrap().is_empty());
+        assert!(db.mentioned_agents(org_b, "hey @scribe").await.unwrap().is_empty());
+        assert_eq!(db.mentioned_agents(org_a, "hey @scribe").await.unwrap().len(), 1);
+
+        let id = db.agents_of_org(org_a).await.unwrap()[0].id;
+        assert!(db.set_bot_enabled(org_a, id, false).await.unwrap());
+        assert!(db.mentioned_agents(org_a, "hey @scribe").await.unwrap().is_empty(), "disabled still answered");
+        // The org id is part of the write, so another tenant cannot flip it.
+        assert!(!db.set_bot_enabled(org_b, id, true).await.unwrap());
+        assert!(db.set_bot_enabled(org_a, id, true).await.unwrap());
+        assert_eq!(db.mentioned_agents(org_a, "@scribe").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_organization_leaves_no_agent_identity_behind() {
+        let (_tmp, db) = test_database().await;
+        let owner = db.create_user_if_absent("owner", "Owner", "pw", "root", None).await.unwrap();
+        let owner_id = db.get_user_by_email("owner").await.unwrap().unwrap().id;
+        let _ = owner;
+        let (org, _, _) = seed_org(&db, owner_id, "Alpha").await;
+        let bot = db.create_bot(org, "scribe", "Scribe", "a", None, 1).await.unwrap();
+
+        db.delete_org(org).await.unwrap();
+
+        let (profiles,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM bots WHERE org_id = $1")
+            .bind(org)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(profiles, 0);
+        // The profile cascading is easy to get right; the identity row is the one
+        // that stays behind and keeps being a valid message author.
+        let (identities,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = $1")
+            .bind(bot.user_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(identities, 0, "an orphaned agent actor survived its org");
+    }
+
+    #[tokio::test]
+    async fn an_agent_name_is_one_word_and_unique_per_org() {
+        let (_tmp, db) = test_database().await;
+        let owner = db.create_user_if_absent("owner", "Owner", "pw", "root", None).await.unwrap();
+        let owner_id = db.get_user_by_email("owner").await.unwrap().unwrap().id;
+        let _ = owner;
+        let (org, _, _) = seed_org(&db, owner_id, "Alpha").await;
+        // The slug is the mention token, so these are what the matcher relies on.
+        for bad in ["two words", "with space", "punct!", "", "  "] {
+            assert!(db.create_bot(org, bad, "X", "", None, 1).await.is_err(), "accepted {bad:?}");
+        }
+        db.create_bot(org, "scribe", "Scribe", "", None, 1).await.unwrap();
+        assert!(db.create_bot(org, "SCRIBE", "Other", "", None, 1).await.is_err(), "case-bypassed the unique name");
+        assert!(db.create_bot(org, "scribe", "Scribe", "", None, 1).await.is_err());
+        // The same name in another organization is a different agent.
+        let (org_b, _, _) = seed_org(&db, owner_id, "Beta").await;
+        assert!(db.create_bot(org_b, "scribe", "Scribe", "", None, 1).await.is_ok());
+    }
+
+    #[test]
+    fn a_mention_ends_at_punctuation_and_a_bare_at_sign_is_not_one() {
+        // The matcher is pure, so its edges are cheap to pin: real messages address
+        // an agent with punctuation attached, and an email is not a mention.
+        assert!(Database::mentions("hey @scribe", "scribe"));
+        assert!(Database::mentions("@scribe?", "scribe"));
+        assert!(Database::mentions("@scribe, help", "scribe"));
+        assert!(Database::mentions("(mentioning @scribe now)", "scribe"));
+        assert!(Database::mentions("@Scribe", "scribe"), "mentions are case-insensitive");
+        assert!(Database::mentions("a @scribe-2 b", "scribe-2"));
+        assert!(!Database::mentions("@scribes", "scribe"), "a longer token is another agent");
+        assert!(!Database::mentions("mail@corp.local", "corp"));
+        assert!(!Database::mentions("no one here", "scribe"));
+        assert!(!Database::mentions("@", "scribe"));
+        // A second mention after a non-match must still be found.
+        assert!(Database::mentions("@nobody @scribe", "scribe"));
     }
 
     #[tokio::test]
@@ -5867,7 +7091,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_remove_ai_schema() {
+    async fn migrations_restore_ai_schema() {
         let file = tempfile::NamedTempFile::new().expect("create temporary database");
         let uri = format!(
             "sqlite://{}",
@@ -5877,20 +7101,22 @@ mod tests {
         );
         let db = Database::new(&uri).await.expect("run database migrations");
 
+        // The AI schema was dropped by migration 26 and restored by 39, so
+        // a fresh database ends with the seven assistant tables in place.
         let (ai_tables,): (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'ai_%'",
         )
         .fetch_one(&db.pool)
         .await
         .expect("inspect migrated schema");
-        assert_eq!(ai_tables, 0);
+        assert_eq!(ai_tables, 7);
 
-        let (cleanup_applied,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 26")
+        let (restore_applied,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 39")
                 .fetch_one(&db.pool)
                 .await
                 .expect("inspect migration history");
-        assert_eq!(cleanup_applied, 1);
+        assert_eq!(restore_applied, 1);
     }
 
     /// An org, a group and a workspace, handing back the two ids a routing

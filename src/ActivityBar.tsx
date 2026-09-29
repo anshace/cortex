@@ -1,8 +1,8 @@
 import { Box, Flex, Icon, IconButton, Tooltip } from "@chakra-ui/react";
 import { ElementType, ReactNode } from "react";
-import { VscComment, VscFiles } from "react-icons/vsc";
+import { VscComment, VscFiles, VscSparkle } from "react-icons/vsc";
 
-export type Section = "explorer" | "chat";
+export type Section = "explorer" | "chat" | "assistant";
 
 /** Personal-scope groups always read "Personal" — the owner's private space. */
 export function groupLabel(g: { scope: string; name: string }): string {
@@ -46,6 +46,12 @@ function ActivityBar({
       label: "Chat",
       hue: "accent.cyan",
       count: chatCount,
+    },
+    {
+      key: "assistant",
+      icon: VscSparkle,
+      label: "Assistant",
+      hue: "accent.base",
     },
   ];
 

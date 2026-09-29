@@ -22,6 +22,8 @@ services:
     environment:
       RUST_LOG: info
       SQLITE_URI: sqlite:///data/authpad.db
+      # AI assistant: encrypts saved provider keys at rest (optional; see README).
+      AI_KEY_SECRET: "${AI_KEY_SECRET:-}"
       # First-run owner (admin/admin by default). Change it on first login.
       ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin}"

@@ -59,6 +59,18 @@ before the first start — they're ignored once any user exists.
 `PORT`. Everyone (owner and users) can change their own username and password
 from Settings; the owner provisions additional accounts from the owner console.
 
+### AI assistant (optional)
+
+The AI assistant is disabled until configured. Provider keys are stored in the
+database, encrypted with `AI_KEY_SECRET` - set a random 32-byte value in `.env`
+(or the compose environment) and keep it stable, since changing it makes
+previously saved keys undecryptable. Then configure your model under
+Settings > AI (per user or per org; OpenAI-compatible, Azure, and Anthropic
+endpoints are supported). Without a saved profile the server can fall back to
+the optional `ANTHROPIC_API_KEY` / `AI_MODEL` environment variables. Web
+research, MCP tool servers, and skills are configured from the same Settings
+sections.
+
 ## Run it (self-hosted)
 
 Cortex ships as a single self-contained image — **one command, no domain, no

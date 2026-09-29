@@ -65,11 +65,13 @@ import {
   VscSettingsGear,
   VscSignOut,
   VscSplitHorizontal,
+  VscSparkle,
   VscTrash,
 } from "react-icons/vsc";
 import useLocalStorageState from "use-local-storage-state";
 
 import ActivityBar, { Section, groupLabel } from "./ActivityBar";
+import AiView from "./AiView";
 import ChatChannels, { ChatTarget } from "./ChatChannels";
 import ChatView, {
   ChatPrefs,
@@ -128,6 +130,21 @@ type ConfirmCfg = {
 type GroupState = { fileIds: number[]; activeId: number | null };
 const EMPTY_GROUPS: GroupState[] = [{ fileIds: [], activeId: null }];
 
+// A saved assistant conversation (stored locally - this machine only). `wsId`
+// scopes it to the workspace it belongs to.
+type Conversation = {
+  id: string;
+  title: string;
+  messages: api.AiMessage[];
+  updated: number;
+  wsId?: number;
+  // A title the user set via rename; persistConversation keeps it instead of
+  // re-deriving from the first user message.
+  customTitle?: string;
+  // Owner pinned it to the top of the history sidebar (syncs to the server).
+  pinned?: boolean;
+};
+
 // A path that doesn't collide with `existing`: "a.txt" → "a (1).txt" → "a (2).txt".
 function freePath(existing: Set<string>, path: string): string {
   if (!existing.has(path)) return path;
@@ -167,7 +184,7 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
     { defaultValue: "explorer" },
   );
   const section: Section =
-    sectionStored === "chat" || sectionStored === "explorer"
+    sectionStored === "chat" || sectionStored === "explorer" || sectionStored === "assistant"
       ? sectionStored
       : "explorer";
   const [chatTarget, setChatTarget] = useState<ChatTarget>({ kind: "group" });
@@ -245,6 +262,15 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
   readRef.current = read;
   const seeded = useRef(false);
   const [presence, setPresence] = useState<Record<number, boolean>>({});
+  // The assistant conversation open in the Assistant section (null = blank
+  // new-chat state). History is cached locally per workspace; conversations
+  // shared by teammates are fetched from the server.
+  const [convId, setConvId] = useState<string | null>(null);
+  const [conversations, setConversations] = useLocalStorageState<Conversation[]>(
+    "cortex-ai-conversations",
+    { defaultValue: [] },
+  );
+  const [sharedConvs, setSharedConvs] = useState<api.SharedConv[]>([]);
 
   const treeRef = useRef<FileTreeHandle>(null);
   const uploadInput = useRef<HTMLInputElement>(null);
@@ -713,6 +739,77 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
     return () => window.clearInterval(id);
   }, [section, settingsOpen, loadWs]);
 
+  const newConvId = () => `c${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
+
+  // Save (or update) a conversation by id. Empty ones are not stored.
+  function persistConversation(convId: string, msgs: api.AiMessage[]) {
+    const real = msgs.filter((m) => !m.note);
+    setConversations((cs) => {
+      const existing = cs.find((c) => c.id === convId);
+      const rest = cs.filter((c) => c.id !== convId);
+      if (real.length === 0) return rest;
+      const autoTitle = real.find((m) => m.role === "user")?.content.slice(0, 60) || "New chat";
+      const title = existing?.customTitle ?? autoTitle;
+      const wsId = existing?.wsId ?? activeWsId ?? undefined;
+      return [
+        {
+          id: convId,
+          title,
+          customTitle: existing?.customTitle,
+          pinned: existing?.pinned,
+          messages: msgs,
+          updated: Date.now(),
+          wsId,
+        },
+        ...rest,
+      ].slice(0, 200);
+    });
+  }
+
+  // Open a saved conversation (local cache or shared-with-me on the server).
+  function openConversation(id: string) {
+    setSidebarCollapsed(false);
+    if (conversations.some((c) => c.id === id)) {
+      setConvId(id);
+      return;
+    }
+    if (activeWsId == null) return;
+    api
+      .getSharedConversation(activeWsId, id)
+      .then((data) => {
+        persistConversation(id, data.messages);
+        setConvId(id);
+      })
+      .catch(() => toast({ title: "Couldn\x27t open the conversation", status: "error", duration: 4000 }));
+  }
+
+  // Always open a fresh conversation.
+  function newChat() {
+    setSidebarCollapsed(false);
+    setConvId(newConvId());
+  }
+
+  // Refresh the shared-conversation list for the active workspace (and
+  // whenever the Assistant section is entered).
+  useEffect(() => {
+    if (activeWsId == null) {
+      setSharedConvs([]);
+      return;
+    }
+    let stop = false;
+    api
+      .listSharedConversations(activeWsId)
+      .then((d) => {
+        if (!stop) setSharedConvs(d);
+      })
+      .catch(() => {
+        if (!stop) setSharedConvs([]);
+      });
+    return () => {
+      stop = true;
+    };
+  }, [activeWsId, section]);
+
   // Pick a group from the chat list: switch the conversation and STAY in chat
   // (the messenger flow), unlike the Explorer switcher which jumps to Explorer.
   function selectGroupChat(id: number) {
@@ -726,6 +823,7 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
     setGroups(EMPTY_GROUPS);
     setFocused(0);
     setSection("explorer");
+    setConvId(null);
     if (orgId == null) {
       const w = wsRef.current.find((x) => x.id === id);
       if (w) window.history.pushState({}, "", "/" + w.slug);
@@ -1436,6 +1534,33 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
     />
   );
 
+  // The conversation currently open in the Assistant section.
+  const currentConv = conversations.find((c) => c.id === convId && (c.wsId ?? activeWsId) === activeWsId);
+  // Local history plus server-shared rows, newest first, for the sidebar.
+  const assistantRows = [
+    ...conversations
+      .filter((c) => c.wsId === activeWsId)
+      .map((c) => ({ id: c.id, title: c.title, updated: c.updated, shared: false })),
+    ...sharedConvs.map((s) => ({ id: s.id, title: s.title, updated: s.updated_at, shared: !s.owner })),
+  ].sort((a, b) => b.updated - a.updated);
+  // Recents handed to AiView so its empty state can reopen past chats.
+  const recentConvs = assistantRows.slice(0, 8).map((r) => ({ id: r.id, title: r.title }));
+
+  const aiPane = (
+    <AiView
+      workspaceId={activeWsId}
+      convId={convId}
+      onFilesChanged={loadWs}
+      files={allFiles}
+      initialMessages={currentConv?.messages ?? []}
+      onPersist={(m) => convId && persistConversation(convId, m)}
+      recent={recentConvs}
+      onOpenConversation={openConversation}
+      members={org.members}
+      meId={myId ?? null}
+    />
+  );
+
   const recentFiles = (recents[activeWsId ?? -1] ?? [])
     .map((id) => filesById.get(id))
     .filter((f): f is FileRow => !!f)
@@ -1824,6 +1949,55 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
               onPrefsChange={setRawChatPrefs}
             />
           </Flex>
+        ) : section === "assistant" ? (
+          <Box flex={1} overflowY="auto" pb={2}>
+            <PanelHeader
+              title="Assistant"
+              icon={VscSparkle}
+              hue="accent.base"
+              actions={
+                <Tooltip label="New chat" openDelay={400}>
+                  <PanelIconButton
+                    aria-label="New chat"
+                    icon={<VscAdd />}
+                    color="accent.base"
+                    onClick={newChat}
+                  />
+                </Tooltip>
+              }
+            />
+            <Box px={2}>
+              {assistantRows.length === 0 ? (
+                <Text fontSize="xs" color="ink.subtle" px={2} py={2}>
+                  No conversations yet. Start a new chat to ask the
+                  assistant about this workspace.
+                </Text>
+              ) : (
+                assistantRows.map((row) => (
+                  <Box
+                    key={row.id}
+                    px={2}
+                    py={1.5}
+                    mb={0.5}
+                    borderRadius="md"
+                    cursor="pointer"
+                    bg={row.id === convId ? "surface.hover" : undefined}
+                    _hover={{ bg: "surface.hover" }}
+                    onClick={() => openConversation(row.id)}
+                  >
+                    <Text fontSize="sm" isTruncated color="ink.base">
+                      {row.title}
+                    </Text>
+                    {row.shared && (
+                      <Text fontSize="xs" color="ink.subtle">
+                        Shared with you
+                      </Text>
+                    )}
+                  </Box>
+                ))
+              )}
+            </Box>
+          </Box>
         ) : (
           <Box flex={1} overflowY="auto" pb={2}>
 
@@ -2012,6 +2186,8 @@ function WorkspaceApp({ me, orgId, initialWorkspaceId, fileClipboard: externalCl
       {/* Main pane — the editor, or the full-width chat when it is the section */}
       {section === "chat" && !settingsOpen ? (
         chatPane
+      ) : section === "assistant" && !settingsOpen ? (
+        aiPane
       ) : (
         <>
           <EditorPane

@@ -25,22 +25,33 @@ use tempfile::NamedTempFile;
 /// The fingerprint [`script`] leaves behind, taken from the code before content
 /// was routed per organization.
 ///
-/// Re-recorded once, when the fingerprint started normalising the schema text:
-/// `sqlx::migrate!` embeds each migration exactly as the checkout holds it, so a
-/// CRLF working tree stored a `CREATE TABLE` carrying a `\r` per line and an LF
-/// one did not. The two values differed (`1ee336a…` against `ba1c12d…`) while
-/// every row and every table matched, which is the signature of a canary
-/// measuring line endings rather than stored data. Both trees now agree on the
-/// value below, so it says what an install stores, not which checkout ran it.
+/// The shape a default install stores today, and the history of how it got here.
 ///
-/// Re-recorded again for organization data keys, and the reason is measured rather
-/// than assumed: with this one table removed from the hash the script reproduces
-/// the previous value exactly, so the whole difference is a `CREATE TABLE` that a
-/// default install leaves empty. That is true because `BLOB_BACKEND` is unset here
-/// — an inline install stores bytes in rows, has nothing to seal, and must not mint
-/// a key it would only misreport. Sealing therefore changes what a *filesystem
-/// object store* holds, which this test does not claim to cover.
-const BEFORE_ROUTING: &str = "eab70ba465436312c90fec8865db9e0b14916c70596fc424833fa13ef5b18f31";
+/// The rule this file enforces is not "the hash never changes" — schema changes
+/// are the job. It is that a change may only add what it says it added. For an
+/// added *table* that is provable: exclude exactly the objects you introduced and
+/// the previous value must come back byte for byte. That is how `V0_1_3`
+/// (`eab70ba4…`, through migration 38) was proven against `BEFORE_AGENTS`
+/// (`e5dadac1…`, through migration 39) — dropping the seven `ai_*` objects
+/// migration 39 re-created reproduced the older value exactly.
+///
+/// An added **column** cannot be proven that way, and pretending otherwise would
+/// make this canary mean nothing. `ALTER TABLE users ADD COLUMN kind` rewrites the
+/// stored `CREATE TABLE` text for a table that already existed, so no filter over
+/// objects or row columns reproduces a pre-column hash; the two older values above
+/// are therefore recorded as history and are no longer asserted. What replaces them
+/// is a direct claim about the data, in the test below: the new table is empty on a
+/// default install, and the new column says `'human'` about every account that
+/// already existed. That is the fact a reader actually wants, and unlike a hash it
+/// cannot be satisfied by editing the hash.
+///
+/// `V0_1_3` itself was re-recorded once for line endings: `sqlx::migrate!` embeds
+/// each migration exactly as the checkout holds it, so a CRLF tree stored a
+/// `CREATE TABLE` carrying a `\r` per line and an LF one did not. Two trees
+/// produced different hashes while every row and table matched, which is the
+/// signature of a canary measuring git configuration instead of stored data. The
+/// schema text is normalised for that reason.
+const CURRENT_SHAPE: &str = "760d43c44771b5ae44f2dc17eb3d98424ed582654bf46b5e0157693934a6e5d0";
 
 /// Tables that say nothing about the data an install holds: `PRAGMA optimize`
 /// fills the first from a random sample of rows, and sqlx writes how long each
@@ -136,6 +147,21 @@ async fn laid_out(with_registry: bool) -> Result<String> {
         assert_eq!(db.migrate_content_to_orgs().await?, 0, "and nothing to move");
     }
     script(&db).await?;
+    // The claim that stands in for a reproduced hash: what the newest migrations
+    // added is structure a default install does not use. `bots` holds nothing until
+    // an organization is given an agent, `org_keys` nothing until an object store
+    // has content to seal, and `kind` says `'human'` about every account that
+    // already existed — so an install with no agents stores no agent data at all.
+    let (bots,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM bots").fetch_one(db.read_only()).await?;
+    assert_eq!(bots, 0, "a default install created an agent");
+    let (keys,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM org_keys").fetch_one(db.read_only()).await?;
+    assert_eq!(keys, 0, "a default install minted an organization key");
+    let (not_human,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE kind <> 'human'")
+        .fetch_one(db.read_only())
+        .await?;
+    assert_eq!(not_human, 0, "an account that already existed stopped meaning a person");
     let sum = fingerprint(&db).await?;
     assert_eq!(
         orgs.path().read_dir()?.count(),
@@ -186,7 +212,7 @@ async fn script(db: &Database) -> Result<()> {
 async fn a_single_mode_install_stores_what_it_always_stored() -> Result<()> {
     let once = laid_out(false).await?;
     assert_eq!(
-        once, BEFORE_ROUTING,
+        once, CURRENT_SHAPE,
         "an install that never turned on per-organization databases stores something else now"
     );
     assert_eq!(laid_out(false).await?, once, "the fingerprint is not stable run to run");
