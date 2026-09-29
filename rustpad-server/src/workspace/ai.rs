@@ -199,6 +199,18 @@ struct ResolvedProvider {
 
 fn resolve_row(row: crate::database::ProviderRow, source: &'static str) -> Option<ResolvedProvider> {
     let key = crypto::secret_decrypt(&row.key_cipher)?;
+    // Checked here, at the one place a stored row becomes usable, rather than at
+    // each of the three call sites that sends it: a row saved before this check
+    // existed must not be able to carry an organization's key to the container's
+    // own admin port. A row that fails is unusable, which the resolver already
+    // treats as "no provider configured" — the honest answer, and never a
+    // connection.
+    if let Some(base) = row.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Err(e) = validate_provider_base(base) {
+            log::warn!("AI provider profile '{}' is not usable: {e}", row.name);
+            return None;
+        }
+    }
     Some(ResolvedProvider {
         name: row.name,
         provider: row.provider,
@@ -246,6 +258,99 @@ async fn resolve_provider(db: &Database, user: &User, profile: Option<&str>) -> 
 
 fn trim_url(base: &str) -> &str {
     base.trim().trim_end_matches('/')
+}
+
+/// The HTTP client every assistant request goes out on.
+///
+/// Redirects are refused rather than followed: the check on a stored base URL is
+/// a check on *that* address, and a public host that answers 302 with an internal
+/// one would carry the organization's key through it. `mcp.rs` and `search.rs`
+/// already pin their clients the same way.
+fn ai_client(seconds: u64) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(seconds))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "AI client init failed".to_string())
+}
+
+/// Whether this operator is allowed to point the assistant at a host on the
+/// private network.
+fn private_base_allowed() -> bool {
+    matches!(
+        std::env::var("AI_ALLOW_PRIVATE_BASE").ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// An address that is never a model server, private setting or not.
+///
+/// `169.254.0.0/16` is where a cloud instance hands out its credentials, and
+/// `is_unspecified` covers `0.0.0.0` and the odd forms that hide private address
+/// space inside an IPv6 literal.
+fn never_a_host(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_link_local() || v4.is_unspecified(),
+            // fe80::/10 is the v6 link-local range, which `IpAddr` has no helper
+            // for and which `mcp.rs`'s public test already covers separately.
+            None => v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+        },
+    }
+}
+
+/// Where a stored provider base URL may point.
+///
+/// This is user input the server itself connects to, with the organization's API
+/// key in the header, so an unvalidated one is a request-forgery primitive
+/// against the container's own private network — and the response came back to the
+/// caller in the error text. Public hosts must be https, because a plaintext hop
+/// would carry the key. Private and loopback hosts are refused too unless
+/// `AI_ALLOW_PRIVATE_BASE` is set: running a local model is a real reason people
+/// self-host this, and the alternative is breaking them.
+fn validate_provider_base(raw: &str) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+    let url = reqwest::Url::parse(raw.trim()).map_err(|_| "provider URL is not a valid URL")?;
+    match url.scheme() {
+        "https" => {}
+        "http" if private_base_allowed() => {}
+        "http" => {
+            return Err(
+                "provider URLs must be https; set AI_ALLOW_PRIVATE_BASE for a local model".into(),
+            )
+        }
+        other => return Err(format!("unsupported provider URL scheme '{other}'")),
+    }
+    let host = url.host_str().ok_or("provider URL has no host")?;
+    let port = url.port_or_known_default().ok_or("provider URL has no port")?;
+    let named_locally = host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".localhost")
+        || host.ends_with(".local");
+    if named_locally && !private_base_allowed() {
+        return Err("localhost providers need AI_ALLOW_PRIVATE_BASE".into());
+    }
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| "could not resolve the provider host")?;
+    let mut resolved = false;
+    for addr in addrs {
+        resolved = true;
+        if never_a_host(addr.ip()) {
+            return Err("the provider host resolves to a link-local address".into());
+        }
+        if !crate::mcp::ip_is_public(addr.ip()) && !private_base_allowed() {
+            return Err(
+                "the provider host resolves to a private address; set AI_ALLOW_PRIVATE_BASE \
+                 to use a local model"
+                    .into(),
+            );
+        }
+    }
+    if !resolved {
+        return Err("could not resolve the provider host".into());
+    }
+    Ok(())
 }
 
 /// Build the Azure OpenAI chat-completions URL for a given deployment base URL.
@@ -296,10 +401,7 @@ async fn post_provider(
     prov: &ResolvedProvider,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|_| "AI client init failed".to_string())?;
+    let client = ai_client(120)?;
 
     // "openai" and "azure" share the Chat Completions wire format; only the URL
     // and auth header differ.
@@ -2249,10 +2351,7 @@ async fn stream_anthropic_round(
     tools: &serde_json::Value,
     thinking: bool,
 ) -> Result<AnthRound, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-        .map_err(|_| "AI client init failed".to_string())?;
+    let client = ai_client(180)?;
     let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.anthropic.com");
     // Extended thinking needs headroom: max_tokens must exceed the thinking
     // budget, and temperature must stay default (we never set it).
@@ -2742,10 +2841,7 @@ async fn stream_openai_round(
     tools: &serde_json::Value,
     use_tools: bool,
 ) -> Result<OpenAiRound, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-        .map_err(|_| "AI client init failed".to_string())?;
+    let client = ai_client(180)?;
 
     let mut oai_msgs = vec![json!({ "role": "system", "content": system })];
     oai_msgs.extend(messages.iter().cloned());
@@ -5103,6 +5199,10 @@ fn parse_github_repo(url: &str) -> Option<(String, String)> {
 fn github_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
+        // The host is pinned by `parse_github_repo`, so this is defence in depth
+        // rather than the control: a redirect from GitHub still should not be able
+        // to take the request somewhere else.
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("cortex-ai-skills")
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
@@ -5719,6 +5819,13 @@ async fn set_ai_provider(user: User, db: Database, body: ProviderBody) -> Result
         },
     };
     let base = body.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    // Refused at the door rather than at the request: a saved row that cannot be
+    // used later would look configured until the turn that tried it.
+    if let Some(b) = base {
+        if let Err(e) = validate_provider_base(b) {
+            return Ok(err(StatusCode::BAD_REQUEST, &e));
+        }
+    }
     if db
         .upsert_provider(scope, scope_id, &name, &body.provider, base, body.model.trim(), &key_cipher, now_secs())
         .await
@@ -5825,6 +5932,15 @@ async fn test_ai_provider(user: User, db: Database, body: ProviderBody) -> Resul
         }
         _ => return Ok(err(StatusCode::BAD_REQUEST, "bad scope")),
     };
+    // "Test connection" is the sharpest version of this hole: it connects to
+    // whatever URL the body carries without saving anything, so any signed-in user
+    // could aim the server at its own admin port and read the answer back. Same
+    // rule as the saved rows, applied before the request is built.
+    if let Some(b) = body.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Err(e) = validate_provider_base(b) {
+            return Ok(err(StatusCode::BAD_REQUEST, &e));
+        }
+    }
 
     let api_key = match body.key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
         Some(k) => k.to_string(),
@@ -6125,6 +6241,34 @@ pub(crate) fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error
 mod tests {
     use super::ai_clean_path;
     use super::{agent_short_name, ai_orchestrator_prompt, ai_tool_defs, anthropic_wire_content, apply_exact_patch, azure_chat_url, ctx_window, extra_ui_paths, fileish_paths, fmt_tok_i64, format_sibling_brief, full_replace_reject, looks_like_ui_work, mentioned_paths, oai_text_of, openai_usage_of, parse_frontmatter, parse_github_repo, tool_arg_preview, tool_round_key, tool_summary, usage_json, wire_args, wire_tool_result, write_ok, ToolFlags, UsageTotals};
+
+    #[test]
+    fn a_provider_url_cannot_point_at_the_private_network() {
+        use super::validate_provider_base;
+        // Addresses, not hostnames: a test that needs DNS is a test that fails on a
+        // plane, and the rule being checked is about where an address is.
+        assert!(validate_provider_base("https://8.8.8.8/v1").is_ok());
+        for bad in [
+            // The cloud's credential endpoint, and the container's own admin port.
+            "http://169.254.169.254/latest/meta-data/",
+            "https://169.254.169.254/",
+            "http://127.0.0.1:2019/config/",
+            "https://10.0.0.5/v1",
+            "https://192.168.1.1/v1",
+            "http://[::1]:11434",
+            // Not a network address at all.
+            "file:///etc/passwd",
+            "gopher://example.com",
+            "not a url",
+            "",
+        ] {
+            assert!(validate_provider_base(bad).is_err(), "accepted {bad:?}");
+        }
+        // The refusal says how to proceed, because a local model server is a
+        // legitimate thing to run and the operator needs to know a switch exists.
+        let err = validate_provider_base("http://127.0.0.1:11434").unwrap_err();
+        assert!(err.contains("AI_ALLOW_PRIVATE_BASE"), "unhelpful refusal: {err}");
+    }
 
     #[test]
     fn frontmatter_parses_common_shapes() {

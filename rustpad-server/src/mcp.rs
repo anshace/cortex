@@ -94,7 +94,11 @@ pub fn validate_remote_url(raw: &str) -> Result<String, String> {
     validate_public_https(raw, "MCP")
 }
 
-fn ip_is_public(ip: IpAddr) -> bool {
+/// True for an address the server may connect to on behalf of a stored URL
+/// without being told where it actually lands. `pub(crate)` because the AI
+/// provider path needs the same judgement about a different kind of URL, and a
+/// second copy of these rules is how one of them stops being updated.
+pub(crate) fn ip_is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
             !(v.is_loopback()
