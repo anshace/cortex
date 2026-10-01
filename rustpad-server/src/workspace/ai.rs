@@ -260,18 +260,29 @@ fn trim_url(base: &str) -> &str {
     base.trim().trim_end_matches('/')
 }
 
-/// The HTTP client every assistant request goes out on.
+/// The HTTP client every assistant request goes out on, pinned to `url`'s host.
 ///
 /// Redirects are refused rather than followed: the check on a stored base URL is
 /// a check on *that* address, and a public host that answers 302 with an internal
 /// one would carry the organization's key through it. `mcp.rs` and `search.rs`
 /// already pin their clients the same way.
-fn ai_client(seconds: u64) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(seconds))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "AI client init failed".to_string())
+///
+/// The pin matters because `validate_provider_base` resolves the name to decide
+/// whether it is safe, and a plain client resolves it again when connecting; with
+/// a short TTL those are two different answers, and only the first was checked.
+/// `AI_ALLOW_PRIVATE_BASE` is passed through to the shared rule rather than
+/// reimplemented here, so link-local stays closed either way.
+fn ai_client(seconds: u64, url: &str) -> Result<reqwest::Client, String> {
+    mcp::pin_client_allowing(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(seconds))
+            .redirect(reqwest::redirect::Policy::none()),
+        url,
+        "Provider",
+        private_base_allowed(),
+    )?
+    .build()
+    .map_err(|_| "AI client init failed".to_string())
 }
 
 /// Whether this operator is allowed to point the assistant at a host on the
@@ -281,23 +292,6 @@ fn private_base_allowed() -> bool {
         std::env::var("AI_ALLOW_PRIVATE_BASE").ok().as_deref().map(str::trim),
         Some("1") | Some("true") | Some("yes")
     )
-}
-
-/// An address that is never a model server, private setting or not.
-///
-/// `169.254.0.0/16` is where a cloud instance hands out its credentials, and
-/// `is_unspecified` covers `0.0.0.0` and the odd forms that hide private address
-/// space inside an IPv6 literal.
-fn never_a_host(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
-        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => v4.is_link_local() || v4.is_unspecified(),
-            // fe80::/10 is the v6 link-local range, which `IpAddr` has no helper
-            // for and which `mcp.rs`'s public test already covers separately.
-            None => v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80,
-        },
-    }
 }
 
 /// Where a stored provider base URL may point.
@@ -336,7 +330,7 @@ fn validate_provider_base(raw: &str) -> Result<(), String> {
     let mut resolved = false;
     for addr in addrs {
         resolved = true;
-        if never_a_host(addr.ip()) {
+        if mcp::never_a_host(addr.ip()) {
             return Err("the provider host resolves to a link-local address".into());
         }
         if !crate::mcp::ip_is_public(addr.ip()) && !private_base_allowed() {
@@ -394,6 +388,27 @@ fn short_detail(s: &str) -> String {
     if short.len() < t.len() { format!("{}…", short) } else { short }
 }
 
+/// The URL a resolved provider's chat call goes to.
+///
+/// Split out of `post_provider` because the client is built from it: the pin has
+/// to know the host before the request exists, and one URL rule shared by the
+/// builder and the caller is what keeps them from disagreeing.
+fn provider_url(prov: &ResolvedProvider) -> Result<String, String> {
+    if prov.provider == "azure" {
+        let base = match prov.base_url.as_deref() {
+            Some(b) if !b.trim().is_empty() => b,
+            _ => return Err("Azure needs the deployment base URL".to_string()),
+        };
+        Ok(azure_chat_url(base, &prov.model))
+    } else if prov.provider == "openai" {
+        let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.openai.com/v1");
+        Ok(format!("{}/chat/completions", base))
+    } else {
+        let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.anthropic.com");
+        Ok(format!("{}/v1/messages", base))
+    }
+}
+
 /// Post an already-built request body to the resolved provider and return the
 /// parsed JSON response. The single place outbound AI HTTP happens (URL, auth,
 /// error shaping), shared by the plain completion and the tool loop.
@@ -401,31 +416,18 @@ async fn post_provider(
     prov: &ResolvedProvider,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let client = ai_client(120)?;
+    let url = provider_url(prov)?;
+    let client = ai_client(120, &url)?;
 
     // "openai" and "azure" share the Chat Completions wire format; only the URL
     // and auth header differ.
-    let openai_style = prov.provider == "openai" || prov.provider == "azure";
-    let req = if openai_style {
-        if prov.provider == "azure" {
-            let base = match prov.base_url.as_deref() {
-                Some(b) if !b.trim().is_empty() => b,
-                _ => return Err("Azure needs the deployment base URL".to_string()),
-            };
-            client
-                .post(azure_chat_url(base, &prov.model))
-                .header("api-key", prov.api_key.clone())
-        } else {
-            let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.openai.com/v1");
-            client
-                .post(format!("{}/chat/completions", base))
-                .header("authorization", format!("Bearer {}", prov.api_key))
-        }
+    let req = client.post(&url);
+    let req = if prov.provider == "azure" {
+        req.header("api-key", prov.api_key.clone())
+    } else if prov.provider == "openai" {
+        req.header("authorization", format!("Bearer {}", prov.api_key))
     } else {
-        let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.anthropic.com");
-        client
-            .post(format!("{}/v1/messages", base))
-            .header("x-api-key", prov.api_key.clone())
+        req.header("x-api-key", prov.api_key.clone())
             .header("anthropic-version", "2023-06-01")
     };
 
@@ -2364,8 +2366,8 @@ async fn stream_anthropic_round(
     tools: &serde_json::Value,
     thinking: bool,
 ) -> Result<AnthRound, String> {
-    let client = ai_client(180)?;
-    let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.anthropic.com");
+    let url = provider_url(prov)?;
+    let client = ai_client(180, &url)?;
     // Extended thinking needs headroom: max_tokens must exceed the thinking
     // budget, and temperature must stay default (we never set it).
     // Prompt caching: mark the last message with a cache breakpoint so the whole
@@ -2385,7 +2387,7 @@ async fn stream_anthropic_round(
         req["thinking"] = json!({ "type": "enabled", "budget_tokens": 4000 });
     }
     let resp = client
-        .post(format!("{}/v1/messages", base))
+        .post(&url)
         .header("x-api-key", prov.api_key.clone())
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
@@ -2854,7 +2856,8 @@ async fn stream_openai_round(
     tools: &serde_json::Value,
     use_tools: bool,
 ) -> Result<OpenAiRound, String> {
-    let client = ai_client(180)?;
+    let url = provider_url(prov)?;
+    let client = ai_client(180, &url)?;
 
     let mut oai_msgs = vec![json!({ "role": "system", "content": system })];
     oai_msgs.extend(messages.iter().cloned());
@@ -2877,13 +2880,12 @@ async fn stream_openai_round(
     let mut cap_idx = 0usize;
     let mut attempt = 0usize;
     let resp = loop {
+        // "openai" and "azure" share this wire format and differ only in the auth
+        // header; the URL came from `provider_url`, which is also what the client
+        // was pinned to.
         let r = if prov.provider == "azure" {
-            let base = match prov.base_url.as_deref() {
-                Some(b) if !b.trim().is_empty() => b,
-                _ => return Err("Azure needs the deployment base URL".to_string()),
-            };
             client
-                .post(azure_chat_url(base, &prov.model))
+                .post(&url)
                 .header("api-key", prov.api_key.clone())
                 .header("content-type", "application/json")
                 .json(&req)
@@ -2891,9 +2893,8 @@ async fn stream_openai_round(
                 .await
                 .map_err(|_| "could not reach the AI service".to_string())?
         } else {
-            let base = prov.base_url.as_deref().map(trim_url).unwrap_or("https://api.openai.com/v1");
             client
-                .post(format!("{}/chat/completions", base))
+                .post(&url)
                 .header("authorization", format!("Bearer {}", prov.api_key))
                 .header("content-type", "application/json")
                 .json(&req)
@@ -6296,6 +6297,23 @@ mod tests {
         // legitimate thing to run and the operator needs to know a switch exists.
         let err = validate_provider_base("http://127.0.0.1:11434").unwrap_err();
         assert!(err.contains("AI_ALLOW_PRIVATE_BASE"), "unhelpful refusal: {err}");
+    }
+
+    #[test]
+    fn the_provider_client_is_pinned_to_the_address_it_checked() {
+        use super::ai_client;
+        // `validate_provider_base` resolves the host to decide whether it is safe;
+        // a plain client resolved it a second time when connecting, so the answer
+        // that carried the organization's key was never the one that was checked.
+        // The client is now built from the URL it is about to post to.
+        let e = ai_client(1, "http://127.0.0.1:11434/v1/chat/completions").unwrap_err();
+        assert!(e.contains("private or loopback"), "{e}");
+        let e = ai_client(1, "http://169.254.169.254/latest/meta-data/").unwrap_err();
+        assert!(e.contains("link-local or unspecified"), "{e}");
+        // And it still works for a real provider address, or every deployment
+        // would fail closed and look like a dead key instead. Literal, like the
+        // test above: a test that needs DNS is a test that fails on a plane.
+        assert!(ai_client(1, "https://8.8.8.8/v1/chat/completions").is_ok());
     }
 
     #[test]

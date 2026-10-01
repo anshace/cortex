@@ -151,6 +151,22 @@ pub(crate) fn pin_client(
     raw: &str,
     kind: &str,
 ) -> Result<reqwest::ClientBuilder, String> {
+    pin_client_allowing(builder, raw, kind, false)
+}
+
+/// The same, with the private range opened by the caller.
+///
+/// `allow_private` exists for one legitimate case: a self-hosted install pointing
+/// the assistant at a model on localhost, which the operator opted into with
+/// `AI_ALLOW_PRIVATE_BASE`. Even then the link-local and unspecified ranges stay
+/// closed, because that is where a cloud hands out credentials and no model server
+/// lives there.
+pub(crate) fn pin_client_allowing(
+    builder: reqwest::ClientBuilder,
+    raw: &str,
+    kind: &str,
+    allow_private: bool,
+) -> Result<reqwest::ClientBuilder, String> {
     let url = reqwest::Url::parse(raw.trim()).map_err(|_| "not a valid URL".to_string())?;
     let host = url.host_str().ok_or("URL is missing a host")?;
     let port = url.port_or_known_default().ok_or("URL has no port")?;
@@ -164,11 +180,29 @@ pub(crate) fn pin_client(
     // Re-checked here rather than trusted from the caller, because the pin is the
     // thing that actually decides where the socket goes.
     for addr in &addrs {
-        if !ip_is_public(addr.ip()) {
+        if never_a_host(addr.ip()) {
+            return Err(format!("{kind} URL resolves to a link-local or unspecified address"));
+        }
+        if !allow_private && !ip_is_public(addr.ip()) {
             return Err(format!("{kind} URL resolves to a private or loopback address"));
         }
     }
     Ok(builder.resolve_to_addrs(host, &addrs))
+}
+
+/// An address that is never a real server, whatever the operator allowed: the
+/// link-local range, where a cloud instance hands out its credentials, and the
+/// forms that hide private address space inside an IPv6 literal.
+pub(crate) fn never_a_host(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_link_local() || v4.is_unspecified(),
+            // fe80::/10 is the v6 link-local range, which `IpAddr` has no helper
+            // for and which `ip_is_public`'s tests already cover separately.
+            None => v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+        },
+    }
 }
 
 fn pinned_client(url: &str) -> Result<reqwest::Client, String> {
@@ -471,7 +505,7 @@ mod tests {
         for bad in [
             "http://127.0.0.1:8080/mcp",
             "http://10.0.0.5/mcp",
-            "http://169.254.169.254/latest/meta-data/",
+            "http://192.168.1.1/mcp",
             "http://[::1]:8080/mcp",
         ] {
             let r = pin_client(reqwest::Client::builder(), bad, "Fetch");
@@ -481,6 +515,36 @@ mod tests {
                 "refused {bad:?} for the wrong reason"
             );
         }
+    }
+
+    #[test]
+    fn the_credential_range_stays_closed_even_when_private_is_allowed() {
+        // `allow_private` is a switch for a local model server, not a licence to
+        // read the cloud's credentials back. 169.254.0.0/16 and the unspecified
+        // address are refused with the flag on, which is the difference between
+        // that switch and having no control at all.
+        for never in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://169.254.1.1/",
+            "http://0.0.0.0:11434/v1",
+            "http://[fe80::1]:11434/v1",
+        ] {
+            let r = pin_client_allowing(reqwest::Client::builder(), never, "Provider", true);
+            assert!(r.is_err(), "pinned a credential-range address for {never:?}");
+            assert!(
+                r.unwrap_err().contains("link-local or unspecified"),
+                "refused {never:?} for the wrong reason"
+            );
+        }
+    }
+
+    #[test]
+    fn the_private_switch_opens_loopback_and_nothing_else() {
+        // With the flag on, a localhost model server is reachable — that is the
+        // whole point of the switch. Public answers are fine either way.
+        assert!(pin_client_allowing(reqwest::Client::builder(), "http://127.0.0.1:11434/v1", "Provider", true).is_ok());
+        assert!(pin_client(reqwest::Client::builder(), "http://127.0.0.1:11434/v1", "Provider").is_err());
+        assert!(pin_client_allowing(reqwest::Client::builder(), "https://8.8.8.8/v1", "Provider", true).is_ok());
     }
 
     #[test]
