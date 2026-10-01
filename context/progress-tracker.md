@@ -15,6 +15,20 @@ Concrete, verified state. A unit moves to Complete only with what proves it.
 
 ## Completed
 
+- **Provider pin and remote caps** (`ai-assistant`, unmerged) — the assistant's
+  client now goes through `mcp::pin_client_allowing`, so the address
+  `validate_provider_base` judged is the address the socket uses;
+  `AI_ALLOW_PRIVATE_BASE` became an argument to the shared rule instead of a
+  second rule set, and `never_a_host` moved to `mcp.rs` with its private copy
+  deleted. Every remaining remote read is bounded: the three provider error bodies,
+  both SSE streams (`add_within_cap` folds each chunk into a running total, because
+  a remote chooses how it splits a body), and the GitHub skill catalog and
+  SKILL.md fetches. Proof: 3 new tests; un-pinning `ai_client` breaks its test,
+  disabling the link-local branch admits `169.254.169.254` with the flag on, and
+  widening the cap lets 8 MB in 8 KB chunks through. What is *not* covered by a
+  test: the one-line wiring of the cap into the stream loops — proving that needs a
+  live provider stub, and `AI_ALLOW_PRIVATE_BASE` is process-global, so a test that
+  set it would race every other test in the binary. `npm test` 153 passed / 0 failed.
 - **MCP and fetch rebinding + response caps** (`ai-assistant`, unmerged) — the two
   audit findings that lived outside `ai.rs`. `mcp::pin_client` is now the single
   place a URL is resolved, refused if any answer is private, and pinned with

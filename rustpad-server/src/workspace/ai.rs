@@ -439,7 +439,7 @@ async fn post_provider(
         .map_err(|_| "could not reach the AI service".to_string())?;
     if !resp.status().is_success() {
         let code = resp.status();
-        let detail = resp.text().await.unwrap_or_default();
+        let detail = mcp::read_capped(resp, "Provider").await.unwrap_or_default();
         log::warn!("AI provider error {}: {}", code, detail);
         return Err(format!("provider returned {} — {}", code.as_u16(), short_detail(&detail)));
     }
@@ -2397,7 +2397,7 @@ async fn stream_anthropic_round(
         .map_err(|_| "could not reach the AI service".to_string())?;
     if !resp.status().is_success() {
         let code = resp.status();
-        let detail = resp.text().await.unwrap_or_default();
+        let detail = mcp::read_capped(resp, "Provider").await.unwrap_or_default();
         log::warn!("AI provider error {}: {}", code, detail);
         return Err(format!("provider returned {} — {}", code.as_u16(), short_detail(&detail)));
     }
@@ -2412,9 +2412,14 @@ async fn stream_anthropic_round(
     let mut cache_creation = 0i64;
     let mut cost = 0f64;
     let mut cost_reported = false;
+    // The stream is bounded too: a remote that never sends `message_stop` would
+    // otherwise keep appending here until the container died, and the SSE frames
+    // are not parseable after the fact anyway.
+    let mut wire = 0u64;
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|_| "stream interrupted".to_string())?;
+        mcp::add_within_cap(&mut wire, bytes.len(), "Provider stream")?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
         // Each SSE event is terminated by a blank line; the `data:` line holds JSON.
         while let Some(raw) = sse_take_event(&mut buf) {
@@ -2906,7 +2911,7 @@ async fn stream_openai_round(
             break r;
         }
         let code = r.status();
-        let detail = r.text().await.unwrap_or_default();
+        let detail = mcp::read_capped(r, "Provider").await.unwrap_or_default();
         // 400/422 are shape/config rejections we can sometimes fix:
         //   attempt 0 -> drop `stream_options` (some gateways reject it)
         //   attempts 1.. -> step max-tokens down (some gateways cap it)
@@ -2934,9 +2939,12 @@ async fn stream_openai_round(
     let mut stop_reason: Option<String> = None;
     let mut usage: Option<(i64, i64, i64, i64, i64, f64, bool)> = None;
     let mut delta_fields: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Bounded like the Anthropic stream: the remote decides how much arrives.
+    let mut wire = 0u64;
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|_| "stream interrupted".to_string())?;
+        mcp::add_within_cap(&mut wire, bytes.len(), "Provider stream")?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
         // Each SSE event is terminated by a blank line; the `data:` line holds JSON.
         while let Some(raw) = sse_take_event(&mut buf) {
@@ -5245,7 +5253,10 @@ async fn fetch_github_catalog(owner: &str, repo: &str) -> Vec<GithubSkillMeta> {
         if !resp.status().is_success() {
             continue;
         }
-        let Ok(tree) = resp.json::<serde_json::Value>().await else { continue };
+        // A recursive tree of a huge repo is exactly the unbounded body this
+        // container cannot afford to buffer, and the catalog shows 40 skills.
+        let Ok(text) = mcp::read_capped(resp, "Skill catalog").await else { continue };
+        let Ok(tree) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
         let mut metas = Vec::new();
         if let Some(entries) = tree.get("tree").and_then(|t| t.as_array()) {
             for e in entries {
@@ -5295,7 +5306,7 @@ async fn fetch_skill_description(
         owner, repo, branch, path
     );
     if let Ok(resp) = client.get(&raw).send().await {
-        if let Ok(text) = resp.text().await {
+        if let Ok(text) = mcp::read_capped(resp, "Skill").await {
             let (_, desc, _) = parse_frontmatter(&text);
             if !desc.is_empty() {
                 return desc;
@@ -5321,7 +5332,7 @@ async fn fetch_github_skill(owner: &str, repo: &str, name: &str) -> Option<Strin
             );
             if let Ok(resp) = client.get(&url).send().await {
                 if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
+                    if let Ok(text) = mcp::read_capped(resp, "Skill").await {
                         return Some(text);
                     }
                 }

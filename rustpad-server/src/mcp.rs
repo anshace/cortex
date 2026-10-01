@@ -225,6 +225,22 @@ fn pinned_client(url: &str) -> Result<reqwest::Client, String> {
 /// same rule where it was missing.
 pub(crate) const MAX_REMOTE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Fold one chunk into a running byte total, refusing past the cap.
+///
+/// A body read in one go and a stream consumed piece by piece are the same risk,
+/// so they share one rule: an unbounded read is decided by the remote, and on one
+/// small container that is one request away from an outage for everyone.
+pub(crate) fn add_within_cap(seen: &mut u64, len: usize, kind: &str) -> Result<(), String> {
+    *seen += len as u64;
+    if *seen > MAX_REMOTE_BYTES {
+        return Err(format!(
+            "{kind} exceeded the {} MB limit",
+            MAX_REMOTE_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
 /// Read a response body, refusing one that exceeds the cap.
 ///
 /// The length is checked while streaming rather than from `content-length` alone,
@@ -234,11 +250,10 @@ pub(crate) async fn read_capped(res: reqwest::Response, kind: &str) -> Result<St
     use futures::StreamExt;
     let mut stream = res.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
+    let mut seen = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("{kind} response body: {e}"))?;
-        if (buf.len() + chunk.len()) as u64 > MAX_REMOTE_BYTES {
-            return Err(format!("{kind} response exceeded the {} MB limit", MAX_REMOTE_BYTES / (1024 * 1024)));
-        }
+        add_within_cap(&mut seen, chunk.len(), kind)?;
         buf.extend_from_slice(&chunk);
     }
     String::from_utf8(buf).map_err(|_| format!("{kind} response was not valid UTF-8"))
@@ -552,6 +567,29 @@ mod tests {
         // The other half: it must not refuse everything, or the pin looks like a
         // working control while no MCP server or page is ever reachable.
         assert!(pin_client(reqwest::Client::builder(), "https://93.184.216.34/mcp", "MCP").is_ok());
+    }
+
+    #[test]
+    fn the_cap_counts_the_running_total_not_the_chunk_that_arrives() {
+        // A remote chooses how to split its body, so the chunk that crosses the
+        // line is never the interesting one — the sum is. 8 MB in 8 KB pieces must
+        // trip at exactly the point where the total passes 4 MB.
+        let mut seen = 0u64;
+        let mut tripped = None;
+        for i in 0..1000u64 {
+            if let Err(e) = add_within_cap(&mut seen, 8 * 1024, "Provider") {
+                tripped = Some((i, e));
+                break;
+            }
+        }
+        let (i, e) = tripped.expect("8 MB arrived in 8 KB chunks and nothing refused it");
+        assert_eq!(i, MAX_REMOTE_BYTES / (8 * 1024), "the total drifted from the chunks");
+        assert!(e.contains("exceeded"), "{e}");
+
+        // Exactly at the cap is allowed; one byte over is not.
+        let mut at = MAX_REMOTE_BYTES - 1;
+        assert!(add_within_cap(&mut at, 1, "Provider").is_ok(), "refused a body exactly at the cap");
+        assert!(add_within_cap(&mut at, 1, "Provider").is_err(), "one byte past the cap got through");
     }
 
     #[tokio::test]
