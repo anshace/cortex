@@ -15,6 +15,20 @@ Concrete, verified state. A unit moves to Complete only with what proves it.
 
 ## Completed
 
+- **Membership re-checked at the assistant's write seams** (`ai-assistant`,
+  unmerged) — a turn runs detached from its request, so `ensure_ws` at entry could
+  be minutes stale and a removed member kept writing. `ensure_ws`'s rules are now
+  extracted into `ws_access`, which answers `Forbidden` or `Unavailable` instead of
+  a warp rejection, and `may_write` calls it before every `create_file` /
+  `edit_file` / `patch_file` and inside `write_workspace_text` (which is what
+  `remember` writes through). Reads stay open on purpose. Proof: written RED — the
+  test reproduced "created 'after.txt'" for a removed member — and each seam
+  mutation-checked separately (removing only the `write_workspace_text` guard makes
+  the `remember` assertion fail, not the file-tool one). Known gap kept honest:
+  `Unavailable` has no test, because producing a DB error on demand needs a
+  poisoned pool, and `ensure_ws`'s HTTP routes still answer a DB error with `403`
+  exactly as before (the #31-class swallow), now recorded as an open issue rather
+  than quietly changed under every route. 154 lib tests, clippy clean.
 - **Provider pin and remote caps** (`ai-assistant`, unmerged) — the assistant's
   client now goes through `mcp::pin_client_allowing`, so the address
   `validate_provider_base` judged is the address the socket uses;

@@ -173,32 +173,66 @@ async fn current_actor(db: &Database, user: &User) -> Result<User, Rejection> {
         .ok_or_else(|| warp::reject::custom(Forbidden))
 }
 
-async fn ensure_ws(db: &Database, user: &User, ws_id: i64) -> Result<Workspace, Rejection> {
-    match db.get_workspace(ws_id).await.ok().flatten() {
-        Some(ws) if user.role == "root" => Ok(ws),
-        Some(ws) => {
-            let group = db.get_group(ws.group_id).await.ok().flatten();
-            match group {
-                Some(g) if user.org_id == Some(g.org_id) => {
-                    // Org admins manage everything in their org (they can already
-                    // manage the group itself, clear its chat and delete it);
-                    // other members are bound by the group's scope.
-                    if user.role == "admin" {
-                        return Ok(ws);
-                    }
-                    let member = g.scope == "group"
-                        && db.is_group_member(g.id, user.id).await.unwrap_or(false);
-                    if scope_ok(&g.scope, g.created_by, user.id, member) {
-                        Ok(ws)
-                    } else {
-                        Err(warp::reject::custom(Forbidden))
-                    }
-                }
-                _ => Err(warp::reject::custom(Forbidden)),
-            }
-        }
-        _ => Err(warp::reject::custom(Forbidden)),
+/// Why a workspace could not be reached. A denial and a database that did not
+/// answer are different facts: the HTTP routes have answered both with `403` for
+/// years (recorded in `context/current-issues.md`), and the detached assistant
+/// task needs the distinction because it is not answering a request. Telling a
+/// model "you are not a member" when the truth is "the pool was busy" ends a
+/// legitimate turn and teaches the wrong lesson.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WsDenied {
+    Forbidden,
+    Unavailable,
+}
+
+/// The workspace if this user may access it, or why not. Visibility comes from
+/// the workspace's group.
+///
+/// Split out of [`ensure_ws`] so a caller that is not inside a request can act on
+/// the answer — an AI turn runs in a detached task and must be able to ask again
+/// before each write.
+pub(crate) async fn ws_access(
+    db: &Database,
+    user: &User,
+    ws_id: i64,
+) -> Result<Workspace, WsDenied> {
+    let ws = match db.get_workspace(ws_id).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => return Err(WsDenied::Forbidden),
+        Err(_) => return Err(WsDenied::Unavailable),
+    };
+    if user.role == "root" {
+        return Ok(ws);
     }
+    let group = match db.get_group(ws.group_id).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return Err(WsDenied::Forbidden),
+        Err(_) => return Err(WsDenied::Unavailable),
+    };
+    if user.org_id != Some(group.org_id) {
+        return Err(WsDenied::Forbidden);
+    }
+    // Org admins manage everything in their org (they can already manage the
+    // group itself, clear its chat and delete it); other members are bound by the
+    // group's scope.
+    if user.role == "admin" {
+        return Ok(ws);
+    }
+    let member = match db.is_group_member(group.id, user.id).await {
+        Ok(m) => group.scope == "group" && m,
+        Err(_) => return Err(WsDenied::Unavailable),
+    };
+    if scope_ok(&group.scope, group.created_by, user.id, member) {
+        Ok(ws)
+    } else {
+        Err(WsDenied::Forbidden)
+    }
+}
+
+async fn ensure_ws(db: &Database, user: &User, ws_id: i64) -> Result<Workspace, Rejection> {
+    ws_access(db, user, ws_id)
+        .await
+        .map_err(|_| warp::reject::custom(Forbidden))
 }
 
 /// Resolve a group the user may access (chat routes are keyed by group).

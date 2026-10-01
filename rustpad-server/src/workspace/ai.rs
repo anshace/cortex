@@ -1209,6 +1209,14 @@ async fn run_ai_tool(
             );
         }
     }
+    // The other half of the entry check: this turn outlives its request, so the
+    // member's access is re-proved per write rather than assumed from the moment
+    // the HTTP call arrived.
+    if is_write_tool(name) {
+        if let Err(e) = may_write(db, user, ws_id).await {
+            return (e, UsageTotals::default(), None);
+        }
+    }
     // Optional (old, new) file content for create/edit so the client can render diffs.
     let mut diff: Option<(String, String)> = None;
     let result = match name {
@@ -1841,6 +1849,30 @@ async fn load_research_cfg(db: &Database, user_id: i64) -> ResearchCfg {
     }
 }
 
+/// Re-prove, at the seam where content actually changes, that the member who
+/// started this turn may still write in this workspace.
+///
+/// The turn is detached from its request: `ensure_ws` ran when the HTTP call came
+/// in, and a turn can keep going for minutes after that, so a member removed
+/// mid-turn would otherwise carry on writing. Reads are not gated — a turn that
+/// can no longer change anything should still be able to finish explaining itself.
+async fn may_write(db: &Database, user: &User, ws_id: i64) -> Result<(), String> {
+    match super::ws_access(db, user, ws_id).await {
+        Ok(_) => Ok(()),
+        Err(super::WsDenied::Forbidden) => {
+            Err("error: you no longer have access to this workspace, so this write was refused.".to_string())
+        }
+        // Not a denial, and not reported as one: the database simply did not
+        // answer. Calling that "no access" would end a legitimate turn and leave
+        // the model with a lesson that is not true.
+        Err(super::WsDenied::Unavailable) => Err(
+            "error: could not confirm your workspace access because the database did not answer; \
+             nothing was written. Retry this call."
+                .to_string(),
+        ),
+    }
+}
+
 async fn write_workspace_text(
     db: &Database,
     user: &User,
@@ -1852,6 +1884,9 @@ async fn write_workspace_text(
         Some(p) => p,
         None => return ("error: invalid file path".to_string(), None),
     };
+    if let Err(e) = may_write(db, user, ws_id).await {
+        return (e, None);
+    }
     let new_text = content.replace("\r\n", "\n");
     let files = match list_files_checked(db, ws_id).await {
         Ok(f) => f,
@@ -6267,6 +6302,110 @@ pub(crate) fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error
 mod tests {
     use super::ai_clean_path;
     use super::{agent_short_name, ai_orchestrator_prompt, ai_tool_defs, anthropic_wire_content, apply_exact_patch, azure_chat_url, ctx_window, extra_ui_paths, fileish_paths, fmt_tok_i64, format_sibling_brief, full_replace_reject, looks_like_ui_work, mentioned_paths, oai_text_of, openai_usage_of, parse_frontmatter, parse_github_repo, tool_arg_preview, tool_round_key, tool_summary, usage_json, wire_args, wire_tool_result, write_ok, ToolFlags, UsageTotals};
+
+    #[tokio::test]
+    async fn a_removed_member_cannot_keep_writing_through_a_live_turn() {
+        use super::{list_files_checked, run_ai_tool, EventTx, ResolvedProvider, MEMORY_PATH};
+        use crate::database::Database;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::new(&format!("sqlite://{}", tmp.path().display()))
+            .await
+            .unwrap();
+        db.create_user_if_absent("boss.example", "Boss", "hash", "root", None).await.unwrap();
+        let boss = db.get_user_by_email("boss.example").await.unwrap().unwrap();
+        let org = db.create_org("First", "first", boss.id).await.unwrap();
+        db.create_user_if_absent("member.example", "Member", "hash", "user", Some(org.id))
+            .await
+            .unwrap();
+        let member = db.get_user_by_email("member.example").await.unwrap().unwrap();
+        let group = db.create_group(org.id, "Team", boss.id, 1, "group").await.unwrap();
+        db.add_group_member(group.id, member.id, "user").await.unwrap();
+        let ws = db.create_workspace(group.id, "Proj", boss.id, 1).await.unwrap();
+
+        let prov = ResolvedProvider {
+            name: "test".into(),
+            provider: "anthropic".into(),
+            base_url: None,
+            model: "m".into(),
+            api_key: "k".into(),
+            source: "test",
+        };
+        let (raw_tx, _raw_rx) = tokio::sync::mpsc::channel(64);
+        let tx = EventTx {
+            tx: raw_tx,
+            job: None,
+            bill: None,
+            plan: false,
+            allow_spawn: false,
+            research: false,
+            research_memo: Arc::new(Mutex::new(HashMap::new())),
+            agent_id: None,
+        };
+        async fn file_paths(db: &Database, ws_id: i64) -> Vec<String> {
+            list_files_checked(db, ws_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|f| f.path)
+                .collect()
+        }
+
+        // While they are a member the write lands, so a later refusal is about the
+        // removal and not about a fixture that never could write.
+        let (msg, _, _) = run_ai_tool(
+            &tx,
+            &db,
+            &member,
+            ws.id,
+            &prov,
+            "create_file",
+            &serde_json::json!({ "path": "kept.txt", "content": "hi" }),
+        )
+        .await;
+        assert!(!msg.starts_with("error:"), "a member was refused: {msg}");
+        assert!(file_paths(&db, ws.id).await.contains(&"kept.txt".to_string()));
+
+        db.remove_group_member(group.id, member.id).await.unwrap();
+        let (msg, _, _) = run_ai_tool(
+            &tx,
+            &db,
+            &member,
+            ws.id,
+            &prov,
+            "create_file",
+            &serde_json::json!({ "path": "after.txt", "content": "hi" }),
+        )
+        .await;
+        let after = file_paths(&db, ws.id).await;
+        assert!(
+            !after.contains(&"after.txt".to_string()),
+            "a removed member wrote a file mid-turn; the turn answered {msg:?}"
+        );
+        assert!(msg.starts_with("error:"), "the model got no refusal: {msg:?}");
+        // The turn's earlier work stands; this is about the writes still to come.
+        assert!(after.contains(&"kept.txt".to_string()));
+
+        // `remember` writes through its own helper rather than the file-tool arm,
+        // so it is a second seam and needs the same refusal.
+        let (msg, _, _) = run_ai_tool(
+            &tx,
+            &db,
+            &member,
+            ws.id,
+            &prov,
+            "remember",
+            &serde_json::json!({ "action": "append", "content": "note from a removed member" }),
+        )
+        .await;
+        assert!(msg.starts_with("error:"), "remember bypassed the check: {msg:?}");
+        assert!(
+            !file_paths(&db, ws.id).await.contains(&MEMORY_PATH.to_string()),
+            "a removed member wrote the memory file"
+        );
+    }
 
     #[test]
     fn an_in_flight_turn_belongs_to_the_one_who_started_it() {
