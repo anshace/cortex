@@ -1150,6 +1150,20 @@ async fn run_ai_tool(
         return (result, usage, None);
     }
     if name == "remember" {
+        // Plan mode means "decide, do not change". `remember` writes a workspace
+        // file, so it belongs behind the same gate as create/edit/patch — which it
+        // used to slip past, because that gate only knew the file tools by name.
+        // `read` stays open: seeing what the workspace already decided is not a
+        // change, and an action this arm cannot recognise is treated as a write.
+        let action = input
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if tx.plan && action != "read" {
+            return (PLAN_MODE_REFUSAL.to_string(), UsageTotals::default(), None);
+        }
         return run_remember(db, user, ws_id, input).await;
     }
     if name == "web_search" {
@@ -1203,7 +1217,7 @@ async fn run_ai_tool(
         let allowed = ai_clean_path(&path_arg).as_deref() == Some(PLAN_PATH);
         if !allowed {
             return (
-                "error: Plan mode may only write .cortex/plan.md. Ask clarifying questions or write the plan, then wait for the user to click Build.".to_string(),
+                PLAN_MODE_REFUSAL.to_string(),
                 UsageTotals::default(),
                 None,
             );
@@ -1563,6 +1577,9 @@ fn patch_not_found(hay: &str) -> String {
 
 const MEMORY_PATH: &str = ".cortex/MEMORY.md";
 const MEMORY_CAP: usize = 8000;
+
+/// What a turn in plan mode is told when it tries to change something.
+const PLAN_MODE_REFUSAL: &str = "error: Plan mode may only write .cortex/plan.md. Ask clarifying questions or write the plan, then wait for the user to click Build.";
 
 async fn load_memory_text(db: &Database, ws_id: i64) -> Option<String> {
     let files = db.list_files(ws_id).await.ok()?;
@@ -6302,50 +6319,80 @@ pub(crate) fn routes(db: Database) -> impl Filter<Extract = (impl Reply,), Error
 mod tests {
     use super::ai_clean_path;
     use super::{agent_short_name, ai_orchestrator_prompt, ai_tool_defs, anthropic_wire_content, apply_exact_patch, azure_chat_url, ctx_window, extra_ui_paths, fileish_paths, fmt_tok_i64, format_sibling_brief, full_replace_reject, looks_like_ui_work, mentioned_paths, oai_text_of, openai_usage_of, parse_frontmatter, parse_github_repo, tool_arg_preview, tool_round_key, tool_summary, usage_json, wire_args, wire_tool_result, write_ok, ToolFlags, UsageTotals};
+    use super::{list_files_checked, run_ai_tool, EventTx, ResolvedProvider, MEMORY_PATH};
+    use crate::database::{Database, User};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
-    #[tokio::test]
-    async fn a_removed_member_cannot_keep_writing_through_a_live_turn() {
-        use super::{list_files_checked, run_ai_tool, EventTx, ResolvedProvider, MEMORY_PATH};
-        use crate::database::Database;
-        use std::collections::HashMap;
-        use std::sync::{Arc, Mutex};
+    /// A workspace with one ordinary member plus everything `run_ai_tool` needs: a
+    /// turn that can write without a model ever being called.
+    struct Turn {
+        /// Kept so the database file outlives the pool.
+        _file: tempfile::NamedTempFile,
+        db: Database,
+        group_id: i64,
+        member: User,
+        ws_id: i64,
+        prov: ResolvedProvider,
+    }
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let db = Database::new(&format!("sqlite://{}", tmp.path().display()))
-            .await
-            .unwrap();
-        db.create_user_if_absent("boss.example", "Boss", "hash", "root", None).await.unwrap();
-        let boss = db.get_user_by_email("boss.example").await.unwrap().unwrap();
-        let org = db.create_org("First", "first", boss.id).await.unwrap();
-        db.create_user_if_absent("member.example", "Member", "hash", "user", Some(org.id))
-            .await
-            .unwrap();
-        let member = db.get_user_by_email("member.example").await.unwrap().unwrap();
-        let group = db.create_group(org.id, "Team", boss.id, 1, "group").await.unwrap();
-        db.add_group_member(group.id, member.id, "user").await.unwrap();
-        let ws = db.create_workspace(group.id, "Proj", boss.id, 1).await.unwrap();
+    impl Turn {
+        async fn new() -> Self {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let db = Database::new(&format!("sqlite://{}", file.path().display()))
+                .await
+                .unwrap();
+            db.create_user_if_absent("boss.example", "Boss", "hash", "root", None).await.unwrap();
+            let boss = db.get_user_by_email("boss.example").await.unwrap().unwrap();
+            let org = db.create_org("First", "first", boss.id).await.unwrap();
+            db.create_user_if_absent("member.example", "Member", "hash", "user", Some(org.id))
+                .await
+                .unwrap();
+            let member = db.get_user_by_email("member.example").await.unwrap().unwrap();
+            let group = db.create_group(org.id, "Team", boss.id, 1, "group").await.unwrap();
+            db.add_group_member(group.id, member.id, "user").await.unwrap();
+            let ws = db.create_workspace(group.id, "Proj", boss.id, 1).await.unwrap();
+            Self {
+                _file: file,
+                db,
+                group_id: group.id,
+                member,
+                ws_id: ws.id,
+                prov: ResolvedProvider {
+                    name: "test".into(),
+                    provider: "anthropic".into(),
+                    base_url: None,
+                    model: "m".into(),
+                    api_key: "k".into(),
+                    source: "test",
+                },
+            }
+        }
 
-        let prov = ResolvedProvider {
-            name: "test".into(),
-            provider: "anthropic".into(),
-            base_url: None,
-            model: "m".into(),
-            api_key: "k".into(),
-            source: "test",
-        };
-        let (raw_tx, _raw_rx) = tokio::sync::mpsc::channel(64);
-        let tx = EventTx {
-            tx: raw_tx,
-            job: None,
-            bill: None,
-            plan: false,
-            allow_spawn: false,
-            research: false,
-            research_memo: Arc::new(Mutex::new(HashMap::new())),
-            agent_id: None,
-        };
-        async fn file_paths(db: &Database, ws_id: i64) -> Vec<String> {
-            list_files_checked(db, ws_id)
+        /// An event channel for one turn. `plan` is the only flag a test here
+        /// cares about; the rest are off so no tool can reach a network.
+        fn tx(&self, plan: bool) -> EventTx {
+            let (raw_tx, _rx) = tokio::sync::mpsc::channel(64);
+            EventTx {
+                tx: raw_tx,
+                job: None,
+                bill: None,
+                plan,
+                allow_spawn: false,
+                research: false,
+                research_memo: Arc::new(Mutex::new(HashMap::new())),
+                agent_id: None,
+            }
+        }
+
+        async fn run(&self, tx: &EventTx, name: &str, input: serde_json::Value) -> String {
+            run_ai_tool(tx, &self.db, &self.member, self.ws_id, &self.prov, name, &input)
+                .await
+                .0
+        }
+
+        async fn paths(&self) -> Vec<String> {
+            list_files_checked(&self.db, self.ws_id)
                 .await
                 .unwrap()
                 .into_iter()
@@ -6353,33 +6400,25 @@ mod tests {
                 .collect()
         }
 
+        async fn leave_the_group(&self) {
+            self.db.remove_group_member(self.group_id, self.member.id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_removed_member_cannot_keep_writing_through_a_live_turn() {
+        let t = Turn::new().await;
+        let tx = t.tx(false);
+
         // While they are a member the write lands, so a later refusal is about the
         // removal and not about a fixture that never could write.
-        let (msg, _, _) = run_ai_tool(
-            &tx,
-            &db,
-            &member,
-            ws.id,
-            &prov,
-            "create_file",
-            &serde_json::json!({ "path": "kept.txt", "content": "hi" }),
-        )
-        .await;
+        let msg = t.run(&tx, "create_file", serde_json::json!({ "path": "kept.txt", "content": "hi" })).await;
         assert!(!msg.starts_with("error:"), "a member was refused: {msg}");
-        assert!(file_paths(&db, ws.id).await.contains(&"kept.txt".to_string()));
+        assert!(t.paths().await.contains(&"kept.txt".to_string()));
 
-        db.remove_group_member(group.id, member.id).await.unwrap();
-        let (msg, _, _) = run_ai_tool(
-            &tx,
-            &db,
-            &member,
-            ws.id,
-            &prov,
-            "create_file",
-            &serde_json::json!({ "path": "after.txt", "content": "hi" }),
-        )
-        .await;
-        let after = file_paths(&db, ws.id).await;
+        t.leave_the_group().await;
+        let msg = t.run(&tx, "create_file", serde_json::json!({ "path": "after.txt", "content": "hi" })).await;
+        let after = t.paths().await;
         assert!(
             !after.contains(&"after.txt".to_string()),
             "a removed member wrote a file mid-turn; the turn answered {msg:?}"
@@ -6390,21 +6429,36 @@ mod tests {
 
         // `remember` writes through its own helper rather than the file-tool arm,
         // so it is a second seam and needs the same refusal.
-        let (msg, _, _) = run_ai_tool(
-            &tx,
-            &db,
-            &member,
-            ws.id,
-            &prov,
-            "remember",
-            &serde_json::json!({ "action": "append", "content": "note from a removed member" }),
-        )
-        .await;
+        let msg = t
+            .run(&tx, "remember", serde_json::json!({ "action": "append", "content": "note" }))
+            .await;
         assert!(msg.starts_with("error:"), "remember bypassed the check: {msg:?}");
         assert!(
-            !file_paths(&db, ws.id).await.contains(&MEMORY_PATH.to_string()),
+            !t.paths().await.contains(&MEMORY_PATH.to_string()),
             "a removed member wrote the memory file"
         );
+    }
+
+    #[tokio::test]
+    async fn plan_mode_refuses_remember_as_well_as_the_file_tools() {
+        let t = Turn::new().await;
+        let tx = t.tx(true);
+        let msg = t.run(&tx, "create_file", serde_json::json!({ "path": "a.txt", "content": "x" })).await;
+        assert!(msg.contains("Plan mode"), "the file tool was not gated: {msg}");
+
+        let msg = t
+            .run(&tx, "remember", serde_json::json!({ "action": "append", "content": "planted" }))
+            .await;
+        assert!(msg.contains("Plan mode"), "remember wrote during plan mode: {msg}");
+        assert!(
+            !t.paths().await.contains(&MEMORY_PATH.to_string()),
+            "plan mode let a turn write the memory file"
+        );
+
+        // Reading is not a change: plan mode must not block it, or the model cannot
+        // see what the workspace already decided.
+        let msg = t.run(&tx, "remember", serde_json::json!({ "action": "read" })).await;
+        assert!(!msg.contains("Plan mode"), "plan mode refused a read: {msg}");
     }
 
     #[test]
