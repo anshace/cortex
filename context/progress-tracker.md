@@ -15,6 +15,20 @@ Concrete, verified state. A unit moves to Complete only with what proves it.
 
 ## Completed
 
+- **MCP and fetch rebinding + response caps** (`ai-assistant`, unmerged) — the two
+  audit findings that lived outside `ai.rs`. `mcp::pin_client` is now the single
+  place a URL is resolved, refused if any answer is private, and pinned with
+  `resolve_to_addrs`; `mcp::pinned_client` and `search.rs::fetch_client` both build
+  through it, and `web_fetch` re-pins on every redirect hop. `mcp::read_capped`
+  bounds a response as it arrives (4 MB) instead of trusting `content-length`, and
+  the fetch path uses it rather than its old length-then-buffer rule. Also fixed:
+  `parse_ddg_html` sliced at a raw byte offset, which panicked the request worker on
+  any non-ASCII redirect target. Proof: 5 new tests, each mutation-checked —
+  removing the pin's address loop breaks 2, raising the cap breaks the chunked
+  test, lowering it breaks the whole-body test, and restoring the byte-offset bound
+  panics the parser test (the first fixture for that one landed wrong: a 20-byte
+  prefix put the 500th byte exactly on a char boundary, so it passed against the
+  buggy code). `npm test` 149 passed / 0 failed / 1 deliberate ignore; clippy clean.
 - **v0.1.3 tenancy and shredding** (`206d55d`, tagged, pushed) — per-org
   databases with routing (#19/#20/#24/#25), `org_keys` crypto-shredding with
   sealed objects and read-path unsealing (#21), whole-instance and
@@ -34,15 +48,23 @@ Concrete, verified state. A unit moves to Complete only with what proves it.
 
 ## Up next
 
-1. Feature 01 backend: `users.kind`, `bots` profile table, mention → queued turn →
+1. Issue 06 remainder: pin `ai.rs::ai_client` (needs `AI_ALLOW_PRIVATE_BASE`
+   threaded into `mcp::pin_client` as an argument, not a second rule set) and cap
+   the provider/skill response reads.
+2. The remaining release-blocking audit findings from `31bdf60` land one commit
+   each — see `context/current-issues.md`.
+3. Feature 01 backend: `users.kind`, `bots` profile table, mention → queued turn →
    reply-as-bot, loop guard, seat exclusion. Its failing test first.
-2. Feature 01 UI: bot marker in People and messages, mention autocomplete, the
+4. Feature 01 UI: bot marker in People and messages, mention autocomplete, the
    owner's agent management panel.
-3. Issue 02: the object-backend dependency call (owner).
-4. F-01: decide the chat-encryption wording.
+5. Issue 02: the object-backend dependency call (owner).
+6. F-01: decide the chat-encryption wording.
 
 ## Session notes
 
+- 2026-10-01: closed the rebinding and unbounded-read findings for the MCP and
+  fetch paths; `ai.rs` still has both (Issue 06). Nothing merged to `main` — this
+  branch is `ai-assistant`.
 - 2026-09-29: skill installed (it was never in `~/.qoder/skills/`, which is why it
   looked broken), repo audited and scaffolded, Feature 01 specced. Two decisions
   recorded with an explicit "owner may veto" — D-11 bot-as-user-kind, D-12 bots

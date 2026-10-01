@@ -90,18 +90,20 @@ pub async fn web_search(cfg: &ResearchCfg, query: &str) -> String {
 
 /// Fetch a public HTTPS page and return stripped text (capped). Redirects
 /// are followed one hop at a time and every target is re-validated against
-/// [`mcp::validate_public_https`], so a public page cannot bounce the fetch to
-/// a private address, an http URL, or anything else the initial URL was not.
+/// [`mcp::validate_public_https`] *and* re-pinned, so a public page cannot bounce
+/// the fetch to a private address, an http URL, or anything else the initial URL
+/// was not - and cannot reach one by answering the check and the connection with
+/// different DNS records.
 pub async fn web_fetch(url: &str) -> String {
     let mut url = match mcp::validate_public_https(url, "Fetch") {
         Ok(u) => u,
         Err(e) => return format!("error: {e}"),
     };
-    let client = match fetch_client() {
-        Ok(c) => c,
-        Err(e) => return format!("error: {e}"),
-    };
     for _hop in 0..5 {
+        let client = match fetch_client(&url) {
+            Ok(c) => c,
+            Err(e) => return format!("error: {e}"),
+        };
         let res = match client.get(&url).send().await {
             Ok(r) => r,
             Err(e) => return format!("error: fetch failed - {e}"),
@@ -132,17 +134,16 @@ pub async fn web_fetch(url: &str) -> String {
         if !res.status().is_success() {
             return format!("error: fetch returned HTTP {}", res.status().as_u16());
         }
-        // Refuse to buffer something enormous before the body is read.
-        if res.content_length().map(|n| n > 1_500_000).unwrap_or(false) {
-            return "error: fetch response too large".to_string();
-        }
-        let bytes = match res.bytes().await {
+        // Capped as it arrives. The old check read `content-length` and then
+        // buffered the body anyway, and a chunked response simply does not send a
+        // length — so what was bounded was the honest servers, not the ones that
+        // matter. One remote streaming forever used to stop the whole container.
+        let body = match mcp::read_capped(res, "Fetch").await {
             Ok(b) => b,
-            Err(e) => return format!("error: could not read body - {e}"),
+            Err(e) => return format!("error: {e}"),
         };
-        const MAX: usize = 80_000;
-        let slice = if bytes.len() > MAX { &bytes[..MAX] } else { &bytes };
-        let raw = String::from_utf8_lossy(slice);
+        const MAX_CHARS: usize = 80_000;
+        let raw: String = body.chars().take(MAX_CHARS).collect();
         let text = collapse_ws(&strip_html(&raw));
         if text.is_empty() {
             return format!("(no readable text at {url})");
@@ -159,15 +160,21 @@ pub async fn web_fetch(url: &str) -> String {
 }
 
 /// A client that does NOT follow redirects on its own - [`web_fetch`] walks
-/// them manually so every hop passes the public-HTTPS validation again.
-fn fetch_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .gzip(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(BROWSER_UA)
-        .build()
-        .map_err(|e| e.to_string())
+/// them manually so every hop passes the public-HTTPS validation again - and that
+/// is pinned to the answers for *this* hop's host, so the connection cannot be
+/// pointed somewhere the validation did not look at.
+fn fetch_client(url: &str) -> Result<reqwest::Client, String> {
+    mcp::pin_client(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .gzip(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(BROWSER_UA),
+        url,
+        "Fetch",
+    )?
+    .build()
+    .map_err(|e| e.to_string())
 }
 
 fn format_hits(provider: &str, query: &str, hits: &[SearchHit]) -> String {
@@ -451,9 +458,17 @@ pub fn parse_ddg_html(html: &str) -> Vec<SearchHit> {
     let mut rest = html.as_str();
     while let Some(i) = rest.find("uddg=") {
         let after = &rest[i + 5..];
+        // A byte count used as an index panics the moment it lands inside a
+        // multi-byte character, which a page with any non-ASCII text eventually
+        // guarantees. Bound by characters, over the same string being sliced.
+        let limit = after
+            .char_indices()
+            .nth(500)
+            .map(|(byte, _)| byte)
+            .unwrap_or(after.len());
         let end = after
             .find(|c: char| c == '&' || c == '"' || c == '\'' || c.is_whitespace())
-            .unwrap_or(after.len().min(500));
+            .unwrap_or(limit);
         let encoded = &after[..end];
         let url = url_decode(encoded);
         let tail = &after[end.min(after.len())..];
@@ -652,6 +667,37 @@ fn collapse_ws(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fetch_client_pins_and_therefore_refuses_a_private_host() {
+        // `web_fetch` validates the URL before it gets here, so a test that only
+        // drives `web_fetch` cannot tell whether this client is pinned at all —
+        // which is precisely the hole: the check looked at one DNS answer and the
+        // connection asked again. Un-wrap `fetch_client` from the pin and this
+        // fails while every `web_fetch` test still passes.
+        let e = fetch_client("http://127.0.0.1:9999/").unwrap_err();
+        assert!(e.contains("private or loopback"), "{e}");
+    }
+
+    #[test]
+    fn a_non_ascii_redirect_target_does_not_panic_the_parser() {
+        // The old bound was `after.len().min(500)` — a byte count used as an index.
+        // With no delimiter in the target the parser fell back to that bound, and on
+        // a multi-byte character it slices mid-codepoint and panics the request
+        // worker. So: raw non-ASCII text and nothing to stop at.
+        //
+        // The 21-byte ASCII prefix is deliberate. Each of these characters is 3
+        // bytes, so a 20-byte prefix puts byte 500 exactly on a boundary and the
+        // old code passes this test without ever having been safe. One byte over
+        // and byte 500 is mid-character, which is what a real page does.
+        let target = "https://example.com/x".to_string() + &"日本語".repeat(300);
+        let hits = parse_ddg_html(&format!("uddg={target}"));
+        assert_eq!(hits.len(), 1, "the link was not parsed at all");
+        // Bounded by characters, so the long target is truncated rather than taken
+        // whole — and rather than crashing.
+        let n = hits[0].url.chars().count();
+        assert!(n <= 520, "no bound was applied: {n} chars");
+    }
 
     #[test]
     fn url_decode_percent_and_plus() {

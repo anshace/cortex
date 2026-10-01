@@ -134,12 +134,80 @@ fn is_link_local_v6(v: std::net::Ipv6Addr) -> bool {
     (v.segments()[0] & 0xffc0) == 0xfe80
 }
 
-fn client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| e.to_string())
+/// Add the answers a URL resolves to onto a client builder, refusing any answer
+/// that is not a public address.
+///
+/// `validate_public_https` resolves a name in order to decide whether it is safe
+/// to connect, and a request built from a plain client resolves it *again*. With a
+/// short TTL an attacker-hosted name can answer with a public address to the check
+/// and `127.0.0.1` to the connection, which makes the check decorative. Pinning the
+/// validated answers is what closes that; checking and then hoping nothing changed
+/// in between is not a control.
+///
+/// This is the shared half of that, because the fetch path has the same shape and a
+/// second copy of the address rules is how one of them stops being updated.
+pub(crate) fn pin_client(
+    builder: reqwest::ClientBuilder,
+    raw: &str,
+    kind: &str,
+) -> Result<reqwest::ClientBuilder, String> {
+    let url = reqwest::Url::parse(raw.trim()).map_err(|_| "not a valid URL".to_string())?;
+    let host = url.host_str().ok_or("URL is missing a host")?;
+    let port = url.port_or_known_default().ok_or("URL has no port")?;
+    let addrs: Vec<std::net::SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| format!("could not resolve host '{host}'"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("could not resolve host '{host}'"));
+    }
+    // Re-checked here rather than trusted from the caller, because the pin is the
+    // thing that actually decides where the socket goes.
+    for addr in &addrs {
+        if !ip_is_public(addr.ip()) {
+            return Err(format!("{kind} URL resolves to a private or loopback address"));
+        }
+    }
+    Ok(builder.resolve_to_addrs(host, &addrs))
+}
+
+fn pinned_client(url: &str) -> Result<reqwest::Client, String> {
+    pin_client(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none()),
+        url,
+        "MCP",
+    )?
+    .build()
+    .map_err(|e| e.to_string())
+}
+
+/// The largest remote body this server will hold in memory.
+///
+/// A small single container is the whole deployment, so an unbounded read is not a
+/// performance question but an availability one: one remote that streams forever
+/// stops the app for everyone. `search.rs` already capped its fetches; this is the
+/// same rule where it was missing.
+pub(crate) const MAX_REMOTE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read a response body, refusing one that exceeds the cap.
+///
+/// The length is checked while streaming rather than from `content-length` alone,
+/// because a chunked response simply does not send one — so a check that trusts it
+/// bounds the honest servers and not the attacker.
+pub(crate) async fn read_capped(res: reqwest::Response, kind: &str) -> Result<String, String> {
+    use futures::StreamExt;
+    let mut stream = res.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("{kind} response body: {e}"))?;
+        if (buf.len() + chunk.len()) as u64 > MAX_REMOTE_BYTES {
+            return Err(format!("{kind} response exceeded the {} MB limit", MAX_REMOTE_BYTES / (1024 * 1024)));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).map_err(|_| format!("{kind} response was not valid UTF-8"))
 }
 
 fn mcp_meta() -> Value {
@@ -165,7 +233,7 @@ async fn rpc(
         "params": params,
     });
     body["_meta"] = mcp_meta();
-    let http = client()?;
+    let http = pinned_client(url)?;
     let mut req = http
         .post(url)
         .header("content-type", "application/json")
@@ -195,7 +263,7 @@ async fn rpc(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let text = res.text().await.map_err(|e| format!("MCP response body: {e}"))?;
+    let text = read_capped(res, "MCP").await?;
     if !status.is_success() {
         let snippet: String = text.chars().take(240).collect();
         return Err(format!("MCP {method} HTTP {status}: {snippet}"));
@@ -392,6 +460,113 @@ mod tests {
         if let Err(e) = r {
             assert!(e.contains("resolve") || e.contains("private"), "{e}");
         }
+    }
+
+    #[test]
+    fn the_pin_refuses_a_private_answer_even_when_the_caller_vouched() {
+        // The pin decides where the socket actually goes, so it re-checks rather
+        // than trusting that someone validated first. Take away that loop and the
+        // caller's check is once again only about a DNS answer that already
+        // expired — which is the whole rebinding bug.
+        for bad in [
+            "http://127.0.0.1:8080/mcp",
+            "http://10.0.0.5/mcp",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:8080/mcp",
+        ] {
+            let r = pin_client(reqwest::Client::builder(), bad, "Fetch");
+            assert!(r.is_err(), "pinned a private address for {bad:?}");
+            assert!(
+                r.unwrap_err().contains("private or loopback"),
+                "refused {bad:?} for the wrong reason"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pin_keeps_a_public_literal_answer() {
+        // The other half: it must not refuse everything, or the pin looks like a
+        // working control while no MCP server or page is ever reachable.
+        assert!(pin_client(reqwest::Client::builder(), "https://93.184.216.34/mcp", "MCP").is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_with_no_content_length_is_still_capped() {
+        // Trusting `content-length` bounds the honest servers and not the attacker:
+        // a chunked response simply never sends one. Serve exactly that and require
+        // the read to stop on its own.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || serve_chunked(listener));
+
+        let res = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            res.content_length().is_none(),
+            "the fixture sent a length, so this would not test the streaming path"
+        );
+        match read_capped(res, "MCP").await {
+            Ok(body) => panic!("read the whole {}-byte body; the cap never fired", body.len()),
+            Err(e) => assert!(e.contains("exceeded"), "{e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_under_the_cap_is_returned_whole() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || serve_chunked_text(listener, "hello world"));
+
+        let res = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_capped(res, "MCP").await.unwrap(), "hello world");
+    }
+
+    /// Answer one request with a chunked body and no `content-length`.
+    ///
+    /// Write errors are ignored on purpose: the capped read is expected to hang up
+    /// mid-body, and a server that panics there would make the test flaky.
+    fn serve_chunked(listener: std::net::TcpListener) {
+        use std::io::{Read, Write};
+        let (mut sock, _) = match listener.accept() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut scratch = [0u8; 4096];
+        let _ = sock.read(&mut scratch);
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n";
+        if sock.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        let body = vec![b'x'; 128 * 1024];
+        for _ in 0..40 {
+            let _ = write!(sock, "{:X}\r\n", body.len());
+            if sock.write_all(&body).is_err() || sock.write_all(b"\r\n").is_err() {
+                return;
+            }
+        }
+        let _ = sock.write_all(b"0\r\n\r\n");
+    }
+
+    fn serve_chunked_text(listener: std::net::TcpListener, text: &str) {
+        use std::io::{Read, Write};
+        let (mut sock, _) = match listener.accept() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut scratch = [0u8; 4096];
+        let _ = sock.read(&mut scratch);
+        let _ = write!(
+            sock,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n{:X}\r\n{text}\r\n0\r\n\r\n",
+            text.len()
+        );
     }
 
     #[test]

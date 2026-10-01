@@ -4,16 +4,22 @@ The handoff file. A fresh session reads this plus `context/overview.md`,
 `context/workflow-rules.md` and `context/progress-tracker.md` and picks up with no
 re-explaining. Tool auto-memory is scratch; this file is the record.
 
-## Current state (2026-09-29)
+## Current state (2026-10-01)
 
-`main` = `f79cd09`, pushed, tagged `v0.1.3`. Working tree carries the new
-`context/` scaffold (uncommitted). Gates: `npm test` 130/0, `tsc` clean,
-`vite build` clean, clippy at one pre-existing warning.
+Work is on branch `ai-assistant`, not `main`. `main` = `f79cd09`, tagged `v0.1.3`.
+The branch carries the assistant checkpoint (`31bdf60`) plus one fix per audit
+finding: the provider URL guard (`ddce381`, D-13), the in-flight turn owner key
+(`b41b75f`), and the outbound-HTTP hardening in `mcp.rs`/`search.rs` — both the MCP
+and web-fetch paths now build their client through `mcp::pin_client`, which
+resolves once, refuses any private answer, and pins the connection to those
+answers; `mcp::read_capped` bounds a body as it streams instead of trusting
+`content-length`; and `parse_ddg_html` no longer slices at a raw byte offset.
+Gates at HEAD: `npm test` 149 passed / 0 failed / one deliberate `#[ignore]`,
+clippy clean, `tsc` and `vite build` unchanged (no UI touched).
 
-Tenancy is finished: per-org databases with routing, per-org crypto-shredding,
-whole-instance and single-organization archives, write-path quotas, maintenance
-that defers rather than starving the pool. The owner console now states what
-protects content and what a deletion destroys.
+Tenancy is finished on `main`: per-org databases with routing, per-org
+crypto-shredding, whole-instance and single-organization archives, write-path
+quotas, maintenance that defers rather than starving the pool.
 
 Feature 01 (agents in chat) is specced, not started. The substrate mostly exists:
 `workspace/ai.rs` already has provider profiles (anthropic/openai/azure, keys
@@ -25,12 +31,16 @@ without touching the wire format.
 
 ## Next step
 
-Implement Feature 01 backend-first, RED-GREEN:
-1. Migration 39: `users.kind` (`'human'` default) + `bots` profile table.
-2. Failing test: mentioning a bot in a channel produces a reply authored by that
-   bot, in the same org, and the mention does not re-trigger it.
-3. Then the routing seam, seat exclusion, and the UI (bot marker, autocomplete,
-   owner's agent panel).
+Finish Issue 06 in `context/current-issues.md` — the same two findings still open
+in `ai.rs`, one commit each:
+1. Pin `ai_client` (`ai.rs:269`). `validate_provider_base` only runs where a
+   profile is *saved* (`ai.rs:209`), so the request itself still resolves a second
+   time — the exact rebinding this branch closed everywhere else. Thread
+   `AI_ALLOW_PRIVATE_BASE` into `mcp::pin_client` as an argument; do not copy the
+   address rules.
+2. Cap the provider and skill response reads (`ai.rs:2403`, `2928`, `github_client`
+   at 5213).
+3. Then the rest of the release-blocking list, then Feature 01.
 
 ## Open questions (need the human)
 
