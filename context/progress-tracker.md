@@ -15,6 +15,27 @@ Concrete, verified state. A unit moves to Complete only with what proves it.
 
 ## Completed
 
+- **Assistant quota reservation + memory provenance** (`ai-assistant`, unmerged) —
+  two findings that live in the same file and landed together, which is a
+  compromise worth naming. (a) `added_bytes` + `hold_write_quota` reserve the
+  organization's storage before the assistant writes, at all four content seams
+  (create, upsert-after-exists, edit, patch, and `write_workspace_text`), holding
+  the per-org guard until the row lands; the upsert path drops its first guard
+  before taking the delta-sized one because the lock is not re-entrant. Limit
+  comes from `plan_for`, same as uploads. (b) `.cortex/MEMORY.md` is now injected
+  through one `memory_section` (used by both prompt paths) that labels it as notes
+  other members wrote and denies it authority, and every `remember append` line
+  carries its author via `memory_note`. Proof: 5 tests, incl. the reservation
+  refusal at an explicit limit and an end-to-end append/read that must show the
+  name. Not covered: that each write site calls the reservation (licence
+  enforcement is off in tests, so the limit is passed in rather than observed),
+  and that both prompt paths use `memory_section` — the framing function is tested,
+  its call sites are not. **The structural question stays open**: whether memory
+  should be owner-only or one file per member, which is the owner's call.
+- **Plan mode covers `remember`** (`0a28b56`) — the tool wrote
+  `.cortex/MEMORY.md` during a read-only planning turn because the gate listed the
+  file tools by name. Refusal text is now one shared constant. Written first and
+  watched fail with `created '.cortex/MEMORY.md'`.
 - **Membership re-checked at the assistant's write seams** (`ai-assistant`,
   unmerged) — a turn runs detached from its request, so `ensure_ws` at entry could
   be minutes stale and a removed member kept writing. `ensure_ws`'s rules are now
